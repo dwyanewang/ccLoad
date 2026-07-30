@@ -144,7 +144,12 @@ func ensureMySQLSchema() error {
 
 func openSQLite(path string) (*sql.DB, error) {
 	fileURL := (&url.URL{Scheme: "file", Path: path}).String()
-	db, err := sql.Open("sqlite", fileURL+"?_pragma=busy_timeout(5000)&_foreign_keys=on")
+	// The migration source is deliberately mounted read-only.  In particular,
+	// a stopped WAL-mode database may still have -wal/-shm files beside it; an
+	// implicit read-write open then fails before VACUUM INTO can make its
+	// consistent backup.  The output of VACUUM INTO is a separate database and
+	// remains writable.
+	db, err := sql.Open("sqlite", fileURL+"?mode=ro&_pragma=busy_timeout(5000)&_foreign_keys=on")
 	if err != nil {
 		return nil, err
 	}
