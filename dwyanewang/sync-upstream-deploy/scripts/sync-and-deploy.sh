@@ -237,6 +237,9 @@ if [[ -z "${VERSION:-}" ]]; then
   VERSION=$("${git_cmd[@]}" describe --tags --always)
   export VERSION
 fi
+candidate_head=$("${git_cmd[@]}" rev-parse HEAD)
+image_tag="rw-${candidate_head:0:12}"
+export CCLOAD_IMAGE_TAG="$image_tag"
 compose_cmd=(docker compose -f "$compose_file")
 
 info "Validating Docker Compose configuration"
@@ -246,8 +249,8 @@ info "Building Docker image from candidate"
 [[ -z "$("${git_cmd[@]}" status --porcelain)" ]] || \
   fail "candidate validation left worktree changes"
 
-candidate_head=$("${git_cmd[@]}" rev-parse HEAD)
 info "Candidate: $candidate_head"
+info "Image: ccload:$image_tag"
 
 if (( dry_run )); then
   "${git_cmd[@]}" switch --quiet "$original_branch"
@@ -256,6 +259,10 @@ if (( dry_run )); then
   info "Dry run passed; $BASE_BRANCH and $DEPLOY_BRANCH were not changed"
   exit 0
 fi
+
+deploy_script="$deploy_dir/deploy/scripts/rollout.sh"
+[[ -x "$deploy_script" ]] || \
+  fail "zero-downtime rollout script is unavailable or not executable: $deploy_script"
 
 if "${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$BACKUP_BRANCH"; then
   backup_before=$("${git_cmd[@]}" rev-parse "$BACKUP_BRANCH")
@@ -288,18 +295,20 @@ info "Atomically updating $BASE_BRANCH and $DEPLOY_BRANCH"
 candidate_created=0
 
 mkdir -p -- "$data_dir"
-info "Deploying the prebuilt image from $DEPLOY_BRANCH"
-"${compose_cmd[@]}" up -d --no-build --remove-orphans --wait --wait-timeout "$wait_timeout"
+info "Delegating ccload:$image_tag to the persistent zero-downtime rollout"
+CCLOAD_DEPLOY_WAIT_TIMEOUT="$wait_timeout" "$deploy_script" --image "ccload:$image_tag"
 
 info "Synchronization and deployment completed"
 printf 'base:     %s -> %s\n' "$base_before" "$upstream_commit"
 printf 'upstream: %s\n' "$upstream_commit"
 printf 'config:   %s\n' "$config_commit"
 printf 'candidate: %s\n' "$candidate_head"
+printf 'image:    ccload:%s\n' "$image_tag"
 if [[ -n "$deploy_before" ]]; then
   printf 'deploy:   %s -> %s\n' "$deploy_before" "$candidate_head"
   printf 'backup:   %s -> %s\n' "$BACKUP_BRANCH" "$deploy_before"
 else
   printf 'deploy:   (created) -> %s\n' "$candidate_head"
 fi
-"${compose_cmd[@]}" ps
+docker compose --project-name ccload-slots \
+  -f "$deploy_dir/deploy/compose.slots.yml" ps

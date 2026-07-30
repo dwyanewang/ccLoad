@@ -5,7 +5,7 @@ description: Atomically rebuild ccLoad's rw-main from the latest official upstre
 
 # 同步上游并部署
 
-使用内置脚本从干净上游基线整体重建 `rw-main`，然后重建 Docker 并等待健康检查。不要手工复制脚本中的 Git 步骤。
+使用内置脚本从干净上游基线整体重建 `rw-main`，构建不可变 Docker 镜像，再交给项目外、长期运行的排空发布器。不要手工复制脚本中的 Git 步骤。
 
 ## 分支职责
 
@@ -20,7 +20,7 @@ description: Atomically rebuild ccLoad's rw-main from the latest official upstre
 
 1. 确认用户要求执行更新部署，而不是只询问流程。
 2. 使用 `CCLOAD_DEPLOY_DIR` 指定的目录；未设置时默认为 `$HOME/Private/ccLoad`。该目录必须位于仓库外，并包含 `.env`。
-3. 在任意干净的本地分支上执行：
+3. 确认 `$CCLOAD_DEPLOY_DIR/deploy/scripts/rollout.sh` 已完成首次迁移并可执行；它负责双槽位健康检查、Nginx 切流与旧连接排空。然后在任意干净的本地分支上执行：
 
 ```bash
 bash dwyanewang/sync-upstream-deploy/scripts/sync-and-deploy.sh
@@ -48,7 +48,7 @@ bash dwyanewang/sync-upstream-deploy/scripts/sync-and-deploy.sh
 - 在候选分支上完成 Compose 配置验证和镜像构建；任一步失败时删除候选，`master` 和旧 `rw-main` 保持不变。
 - 验证通过后，将旧 `rw-main` 保存为 `rw-main-backup-latest`，再原子更新 `master` 和 `rw-main`。
 - 永不执行 stash、hard reset、rebase、force push 或普通 push。
-- 成功后停留在 `rw-main`，用已构建镜像启动 Compose 并等待健康检查。
+- 成功后停留在 `rw-main`，将不可变镜像标签交给项目外的发布器；发布器健康检查新槽位、切换入口代理并排空旧槽位。
 
 `--dry-run` 会 fetch 上游、创建和验证临时候选，但不移动 `master`/`rw-main` 且不启动服务。用户明确要求更新部署时直接执行正常模式。
 

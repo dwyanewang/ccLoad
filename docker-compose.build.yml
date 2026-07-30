@@ -9,7 +9,8 @@ services:
         # - v1.x.x：生产环境，静态资源长缓存
         # 生产构建: VERSION=$(git describe --tags --always) docker compose -f docker-compose.build.yml build
         VERSION: ${VERSION:-dev}
-    image: ccload:local
+    # 同步发布脚本会注入不可变 CCLOAD_IMAGE_TAG；手工本地构建仍沿用 local。
+    image: ccload:${CCLOAD_IMAGE_TAG:-local}
     # 始终基于当前工作区源码构建，不拉取远程发布镜像。
     pull_policy: build
     container_name: ccload
