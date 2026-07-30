@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   ccload:
     build:
@@ -9,27 +7,30 @@ services:
         # 版本号：用于静态资源缓存控制
         # - dev（默认）：开发环境，静态资源不缓存
         # - v1.x.x：生产环境，静态资源长缓存
-        # 生产构建: VERSION=$(git describe --tags --always) docker-compose -f docker-compose.build.yml build
+        # 生产构建: VERSION=$(git describe --tags --always) docker compose -f docker-compose.build.yml build
         VERSION: ${VERSION:-dev}
     image: ccload:local
+    # 始终基于当前工作区源码构建，不拉取远程发布镜像。
+    pull_policy: build
     container_name: ccload
+    # 确保新建的宿主机绑定目录可写，与预构建镜像的 Compose 配置保持一致。
+    user: root
     restart: unless-stopped
     ports:
       # 宿主机端口:容器端口。只改左边即可对外换端口，不要改右边
       - "8080:8080"
-    # 所有配置统一写在 .env 里（从 .env.docker.example 复制）。
+    # 配置与运行数据统一放在 CCLOAD_DEPLOY_DIR 指定的项目外部目录。
     # 文件不存在时 Compose 直接报错拒绝启动，不会用弱默认密码跑起来。
     env_file:
-      - .env
+      - "${CCLOAD_DEPLOY_DIR:?set CCLOAD_DEPLOY_DIR}/.env"
     volumes:
-      - ccload_data:/app/data
+      # 宿主机路径由部署环境传入，Compose 文件不绑定机器或目录层级。
+      - type: bind
+        source: "${CCLOAD_DEPLOY_DIR:?set CCLOAD_DEPLOY_DIR}/data"
+        target: /app/data
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
-
-volumes:
-  ccload_data:
-    driver: local
