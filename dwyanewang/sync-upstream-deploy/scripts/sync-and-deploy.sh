@@ -18,10 +18,9 @@ move only after the candidate passes Compose validation and image build.
 
   --dry-run  Build and verify a candidate without moving branches or deploying.
 
-Required environment:
-  CCLOAD_DEPLOY_DIR             External directory containing .env and data/
-
 Optional environment:
+  CCLOAD_DEPLOY_DIR             External .env/data directory
+                                (default: $HOME/Private/ccLoad)
   CCLOAD_UPSTREAM_REMOTE        Upstream remote name (default: upstream)
   CCLOAD_UPSTREAM_URL           URL used when adding the remote
   CCLOAD_UPSTREAM_BRANCH        Upstream branch (default: master)
@@ -129,9 +128,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   integration_branches+=("$entry")
 done < "$manifest_file"
 
-deploy_dir=${CCLOAD_DEPLOY_DIR:-}
-[[ -n "$deploy_dir" ]] || fail "CCLOAD_DEPLOY_DIR is required"
-deploy_dir=$(realpath -m -- "$deploy_dir")
+CCLOAD_DEPLOY_DIR="${CCLOAD_DEPLOY_DIR:-$HOME/Private/ccLoad}"
+deploy_dir=$(realpath -m -- "$CCLOAD_DEPLOY_DIR")
 [[ "$deploy_dir" != "/" ]] || fail "CCLOAD_DEPLOY_DIR must not be /"
 case "$deploy_dir" in
   "$repo_root"|"$repo_root"/*)
