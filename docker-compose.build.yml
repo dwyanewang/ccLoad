@@ -16,20 +16,22 @@ services:
     # 确保新建的宿主机绑定目录可写，与预构建镜像的 Compose 配置保持一致。
     user: root
     restart: unless-stopped
-    ports:
-      # 宿主机端口:容器端口。只改左边即可对外换端口，不要改右边
-      - "8808:8080"
+    # 直接使用宿主机网络，避免 TUN 代理接管 Docker DNAT 后的容器流量。
+    network_mode: host
     # 配置与运行数据统一放在 CCLOAD_DEPLOY_DIR 指定的项目外部目录。
     # 文件不存在时 Compose 直接报错拒绝启动，不会用弱默认密码跑起来。
     env_file:
       - "${CCLOAD_DEPLOY_DIR:?set CCLOAD_DEPLOY_DIR}/.env"
+    environment:
+      # environment 的优先级高于 env_file，确保服务直接监听宿主机 8808 端口。
+      PORT: "8808"
     volumes:
       # 宿主机路径由部署环境传入，Compose 文件不绑定机器或目录层级。
       - type: bind
         source: "${CCLOAD_DEPLOY_DIR:?set CCLOAD_DEPLOY_DIR}/data"
         target: /app/data
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8808/health"]
       interval: 30s
       timeout: 10s
       retries: 3
