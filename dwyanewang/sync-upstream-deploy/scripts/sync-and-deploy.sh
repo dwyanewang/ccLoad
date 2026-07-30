@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+readonly BASE_BRANCH="master"
+readonly CONFIG_BRANCH="chore/local-docker-deployment"
+readonly DEPLOY_BRANCH="rw-main"
 readonly DEFAULT_UPSTREAM_URL="https://github.com/caidaoli/ccLoad.git"
 
 usage() {
   cat <<'EOF'
 Usage: sync-and-deploy.sh [--dry-run]
 
-Synchronize the local base branch with ccLoad upstream, rebase the current
-deployment branch, then rebuild and verify the Docker Compose deployment.
+Fast-forward master from ccLoad upstream, merge master into the dedicated
+deployment-configuration branch, fast-forward rw-main, then rebuild and verify
+the Docker Compose deployment from rw-main.
 
 Required environment:
   CCLOAD_DEPLOY_DIR             External directory containing .env and data/
@@ -17,7 +21,6 @@ Optional environment:
   CCLOAD_UPSTREAM_REMOTE        Upstream remote name (default: upstream)
   CCLOAD_UPSTREAM_URL           URL used when adding the remote
   CCLOAD_UPSTREAM_BRANCH        Upstream branch (default: master)
-  CCLOAD_BASE_BRANCH            Local base branch (default: master)
   CCLOAD_COMPOSE_FILE           Repo-relative Compose file
   CCLOAD_DEPLOY_WAIT_TIMEOUT    Compose health wait in seconds (default: 180)
 EOF
@@ -59,20 +62,21 @@ docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is unavail
 script_dir=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null) || \
   fail "the skill script is not inside a Git worktree"
-
 git_cmd=(git -C "$repo_root")
-current_branch=$("${git_cmd[@]}" branch --show-current)
-[[ -n "$current_branch" ]] || fail "detached HEAD is not supported"
 
-base_branch=${CCLOAD_BASE_BRANCH:-master}
-[[ "$current_branch" != "$base_branch" ]] || \
-  fail "run this script from the deployment branch, not $base_branch"
-"${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$base_branch" || \
-  fail "local base branch does not exist: $base_branch"
+original_branch=$("${git_cmd[@]}" branch --show-current)
+[[ -n "$original_branch" ]] || fail "detached HEAD is not supported"
+
+for branch_name in "$BASE_BRANCH" "$CONFIG_BRANCH" "$DEPLOY_BRANCH"; do
+  "${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$branch_name" || \
+    fail "required local branch does not exist: $branch_name"
+done
 
 worktree_status=$("${git_cmd[@]}" status --porcelain=v1 --untracked-files=all)
-[[ -z "$worktree_status" ]] || \
-  fail "worktree must be clean before synchronization"
+[[ -z "$worktree_status" ]] || fail "worktree must be clean before synchronization"
+
+"${git_cmd[@]}" merge-base --is-ancestor "$DEPLOY_BRANCH" "$CONFIG_BRANCH" || \
+  fail "$DEPLOY_BRANCH contains commits not present in $CONFIG_BRANCH"
 
 deploy_dir=${CCLOAD_DEPLOY_DIR:-}
 [[ -n "$deploy_dir" ]] || fail "CCLOAD_DEPLOY_DIR is required"
@@ -109,8 +113,9 @@ case "$compose_file" in
 esac
 [[ -f "$compose_file" ]] || fail "Compose file not found: $compose_file"
 
-base_before=$("${git_cmd[@]}" rev-parse "$base_branch")
-deploy_before=$("${git_cmd[@]}" rev-parse "$current_branch")
+base_before=$("${git_cmd[@]}" rev-parse "$BASE_BRANCH")
+config_before=$("${git_cmd[@]}" rev-parse "$CONFIG_BRANCH")
+deploy_before=$("${git_cmd[@]}" rev-parse "$DEPLOY_BRANCH")
 
 if "${git_cmd[@]}" remote get-url "$upstream_remote" >/dev/null 2>&1; then
   configured_upstream=$("${git_cmd[@]}" remote get-url "$upstream_remote")
@@ -120,16 +125,20 @@ fi
 
 if (( dry_run )); then
   info "dry run: repository=$repo_root"
-  info "dry run: deployment branch=$current_branch ($deploy_before)"
-  info "dry run: base branch=$base_branch ($base_before)"
+  info "dry run: original branch=$original_branch"
+  info "dry run: base branch=$BASE_BRANCH ($base_before)"
+  info "dry run: config branch=$CONFIG_BRANCH ($config_before)"
+  info "dry run: deploy branch=$DEPLOY_BRANCH ($deploy_before)"
   if [[ -z "$configured_upstream" ]]; then
     info "dry run: add remote $upstream_remote -> $upstream_url"
   else
     info "dry run: use remote $upstream_remote -> $configured_upstream"
   fi
   info "dry run: fetch $upstream_remote/$upstream_branch"
-  info "dry run: fast-forward $base_branch, then rebase $current_branch"
-  info "dry run: build $compose_file with deployment data in $deploy_dir"
+  info "dry run: fast-forward $BASE_BRANCH"
+  info "dry run: merge $BASE_BRANCH into $CONFIG_BRANCH"
+  info "dry run: fast-forward $DEPLOY_BRANCH to $CONFIG_BRANCH"
+  info "dry run: build $compose_file from $DEPLOY_BRANCH with data in $deploy_dir"
   exit 0
 fi
 
@@ -141,8 +150,9 @@ else
 fi
 
 info "Fetching $upstream_remote/$upstream_branch"
-"${git_cmd[@]}" fetch --prune "$upstream_remote" "$upstream_branch"
 upstream_ref="refs/remotes/$upstream_remote/$upstream_branch"
+"${git_cmd[@]}" fetch --prune "$upstream_remote" \
+  "refs/heads/$upstream_branch:$upstream_ref"
 "${git_cmd[@]}" show-ref --verify --quiet "$upstream_ref" || \
   fail "fetched upstream ref is unavailable: $upstream_ref"
 upstream_commit=$("${git_cmd[@]}" rev-parse "$upstream_ref")
@@ -153,26 +163,30 @@ cleanup() {
   if (( status != 0 )); then
     local git_dir
     git_dir=$("${git_cmd[@]}" rev-parse --absolute-git-dir 2>/dev/null || true)
-    if [[ -n "$git_dir" && ( -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ) ]]; then
-      "${git_cmd[@]}" rebase --abort >/dev/null 2>&1 || true
+    if [[ -n "$git_dir" && -f "$git_dir/MERGE_HEAD" ]]; then
+      "${git_cmd[@]}" merge --abort >/dev/null 2>&1 || true
     fi
     local active_branch
     active_branch=$("${git_cmd[@]}" branch --show-current 2>/dev/null || true)
-    if [[ "$active_branch" != "$current_branch" ]]; then
-      "${git_cmd[@]}" switch "$current_branch" >/dev/null 2>&1 || true
+    if [[ "$active_branch" != "$original_branch" ]]; then
+      "${git_cmd[@]}" switch "$original_branch" >/dev/null 2>&1 || true
     fi
   fi
   exit "$status"
 }
 trap cleanup EXIT
 
-info "Fast-forwarding $base_branch to $upstream_remote/$upstream_branch"
-"${git_cmd[@]}" switch "$base_branch"
+info "Fast-forwarding $BASE_BRANCH to $upstream_remote/$upstream_branch"
+"${git_cmd[@]}" switch "$BASE_BRANCH"
 "${git_cmd[@]}" merge --ff-only "$upstream_ref"
 
-info "Rebasing $current_branch onto $base_branch"
-"${git_cmd[@]}" switch "$current_branch"
-"${git_cmd[@]}" rebase "$base_branch"
+info "Merging $BASE_BRANCH into $CONFIG_BRANCH"
+"${git_cmd[@]}" switch "$CONFIG_BRANCH"
+"${git_cmd[@]}" merge --no-edit "$BASE_BRANCH"
+
+info "Fast-forwarding $DEPLOY_BRANCH to $CONFIG_BRANCH"
+"${git_cmd[@]}" switch "$DEPLOY_BRANCH"
+"${git_cmd[@]}" merge --ff-only "$CONFIG_BRANCH"
 
 mkdir -p -- "$data_dir"
 export CCLOAD_DEPLOY_DIR="$deploy_dir"
@@ -185,13 +199,15 @@ compose_cmd=(docker compose -f "$compose_file")
 info "Validating Docker Compose configuration"
 "${compose_cmd[@]}" config --quiet
 
-info "Building and deploying Docker services"
+info "Building and deploying Docker services from $DEPLOY_BRANCH"
 "${compose_cmd[@]}" up -d --build --remove-orphans --wait --wait-timeout "$wait_timeout"
 
-base_after=$("${git_cmd[@]}" rev-parse "$base_branch")
-deploy_after=$("${git_cmd[@]}" rev-parse "$current_branch")
+base_after=$("${git_cmd[@]}" rev-parse "$BASE_BRANCH")
+config_after=$("${git_cmd[@]}" rev-parse "$CONFIG_BRANCH")
+deploy_after=$("${git_cmd[@]}" rev-parse "$DEPLOY_BRANCH")
 info "Synchronization and deployment completed"
 printf 'base:     %s -> %s\n' "$base_before" "$base_after"
 printf 'upstream: %s\n' "$upstream_commit"
+printf 'config:   %s -> %s\n' "$config_before" "$config_after"
 printf 'deploy:   %s -> %s\n' "$deploy_before" "$deploy_after"
 "${compose_cmd[@]}" ps
