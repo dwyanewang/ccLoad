@@ -260,7 +260,23 @@ if (( dry_run )); then
   exit 0
 fi
 
-deploy_script="$deploy_dir/deploy/scripts/rollout.sh"
+edge_mode_file="$deploy_dir/deploy/state/edge-mode"
+case "$(tr -d '[:space:]' < "$edge_mode_file" 2>/dev/null || true)" in
+  docker)
+    deploy_script="$deploy_dir/deploy/scripts/docker-rollout.sh"
+    slots_compose_file="$deploy_dir/deploy/compose.slots.docker.yml"
+    ;;
+  "")
+    # During the staged migration the current host-Nginx topology remains the
+    # only live path. docker-cutover.sh writes the marker after its public
+    # health check passes, so ordinary syncs cannot switch architectures.
+    deploy_script="$deploy_dir/deploy/scripts/rollout.sh"
+    slots_compose_file="$deploy_dir/deploy/compose.slots.yml"
+    ;;
+  *)
+    fail "unknown ccLoad edge mode in $edge_mode_file"
+    ;;
+esac
 [[ -x "$deploy_script" ]] || \
   fail "zero-downtime rollout script is unavailable or not executable: $deploy_script"
 
@@ -311,4 +327,4 @@ else
   printf 'deploy:   (created) -> %s\n' "$candidate_head"
 fi
 docker compose --project-name ccload-slots \
-  -f "$deploy_dir/deploy/compose.slots.yml" ps
+  -f "$slots_compose_file" ps
