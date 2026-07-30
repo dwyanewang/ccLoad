@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
     ports:
       # 宿主机端口:容器端口。只改左边即可对外换端口，不要改右边
-      - "8080:8080"
+      - "8808:8080"
     # 配置与运行数据统一放在 CCLOAD_DEPLOY_DIR 指定的项目外部目录。
     # 文件不存在时 Compose 直接报错拒绝启动，不会用弱默认密码跑起来。
     env_file:
