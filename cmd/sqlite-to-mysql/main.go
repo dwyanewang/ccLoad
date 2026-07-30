@@ -144,11 +144,11 @@ func ensureMySQLSchema() error {
 
 func openSQLite(path string) (*sql.DB, error) {
 	fileURL := (&url.URL{Scheme: "file", Path: path}).String()
-	// The migration source is deliberately mounted read-only.  In particular,
-	// a stopped WAL-mode database may still have -wal/-shm files beside it; an
-	// implicit read-write open then fails before VACUUM INTO can make its
-	// consistent backup.  The output of VACUUM INTO is a separate database and
-	// remains writable.
+	// The source database is deliberately opened read-only. A stopped WAL-mode
+	// database may still need to update its -shm lock file while this connection
+	// reads it, so the surrounding directory must be writable even though this
+	// connection itself can never write database content. The output of VACUUM
+	// INTO is a separate database.
 	db, err := sql.Open("sqlite", fileURL+"?mode=ro&_pragma=busy_timeout(5000)&_foreign_keys=on")
 	if err != nil {
 		return nil, err
