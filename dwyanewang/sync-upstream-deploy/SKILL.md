@@ -19,13 +19,14 @@ description: Atomically rebuild ccLoad's rw-main from the latest official upstre
 ## 执行
 
 1. 确认用户要求执行更新部署，而不是只询问流程。
-2. 从当前 shell 或用户提供的值取得 `CCLOAD_DEPLOY_DIR`。该目录必须位于仓库外，并包含 `.env`；不要猜测未提供的路径。
+2. 使用 `CCLOAD_DEPLOY_DIR` 指定的目录；未设置时默认为 `$HOME/Private/ccLoad`。该目录必须位于仓库外，并包含 `.env`。
 3. 在任意干净的本地分支上执行：
 
 ```bash
-CCLOAD_DEPLOY_DIR=/path/to/deployment \
-  bash dwyanewang/sync-upstream-deploy/scripts/sync-and-deploy.sh
+bash dwyanewang/sync-upstream-deploy/scripts/sync-and-deploy.sh
 ```
+
+只在需要覆盖默认位置时为单次命令传入 `CCLOAD_DEPLOY_DIR=/path/to/deployment`。
 
 4. 报告原 `master`、上游目标、候选 commit、原/新 `rw-main`、备份分支、合并的清单分支和 Compose 健康状态。
 
