@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -78,6 +79,25 @@ func getTrustedProxies() []string {
 		return nil
 	}
 	return proxies
+}
+
+// listenAddress resolves the HTTP listening address from the service port and
+// an optional host-only CCLOAD_LISTEN_ADDR value. Leaving the variable empty
+// retains the historical all-interface behaviour (":PORT"). Deployments that
+// sit behind a local reverse proxy can set it to 127.0.0.1 so backend slots are
+// never reachable directly from the network.
+func listenAddress(port string) string {
+	port = strings.TrimSpace(port)
+	port = strings.TrimPrefix(port, ":")
+	if port == "" {
+		port = "8080"
+	}
+
+	host := strings.TrimSpace(os.Getenv("CCLOAD_LISTEN_ADDR"))
+	if host == "" {
+		return ":" + port
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func main() {
@@ -160,13 +180,7 @@ func main() {
 
 	// session清理循环在NewServer中已启动，避免重复启动
 
-	addr := ":8080"
-	if v := os.Getenv("PORT"); v != "" {
-		if !strings.HasPrefix(v, ":") {
-			v = ":" + v
-		}
-		addr = v
-	}
+	addr := listenAddress(os.Getenv("PORT"))
 
 	// 使用http.Server支持优雅关闭
 	// WriteTimeout 动态计算：确保不早于流式/非流式业务总超时
