@@ -38,6 +38,68 @@ info() {
   printf '==> %s\n' "$*"
 }
 
+warn() {
+  printf 'sync-upstream-deploy: warning: %s\n' "$*" >&2
+}
+
+verify_compose_slot_health() {
+  local project_name=$1 state_file=$2 active_slot health
+  local -a container_ids=()
+
+  active_slot=$(tr -d '[:space:]' < "$state_file")
+  case "$active_slot" in
+    blue|green) ;;
+    *) fail "invalid active slot after rollout: $active_slot" ;;
+  esac
+
+  mapfile -t container_ids < <(docker ps \
+    --filter "label=com.docker.compose.project=$project_name" \
+    --filter "label=com.docker.compose.service=$active_slot" \
+    --format '{{.ID}}')
+  (( ${#container_ids[@]} == 1 )) || \
+    fail "expected one running $project_name/$active_slot container after rollout"
+
+  health=$(docker inspect --format \
+    '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    "${container_ids[0]}")
+  [[ "$health" == healthy ]] || \
+    fail "$project_name/$active_slot is not healthy after rollout: $health"
+  info "Compose health: $project_name/$active_slot is $health"
+}
+
+cleanup_release_images() {
+  local current_image=$1 rollback_commit=${2:-} rollback_image=""
+  local image_lines repository tag image_ref
+  local kept=0 removed=0
+
+  if [[ -n "$rollback_commit" ]]; then
+    rollback_image="ccload:rw-${rollback_commit:0:12}"
+  fi
+  if ! image_lines=$(docker image ls ccload --format '{{.Repository}}\t{{.Tag}}'); then
+    warn "could not list release images; old images were left unchanged"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r repository tag; do
+    [[ "$repository" == ccload && "$tag" == rw-* ]] || continue
+    image_ref="$repository:$tag"
+    if [[ "$image_ref" == "$current_image" || \
+          ( -n "$rollback_image" && "$image_ref" == "$rollback_image" ) ]]; then
+      kept=$((kept + 1))
+      continue
+    fi
+
+    info "Removing old release image $image_ref"
+    if docker image rm "$image_ref" >/dev/null; then
+      removed=$((removed + 1))
+    else
+      warn "could not remove old release image $image_ref"
+    fi
+  done <<< "$image_lines"
+
+  info "Release image cleanup: kept $kept, removed $removed"
+}
+
 dry_run=0
 case "${1:-}" in
   "") ;;
@@ -264,14 +326,14 @@ edge_mode_file="$deploy_dir/deploy/state/edge-mode"
 case "$(tr -d '[:space:]' < "$edge_mode_file" 2>/dev/null || true)" in
   docker)
     deploy_script="$deploy_dir/deploy/scripts/docker-rollout.sh"
-    slots_compose_file="$deploy_dir/deploy/compose.slots.docker.yml"
+    slots_project="ccload-internal-slots"
     ;;
   "")
     # During the staged migration the current host-Nginx topology remains the
     # only live path. docker-cutover.sh writes the marker after its public
     # health check passes, so ordinary syncs cannot switch architectures.
     deploy_script="$deploy_dir/deploy/scripts/rollout.sh"
-    slots_compose_file="$deploy_dir/deploy/compose.slots.yml"
+    slots_project="ccload-slots"
     ;;
   *)
     fail "unknown ccLoad edge mode in $edge_mode_file"
@@ -313,6 +375,8 @@ candidate_created=0
 mkdir -p -- "$data_dir"
 info "Delegating ccload:$image_tag to the persistent zero-downtime rollout"
 CCLOAD_DEPLOY_WAIT_TIMEOUT="$wait_timeout" "$deploy_script" --image "ccload:$image_tag"
+verify_compose_slot_health "$slots_project" "$deploy_dir/deploy/state/active-slot"
+cleanup_release_images "ccload:$image_tag" "$deploy_before"
 
 info "Synchronization and deployment completed"
 printf 'base:     %s -> %s\n' "$base_before" "$upstream_commit"
@@ -326,5 +390,3 @@ if [[ -n "$deploy_before" ]]; then
 else
   printf 'deploy:   (created) -> %s\n' "$candidate_head"
 fi
-docker compose --project-name ccload-slots \
-  -f "$slots_compose_file" ps

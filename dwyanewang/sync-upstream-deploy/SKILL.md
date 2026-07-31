@@ -49,6 +49,8 @@ bash dwyanewang/sync-upstream-deploy/scripts/sync-and-deploy.sh
 - 验证通过后，将旧 `rw-main` 保存为 `rw-main-backup-latest`，再原子更新 `master` 和 `rw-main`。
 - 永不执行 stash、hard reset、rebase、force push 或普通 push。
 - 成功后停留在 `rw-main`，将不可变镜像标签交给项目外的发布器；发布器健康检查新槽位、切换入口代理并排空旧槽位。
+- 发布成功并再次确认活动 Compose 槽位健康后，只保留当前 `rw-main` 与 `rw-main-backup-latest` 对应的 `ccload:rw-*` 镜像；更早的发布镜像使用非强制删除，删除失败只告警。
+- 不自动执行全局 BuildKit cache prune；默认构建器可能由多个项目共享，缓存容量治理必须作为独立、显式的主机维护操作。
 
 `--dry-run` 会 fetch 上游、创建和验证临时候选，但不移动 `master`/`rw-main` 且不启动服务。用户明确要求更新部署时直接执行正常模式。
 
