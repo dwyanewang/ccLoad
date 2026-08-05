@@ -52,8 +52,6 @@ Thumbs.db
 .claude/skills/*
 !.claude/skills/sync-cliproxy-core
 !.claude/skills/ccload-release
-!.claude/skills/release-ccload
-!.claude/skills/sync-upstream-deploy
 com.ccload.service.plist
 .dataX
 .serena
@@ -74,3 +72,9 @@ docs
 /superpowers/
 .omc
 .qoder
+
+# Local deployment skill
+!.claude/skills/sync-upstream-deploy
+
+# Local deployment skill
+!.claude/skills/sync-upstream-deploy
