@@ -1,4 +1,4 @@
 interface:
-  display_name: "同步上游并部署"
-  short_description: "原子重建 ccLoad rw-main 并构建、验证 Docker 部署"
-  default_prompt: "使用 $sync-upstream-deploy 从最新上游和分支清单原子重建 rw-main，并重新构建验证 Docker。"
+  display_name: "同步三端上游并部署"
+  short_description: "同步官方上游、本地与 origin master，并原子重建部署 ccLoad"
+  default_prompt: "使用 $sync-upstream-deploy 同步官方上游、本地 master 与 origin/master，并原子重建 rw-main 后部署 Docker。"

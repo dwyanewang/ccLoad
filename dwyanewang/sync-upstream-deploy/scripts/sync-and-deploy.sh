@@ -13,8 +13,9 @@ usage() {
 Usage: sync-and-deploy.sh [--dry-run]
 
 Rebuild rw-main from the latest upstream master, the Docker configuration
-branch, and the branches listed in dwyanewang/rw-main-branches.txt. Branch refs
-move only after the candidate passes Compose validation and image build.
+branch, and the branches listed in dwyanewang/rw-main-branches.txt. After the
+candidate passes validation and build, fast-forward origin/master and then move
+the local release refs.
 
   --dry-run  Build and verify a candidate without moving branches or deploying.
 
@@ -24,6 +25,7 @@ Optional environment:
   CCLOAD_UPSTREAM_REMOTE        Upstream remote name (default: upstream)
   CCLOAD_UPSTREAM_URL           URL used when adding the remote
   CCLOAD_UPSTREAM_BRANCH        Upstream branch (default: master)
+  CCLOAD_ORIGIN_REMOTE          Mirror remote name (default: origin)
   CCLOAD_COMPOSE_FILE           Repo-relative Compose file
   CCLOAD_DEPLOY_WAIT_TIMEOUT    Compose health wait in seconds (default: 180)
 EOF
@@ -205,8 +207,11 @@ data_dir="$deploy_dir/data"
 upstream_remote=${CCLOAD_UPSTREAM_REMOTE:-upstream}
 upstream_url=${CCLOAD_UPSTREAM_URL:-$DEFAULT_UPSTREAM_URL}
 upstream_branch=${CCLOAD_UPSTREAM_BRANCH:-master}
+origin_remote=${CCLOAD_ORIGIN_REMOTE:-origin}
 compose_relative=${CCLOAD_COMPOSE_FILE:-docker-compose.build.yml}
 wait_timeout=${CCLOAD_DEPLOY_WAIT_TIMEOUT:-180}
+[[ "$origin_remote" != "$upstream_remote" ]] || \
+  fail "CCLOAD_ORIGIN_REMOTE and CCLOAD_UPSTREAM_REMOTE must differ"
 [[ "$wait_timeout" =~ ^[1-9][0-9]*$ ]] || \
   fail "CCLOAD_DEPLOY_WAIT_TIMEOUT must be a positive integer"
 
@@ -224,6 +229,11 @@ else
   info "Adding upstream remote $upstream_remote ($upstream_url)"
   "${git_cmd[@]}" remote add "$upstream_remote" "$upstream_url"
 fi
+if origin_url=$("${git_cmd[@]}" remote get-url "$origin_remote" 2>/dev/null); then
+  info "Using origin remote $origin_remote ($origin_url)"
+else
+  fail "origin remote does not exist: $origin_remote"
+fi
 
 upstream_ref="refs/remotes/$upstream_remote/$upstream_branch"
 info "Fetching $upstream_remote/$upstream_branch"
@@ -232,10 +242,20 @@ info "Fetching $upstream_remote/$upstream_branch"
 "${git_cmd[@]}" show-ref --verify --quiet "$upstream_ref" || \
   fail "fetched upstream ref is unavailable: $upstream_ref"
 
+origin_ref="refs/remotes/$origin_remote/$BASE_BRANCH"
+info "Fetching $origin_remote/$BASE_BRANCH"
+"${git_cmd[@]}" fetch --prune "$origin_remote" \
+  "refs/heads/$BASE_BRANCH:$origin_ref"
+"${git_cmd[@]}" show-ref --verify --quiet "$origin_ref" || \
+  fail "fetched origin ref is unavailable: $origin_ref"
+
 base_before=$("${git_cmd[@]}" rev-parse "$BASE_BRANCH")
 upstream_commit=$("${git_cmd[@]}" rev-parse "$upstream_ref")
+origin_before=$("${git_cmd[@]}" rev-parse "$origin_ref")
 "${git_cmd[@]}" merge-base --is-ancestor "$base_before" "$upstream_commit" || \
   fail "$BASE_BRANCH cannot fast-forward to $upstream_remote/$upstream_branch"
+"${git_cmd[@]}" merge-base --is-ancestor "$origin_before" "$upstream_commit" || \
+  fail "$origin_remote/$BASE_BRANCH cannot fast-forward to $upstream_remote/$upstream_branch"
 
 config_commit=$("${git_cmd[@]}" rev-parse "$CONFIG_BRANCH")
 if "${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$DEPLOY_BRANCH"; then
@@ -245,6 +265,7 @@ else
 fi
 
 info "Base: $BASE_BRANCH ($base_before -> $upstream_commit)"
+info "Origin: $origin_remote/$BASE_BRANCH ($origin_before -> $upstream_commit)"
 info "Configuration: $CONFIG_BRANCH ($config_commit)"
 for branch_name in "${integration_branches[@]}"; do
   read -r behind ahead < <("${git_cmd[@]}" rev-list --left-right --count \
@@ -318,7 +339,7 @@ if (( dry_run )); then
   "${git_cmd[@]}" switch --quiet "$original_branch"
   "${git_cmd[@]}" branch -D "$candidate_branch" >/dev/null
   candidate_created=0
-  info "Dry run passed; $BASE_BRANCH and $DEPLOY_BRANCH were not changed"
+  info "Dry run passed; local refs and remote $origin_remote/$BASE_BRANCH were not changed"
   exit 0
 fi
 
@@ -347,6 +368,16 @@ if "${git_cmd[@]}" show-ref --verify --quiet "refs/heads/$BACKUP_BRANCH"; then
 else
   backup_before=""
 fi
+
+info "Fast-forwarding $origin_remote/$BASE_BRANCH to $upstream_commit"
+"${git_cmd[@]}" push "$origin_remote" \
+  "$upstream_ref:refs/heads/$BASE_BRANCH"
+info "Verifying $origin_remote/$BASE_BRANCH"
+"${git_cmd[@]}" fetch --prune "$origin_remote" \
+  "refs/heads/$BASE_BRANCH:$origin_ref"
+origin_after=$("${git_cmd[@]}" rev-parse "$origin_ref")
+[[ "$origin_after" == "$upstream_commit" ]] || \
+  fail "$origin_remote/$BASE_BRANCH changed during synchronization: $origin_after"
 
 info "Atomically updating $BASE_BRANCH and $DEPLOY_BRANCH"
 {
@@ -381,6 +412,7 @@ cleanup_release_images "ccload:$image_tag" "$deploy_before"
 info "Synchronization and deployment completed"
 printf 'base:     %s -> %s\n' "$base_before" "$upstream_commit"
 printf 'upstream: %s\n' "$upstream_commit"
+printf 'origin:   %s -> %s\n' "$origin_before" "$origin_after"
 printf 'config:   %s\n' "$config_commit"
 printf 'candidate: %s\n' "$candidate_head"
 printf 'image:    ccload:%s\n' "$image_tag"
