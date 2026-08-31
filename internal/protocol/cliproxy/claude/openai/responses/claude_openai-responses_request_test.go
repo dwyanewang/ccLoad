@@ -1369,3 +1369,125 @@ func TestConvertOpenAIResponsesRequestToClaude_ServiceTierToSpeed(t *testing.T) 
 		})
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToClaude_PreservesCallerSuppliedMetadataUserID(t *testing.T) {
+	testCases := []struct {
+		name     string
+		rawJSON  string
+		expected string
+	}{
+		{
+			name:     "plain string",
+			rawJSON:  `{"model":"claude-test","metadata":{"user_id":"custom-resp-user-123"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
+			expected: "custom-resp-user-123",
+		},
+		{
+			name:     "special characters and json string",
+			rawJSON:  `{"model":"claude-test","metadata":{"user_id":"foo\"bar\nbaz\\qux"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
+			expected: "foo\"bar\nbaz\\qux",
+		},
+		{
+			name:     "claude code json format",
+			rawJSON:  `{"model":"claude-test","metadata":{"user_id":"{\"device_id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"session_id\":\"11111111-2222-4333-8444-555555555555\"}"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
+			expected: `{"device_id":"0000000000000000000000000000000000000000000000000000000000000000","session_id":"11111111-2222-4333-8444-555555555555"}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := ConvertOpenAIResponsesRequestToClaude("claude-test", []byte(tc.rawJSON), false)
+			if !gjson.ValidBytes(out) {
+				t.Fatalf("output is invalid json: %s", string(out))
+			}
+			got := gjson.GetBytes(out, "metadata.user_id").String()
+			if got != tc.expected {
+				t.Fatalf("metadata.user_id = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_PreservesUserField(t *testing.T) {
+	raw := []byte(`{"model":"claude-test","user":"openai-resp-user-456","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("output is invalid json: %s", string(out))
+	}
+	got := gjson.GetBytes(out, "metadata.user_id").String()
+	if got != "openai-resp-user-456" {
+		t.Fatalf("metadata.user_id = %q, want %q", got, "openai-resp-user-456")
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_DifferentSessionsProduceDifferentUserIDs(t *testing.T) {
+	a := []byte(`{"model":"claude-test","prompt_cache_key":"resp-session-a","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	b := []byte(`{"model":"claude-test","prompt_cache_key":"resp-session-b","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	outA := ConvertOpenAIResponsesRequestToClaude("claude-test", a, false)
+	outB := ConvertOpenAIResponsesRequestToClaude("claude-test", b, false)
+	idA := gjson.GetBytes(outA, "metadata.user_id").String()
+	idB := gjson.GetBytes(outB, "metadata.user_id").String()
+	if idA == idB {
+		t.Fatalf("different prompt_cache_key produced identical metadata.user_id: %q", idA)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_DifferentUserContentWithSameSystemPrompt(t *testing.T) {
+	rawA := []byte(`{
+		"model": "claude-test",
+		"instructions": "global instruction",
+		"input": [
+			{"type": "message", "role": "system", "content": "system context"},
+			{"type": "message", "role": "user", "content": "user question A"}
+		]
+	}`)
+	rawB := []byte(`{
+		"model": "claude-test",
+		"instructions": "global instruction",
+		"input": [
+			{"type": "message", "role": "system", "content": "system context"},
+			{"type": "message", "role": "user", "content": "user question B"}
+		]
+	}`)
+	outA := ConvertOpenAIResponsesRequestToClaude("claude-test", rawA, false)
+	outB := ConvertOpenAIResponsesRequestToClaude("claude-test", rawB, false)
+	idA := gjson.GetBytes(outA, "metadata.user_id").String()
+	idB := gjson.GetBytes(outB, "metadata.user_id").String()
+	if idA == "" || idB == "" || idA == "unknown" || idB == "unknown" {
+		t.Fatalf("expected valid derived user_id, got idA=%q idB=%q", idA, idB)
+	}
+	if idA == idB {
+		t.Fatalf("different user questions with same system prompt produced identical metadata.user_id: %q", idA)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_FableStripsTrailingAssistantPrefill(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"progress"}]}]}`)
+	messages := gjson.GetBytes(ConvertOpenAIResponsesRequestToClaude("claude-fable-5", raw, false), "messages").Array()
+	if len(messages) != 1 || messages[0].Get("role").String() != "user" || messages[0].Get("content").String() != "hello" {
+		t.Fatalf("messages = %v, want one user hello turn", messages)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_FableOnlyAssistantMessageYieldsFallbackUser(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"progress"}]}]}`)
+	messages := gjson.GetBytes(ConvertOpenAIResponsesRequestToClaude("claude-fable-5", raw, false), "messages").Array()
+	if len(messages) != 1 || messages[0].Get("role").String() != "user" {
+		t.Fatalf("messages = %v, want one fallback user turn", messages)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_NonFablePreservesAssistantPrefill(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill"}]}]}`)
+	messages := gjson.GetBytes(ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-5", raw, false), "messages").Array()
+	if len(messages) != 2 || messages[1].Get("role").String() != "assistant" {
+		t.Fatalf("messages = %v, want preserved assistant prefill", messages)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaudeWithCompat_FablePreservesAssistantPrefill(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"prefill"}]}]}`)
+	messages := gjson.GetBytes(ConvertOpenAIResponsesRequestToClaudeWithCompat("claude-fable-5", raw, false), "messages").Array()
+	if len(messages) != 2 || messages[1].Get("role").String() != "assistant" {
+		t.Fatalf("messages = %v, want preserved compat prefill", messages)
+	}
+}

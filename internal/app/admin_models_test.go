@@ -109,6 +109,76 @@ func TestAdminModels_FetchModelsPreview(t *testing.T) {
 		}
 	})
 
+	t.Run("per-key discovery returns union and scoped results without secrets", func(t *testing.T) {
+		perKeyUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Header.Get("Authorization") {
+			case "Bearer sk-a":
+				_, _ = w.Write([]byte(`{"data":[{"id":"model-a"},{"id":"common"}]}`))
+			case "Bearer sk-b":
+				_, _ = w.Write([]byte(`{"data":[{"id":"model-b"},{"id":"common"}]}`))
+			default:
+				http.Error(w, "invalid api key sk-bad", http.StatusUnauthorized)
+			}
+		}))
+		t.Cleanup(perKeyUpstream.Close)
+
+		payload := map[string]any{
+			"protocol": "openai",
+			"urls":     []map[string]any{{"url": perKeyUpstream.URL, "protocols": []string{"openai"}}},
+			"api_keys": []string{"sk-a", "sk-bad", "sk-b"},
+			"per_key":  true,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		server.HandleFetchModelsPreview(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 body=%s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "sk-a") || strings.Contains(w.Body.String(), "sk-b") {
+			t.Fatalf("response leaked API key: %s", w.Body.String())
+		}
+		resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+		if !resp.Success || len(resp.Data.Models) != 3 || len(resp.Data.KeyModels) != 3 {
+			t.Fatalf("unexpected per-key response: %s", w.Body.String())
+		}
+		if resp.Data.KeyModels[0].KeyIndex != 0 || len(resp.Data.KeyModels[0].Models) != 2 {
+			t.Fatalf("key 0 result=%+v", resp.Data.KeyModels[0])
+		}
+		if resp.Data.KeyModels[1].KeyIndex != 1 || resp.Data.KeyModels[1].Error == "" {
+			t.Fatalf("key 1 failure=%+v", resp.Data.KeyModels[1])
+		}
+		if resp.Data.KeyModels[2].KeyIndex != 2 || len(resp.Data.KeyModels[2].Models) != 2 {
+			t.Fatalf("key 2 result=%+v", resp.Data.KeyModels[2])
+		}
+	})
+
+	t.Run("per-key discovery fails when every key fails", func(t *testing.T) {
+		failedUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "invalid api key sk-secret", http.StatusUnauthorized)
+		}))
+		t.Cleanup(failedUpstream.Close)
+
+		payload := map[string]any{
+			"protocol": "openai",
+			"urls":     []map[string]any{{"url": failedUpstream.URL, "protocols": []string{"openai"}}},
+			"api_keys": []string{"sk-bad-a", "sk-bad-b"},
+			"per_key":  true,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/fetch", payload))
+		server.HandleFetchModelsPreview(c)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 body=%s", w.Code, w.Body.String())
+		}
+		resp := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
+		if resp.Success || !strings.Contains(resp.Error, "所有 API Key 模型探测均失败") {
+			t.Fatalf("unexpected response: %s", w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "sk-secret") {
+			t.Fatalf("response leaked upstream error body: %s", w.Body.String())
+		}
+	})
+
 	t.Run("normalization options preserve upstream model names", func(t *testing.T) {
 		normalizationUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/v1/models" {
@@ -180,19 +250,20 @@ func TestAdminModels_FetchSub2APIBillingPreview(t *testing.T) {
 
 	for _, baseURL := range []string{upstream.URL, upstream.URL + "/v1/"} {
 		payload := map[string]any{
+			"profile":  model.ChannelManagementProfileSub2API,
 			"base_url": baseURL,
 			"api_key":  "sk-billing-test",
 		}
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
 
-		server.HandleFetchSub2APIBilling(c)
+		server.HandleFetchKeyRate(c)
 		if w.Code != http.StatusOK {
 			t.Fatalf("baseURL=%q status=%d, want %d, body=%s", baseURL, w.Code, http.StatusOK, w.Body.String())
 		}
 
 		var resp struct {
-			Success bool                        `json:"success"`
-			Data    fetchSub2APIBillingResponse `json:"data"`
+			Success bool                 `json:"success"`
+			Data    fetchKeyRateResponse `json:"data"`
 		}
 		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
 		if !resp.Success || resp.Data.EffectiveRateMultiplier != 1.2 {
@@ -205,6 +276,211 @@ func TestAdminModels_FetchSub2APIBillingPreview(t *testing.T) {
 	}
 	if gotAccept != "application/json" {
 		t.Fatalf("Accept=%q, want application/json", gotAccept)
+	}
+}
+
+func TestAdminModels_FetchNewAPIKeyRatePreview(t *testing.T) {
+	var calls []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		if got := r.Header.Get("Authorization"); got != "Bearer management-pat" {
+			t.Errorf("Authorization=%q, want management PAT", got)
+		}
+		if got := r.Header.Get("New-API-User"); got != "42" {
+			t.Errorf("New-API-User=%q, want 42", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/token/search":
+			if got := r.URL.Query().Get("token"); got != "new" {
+				t.Errorf("token query=%q, want New API relay token prefix", got)
+			}
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"items":[{"key":"abcd**********wxyz","group":"vip"}],"total":1}
+			}`))
+		case "/api/user/self/groups":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"default":{"ratio":1,"desc":"Default"},"vip":{"ratio":0.75,"desc":"VIP"}}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	userID := int64(42)
+	payload := map[string]any{
+		"profile":      model.ChannelManagementProfileNewAPI,
+		"base_url":     upstream.URL,
+		"api_key":      "sk-new-api-key",
+		"access_token": "management-pat",
+		"user_id":      userID,
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+	server.HandleFetchKeyRate(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	var resp struct {
+		Success bool                 `json:"success"`
+		Data    fetchKeyRateResponse `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if !resp.Success || resp.Data.EffectiveRateMultiplier != 0.75 {
+		t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
+	}
+	wantCalls := []string{"/api/token/search", "/api/user/self/groups"}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("upstream calls=%v, want %v", calls, wantCalls)
+	}
+	if strings.Contains(w.Body.String(), "management-pat") || strings.Contains(w.Body.String(), "sk-new-api-key") {
+		t.Fatalf("response leaked a secret: %s", w.Body.String())
+	}
+}
+
+func TestAdminModels_FetchNewAPIKeyRateRejectsAutoGroup(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/api/token/search" {
+			t.Errorf("unexpected upstream path %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"success":true,
+			"message":"",
+			"data":{"items":[{"group":"auto"}],"total":1}
+		}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	payload := map[string]any{
+		"profile":      model.ChannelManagementProfileNewAPI,
+		"base_url":     upstream.URL,
+		"api_key":      "sk-auto-key",
+		"access_token": "management-pat",
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+	server.HandleFetchKeyRate(c)
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Code string `json:"code"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if resp.Success || resp.Data.Code != sub2APIBillingErrorUnsupported {
+		t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
+	}
+}
+
+func TestAdminModels_FetchNewAPIKeyRateUsesOwnerGroupForLegacyKey(t *testing.T) {
+	var calls []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/token/search":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"items":[{"group":""}],"total":1}
+			}`))
+		case "/api/user/self":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"group":"default"}
+			}`))
+		case "/api/user/self/groups":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"default":{"ratio":1.25,"desc":"Default"}}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	payload := map[string]any{
+		"profile":      model.ChannelManagementProfileNewAPI,
+		"base_url":     upstream.URL,
+		"api_key":      "sk-legacy-key",
+		"access_token": "management-pat",
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+	server.HandleFetchKeyRate(c)
+	var resp struct {
+		Success bool                 `json:"success"`
+		Data    fetchKeyRateResponse `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if !resp.Success || resp.Data.EffectiveRateMultiplier != 1.25 {
+		t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
+	}
+	wantCalls := []string{"/api/token/search", "/api/user/self", "/api/user/self/groups"}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("upstream calls=%v, want %v", calls, wantCalls)
+	}
+}
+
+func TestAdminModels_FetchNewAPIKeyRateRejectsNullRatio(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/token/search":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"items":[{"group":"vip"}],"total":1}
+			}`))
+		case "/api/user/self/groups":
+			_, _ = w.Write([]byte(`{
+				"success":true,
+				"message":"",
+				"data":{"vip":{"ratio":null,"desc":"VIP"}}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	payload := map[string]any{
+		"profile":      model.ChannelManagementProfileNewAPI,
+		"base_url":     upstream.URL,
+		"api_key":      "sk-null-ratio",
+		"access_token": "management-pat",
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
+
+	server.HandleFetchKeyRate(c)
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Code string `json:"code"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+	if resp.Success || resp.Data.Code != sub2APIBillingErrorInvalid {
+		t.Fatalf("unexpected resp: %+v, body=%s", resp, w.Body.String())
 	}
 }
 
@@ -293,10 +569,14 @@ func TestAdminModels_FetchSub2APIBillingRejectsUntrustedResponses(t *testing.T) 
 
 			server, _, cleanup := setupAdminTestServer(t)
 			defer cleanup()
-			payload := map[string]any{"base_url": upstream.URL, "api_key": "sk-request-secret"}
+			payload := map[string]any{
+				"profile":  model.ChannelManagementProfileSub2API,
+				"base_url": upstream.URL,
+				"api_key":  "sk-request-secret",
+			}
 			c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
 
-			server.HandleFetchSub2APIBilling(c)
+			server.HandleFetchKeyRate(c)
 			if w.Code != http.StatusOK {
 				t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
 			}
@@ -341,10 +621,14 @@ func TestAdminModels_FetchSub2APIBillingDoesNotFollowRedirects(t *testing.T) {
 
 	server, _, cleanup := setupAdminTestServer(t)
 	defer cleanup()
-	payload := map[string]any{"base_url": upstream.URL, "api_key": "sk-redirect-secret"}
+	payload := map[string]any{
+		"profile":  model.ChannelManagementProfileSub2API,
+		"base_url": upstream.URL,
+		"api_key":  "sk-redirect-secret",
+	}
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/billing/fetch", payload))
 
-	server.HandleFetchSub2APIBilling(c)
+	server.HandleFetchKeyRate(c)
 	var resp struct {
 		Success bool `json:"success"`
 		Data    struct {
@@ -521,17 +805,17 @@ func TestAdminModels_HandleFetchModels_AntigravityOAuth(t *testing.T) {
 	want := []model.ModelEntry{
 		{Model: "claude-opus-4-6-thinking", RedirectModel: "claude-opus-4-6-thinking"},
 		{Model: "claude-sonnet-4-6", RedirectModel: "claude-sonnet-4-6"},
-		{Model: "gemini-3.7-flash-high", RedirectModel: "gemini-3.7-flash-high"},
-		{Model: "gemini-3.6-flash-high", RedirectModel: "gemini-3.6-flash-high"},
 		{Model: "gemini-3-flash", RedirectModel: "gemini-3-flash"},
 		{Model: "gemini-3-flash-agent", RedirectModel: "gemini-3-flash-agent"},
 		{Model: "gemini-3.1-flash-image", RedirectModel: "gemini-3.1-flash-image"},
-		{Model: "gemini-pro-agent", RedirectModel: "gemini-pro-agent"},
-		{Model: "gemini-3.1-pro-low", RedirectModel: "gemini-3.1-pro-low"},
-		{Model: "gpt-oss-120b-medium", RedirectModel: "gpt-oss-120b-medium"},
 		{Model: "gemini-3.1-flash-lite", RedirectModel: "gemini-3.1-flash-lite"},
-		{Model: "gemini-3.5-flash-low", RedirectModel: "gemini-3.5-flash-low"},
+		{Model: "gemini-3.1-pro-low", RedirectModel: "gemini-3.1-pro-low"},
 		{Model: "gemini-3.5-flash-extra-low", RedirectModel: "gemini-3.5-flash-extra-low"},
+		{Model: "gemini-3.5-flash-low", RedirectModel: "gemini-3.5-flash-low"},
+		{Model: "gemini-3.6-flash-high", RedirectModel: "gemini-3.6-flash-high"},
+		{Model: "gemini-3.7-flash-high", RedirectModel: "gemini-3.7-flash-high"},
+		{Model: "gemini-pro-agent", RedirectModel: "gemini-pro-agent"},
+		{Model: "gpt-oss-120b-medium", RedirectModel: "gpt-oss-120b-medium"},
 	}
 	if !resp.Success || !reflect.DeepEqual(resp.Data.Models, want) || resp.Data.Protocol != "gemini" {
 		t.Fatalf("unexpected response: %s", w.Body.String())
@@ -670,11 +954,11 @@ func TestAdminModels_HandleFetchModels_CodexOAuth(t *testing.T) {
 		t.Fatalf("response leaked OAuth token: %s", w.Body.String())
 	}
 	want := []model.ModelEntry{
-		{Model: "gpt-5.6-terra", RedirectModel: "gpt-5.6-terra"},
-		{Model: "gpt-5.6-luna", RedirectModel: "gpt-5.6-luna"},
-		{Model: "gpt-5.5", RedirectModel: "gpt-5.5"},
-		{Model: "gpt-5.4-mini", RedirectModel: "gpt-5.4-mini"},
 		{Model: "codex-auto-review", RedirectModel: "codex-auto-review"},
+		{Model: "gpt-5.4-mini", RedirectModel: "gpt-5.4-mini"},
+		{Model: "gpt-5.5", RedirectModel: "gpt-5.5"},
+		{Model: "gpt-5.6-luna", RedirectModel: "gpt-5.6-luna"},
+		{Model: "gpt-5.6-terra", RedirectModel: "gpt-5.6-terra"},
 		{Model: "gpt-image-1.5", RedirectModel: "gpt-image-1.5"},
 		{Model: "gpt-image-2", RedirectModel: "gpt-image-2"},
 	}
@@ -732,19 +1016,19 @@ func TestAdminModels_HandleFetchModels_XAIOAuthUsesFixedCatalog(t *testing.T) {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 	wantNames := []string{
-		"grok-build-0.1",
-		"grok-4.6",
-		"grok-4.5",
-		"grok-4.3",
-		"grok-4.20-0309-reasoning",
-		"grok-4.20-0309-non-reasoning",
-		"grok-4.20-multi-agent-0309",
 		"grok-3-mini",
 		"grok-3-mini-fast",
+		"grok-4.20-0309-non-reasoning",
+		"grok-4.20-0309-reasoning",
+		"grok-4.20-multi-agent-0309",
+		"grok-4.3",
+		"grok-4.5",
+		"grok-4.6",
+		"grok-build-0.1",
 		"grok-composer-2.5-fast",
 		"grok-imagine-image",
-		"grok-imagine-image-quality",
 		"grok-imagine-image-2.0",
+		"grok-imagine-image-quality",
 	}
 	response := mustParseAPIResponse[FetchModelsResponse](t, w.Body.Bytes())
 	if !response.Success || response.Data.Protocol != "codex" || response.Data.Source != "predefined" {
@@ -1559,6 +1843,172 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 		}
 	})
 
+	t.Run("replace mode unions per-key models across groups", func(t *testing.T) {
+		var upstreamAuth []string
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			upstreamAuth = append(upstreamAuth, auth)
+			switch auth {
+			case "Bearer group-a":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"ma-1"}]}`))
+			case "Bearer group-b":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"mb-1"}]}`))
+			default:
+				http.Error(w, "invalid api key", http.StatusUnauthorized)
+			}
+		}))
+		t.Cleanup(upstream.Close)
+
+		server, store, cleanup := setupAdminTestServer(t)
+		defer cleanup()
+
+		ctx := context.Background()
+		cfg, err := store.CreateConfig(ctx, &model.Config{
+			Name:         "multi-group-channel",
+			URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"openai"}}},
+			Priority:     1,
+			ModelEntries: []model.ModelEntry{{Model: "stale-only"}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig failed: %v", err)
+		}
+		// group-a 正常可用；group-b 作用域被裁剪空而自动禁用（凭据仍有效）；
+		// manual-off 手动禁用，不得参与探测。
+		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+			{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "group-a", KeyStrategy: model.KeyStrategySequential},
+			{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "group-b", KeyStrategy: model.KeyStrategySequential, Disabled: true, ModelScopeEmpty: true},
+			{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "manual-off", KeyStrategy: model.KeyStrategySequential, Disabled: true},
+		}); err != nil {
+			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+		}
+
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", map[string]any{
+			"channel_ids": []int64{cfg.ID},
+			"mode":        "replace",
+		}))
+		server.HandleBatchRefreshModels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		got, err := store.GetConfig(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		wantModels := []model.ModelEntry{{Model: "ma-1"}, {Model: "mb-1"}}
+		if !reflect.DeepEqual(got.ModelEntries, wantModels) {
+			t.Fatalf("models=%#v, want %#v", got.ModelEntries, wantModels)
+		}
+
+		wantAuth := []string{"Bearer group-a", "Bearer group-b"}
+		if !reflect.DeepEqual(upstreamAuth, wantAuth) {
+			t.Fatalf("Authorization sequence=%v, want %v", upstreamAuth, wantAuth)
+		}
+
+		keys, err := store.GetAPIKeys(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetAPIKeys failed: %v", err)
+		}
+		if !reflect.DeepEqual(keys[0].AllowedModels, []string{"ma-1"}) || keys[0].Disabled || keys[0].ModelScopeEmpty {
+			t.Fatalf("successful group-a key scope=%+v, want ma-1 and enabled", keys[0])
+		}
+		if !reflect.DeepEqual(keys[1].AllowedModels, []string{"mb-1"}) || keys[1].Disabled || keys[1].ModelScopeEmpty {
+			t.Fatalf("successful scope-auto-disabled key must recover its scope: %+v", keys[1])
+		}
+		if !keys[2].Disabled {
+			t.Fatalf("manually disabled key must stay disabled: %+v", keys[2])
+		}
+	})
+
+	t.Run("replace mode continues with successful keys when one key probe fails", func(t *testing.T) {
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				http.NotFound(w, r)
+				return
+			}
+			switch r.Header.Get("Authorization") {
+			case "Bearer healthy":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"model-a"}]}`))
+			case "Bearer broken":
+				http.Error(w, "temporary upstream failure", http.StatusInternalServerError)
+			default:
+				http.Error(w, "invalid api key", http.StatusUnauthorized)
+			}
+		}))
+		t.Cleanup(upstream.Close)
+
+		server, store, cleanup := setupAdminTestServer(t)
+		defer cleanup()
+
+		ctx := context.Background()
+		cfg, err := store.CreateConfig(ctx, &model.Config{
+			Name:         "partial-probe-channel",
+			URLs:         model.ChannelURLs{{URL: upstream.URL, Protocols: []string{"openai"}}},
+			Priority:     1,
+			ModelEntries: []model.ModelEntry{{Model: "model-a"}, {Model: "model-b"}, {Model: "stale-model"}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig failed: %v", err)
+		}
+		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+			{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "healthy", AllowedModels: []string{"model-a"}, KeyStrategy: model.KeyStrategySequential},
+			{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "broken", AllowedModels: []string{"model-b"}, KeyStrategy: model.KeyStrategySequential},
+		}); err != nil {
+			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+		}
+
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/refresh-batch", map[string]any{
+			"channel_ids": []int64{cfg.ID},
+			"mode":        "replace",
+		}))
+		server.HandleBatchRefreshModels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		var response struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Updated int                      `json:"updated"`
+				Failed  int                      `json:"failed"`
+				Results []BatchRefreshModelsItem `json:"results"`
+			} `json:"data"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &response)
+		if !response.Success || response.Data.Updated != 1 || response.Data.Failed != 0 ||
+			len(response.Data.Results) != 1 || response.Data.Results[0].Status != "updated" || response.Data.Results[0].Warning == "" {
+			t.Fatalf("unexpected response: %s", w.Body.String())
+		}
+
+		got, err := store.GetConfig(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		want := []model.ModelEntry{{Model: "model-a"}}
+		if !reflect.DeepEqual(got.ModelEntries, want) {
+			t.Fatalf("models=%#v, want %#v (successful model should apply despite failed key)", got.ModelEntries, want)
+		}
+		keys, err := store.GetAPIKeys(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("GetAPIKeys failed: %v", err)
+		}
+		if !reflect.DeepEqual(keys[0].AllowedModels, []string{"model-a"}) || keys[0].ModelScopeEmpty || keys[0].Disabled {
+			t.Fatalf("healthy key scope=%+v, want model-a and enabled", keys[0])
+		}
+		if len(keys[1].AllowedModels) != 0 || !keys[1].ModelScopeEmpty || !keys[1].Disabled {
+			t.Fatalf("failed key must become an explicit empty scope: %+v", keys[1])
+		}
+	})
+
 	t.Run("invalid mode", func(t *testing.T) {
 		server, _, cleanup := setupAdminTestServer(t)
 		defer cleanup()
@@ -1569,4 +2019,39 @@ func TestAdminModels_HandleBatchRefreshModels(t *testing.T) {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
 		}
 	})
+}
+
+func TestAvailableModelFetchAPIKeysScopeEmptyFallback(t *testing.T) {
+	now := time.Now()
+	keys := []*model.APIKey{
+		{KeyIndex: 0, APIKey: "manual-off", Disabled: true},
+		{KeyIndex: 1, APIKey: "scope-empty", Disabled: true, ModelScopeEmpty: true},
+		{KeyIndex: 2, APIKey: "cooling-normal", CooldownUntil: now.Add(5 * time.Minute).Unix()},
+		{KeyIndex: 3, APIKey: "normal"},
+		{KeyIndex: 4, APIKey: "scope-empty-cooling", Disabled: true, ModelScopeEmpty: true, CooldownUntil: now.Add(5 * time.Minute).Unix()},
+	}
+	got := availableModelFetchAPIKeys(keys, now)
+	gotNames := make([]string, 0, len(got))
+	for _, key := range got {
+		gotNames = append(gotNames, key.APIKey)
+	}
+	want := []string{"normal", "scope-empty"}
+	if !reflect.DeepEqual(gotNames, want) {
+		t.Fatalf("keys=%v, want %v", gotNames, want)
+	}
+
+	allCooling := []*model.APIKey{
+		{KeyIndex: 0, APIKey: "cool-late", CooldownUntil: now.Add(10 * time.Minute).Unix()},
+		{KeyIndex: 1, APIKey: "cool-soon", CooldownUntil: now.Add(3 * time.Minute).Unix()},
+		{KeyIndex: 2, APIKey: "scope-empty", Disabled: true, ModelScopeEmpty: true},
+	}
+	got = availableModelFetchAPIKeys(allCooling, now)
+	gotNames = gotNames[:0]
+	for _, key := range got {
+		gotNames = append(gotNames, key.APIKey)
+	}
+	want = []string{"cool-soon", "scope-empty"}
+	if !reflect.DeepEqual(gotNames, want) {
+		t.Fatalf("all-cooling keys=%v, want %v", gotNames, want)
+	}
 }

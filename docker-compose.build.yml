@@ -32,7 +32,7 @@ services:
         source: "${CCLOAD_DEPLOY_DIR:?set CCLOAD_DEPLOY_DIR}/data"
         target: /app/data
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--output-document=/dev/null", "http://localhost:8808/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "--tries=1", "http://localhost:8808/health"]
       interval: 30s
       timeout: 10s
       retries: 3

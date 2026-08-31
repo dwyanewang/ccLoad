@@ -103,6 +103,89 @@ func feedAndAssertUsage(t *testing.T, parser usageParser, data string, wantInput
 	}
 }
 
+func TestUsageParsersExtractResponseModel(t *testing.T) {
+	tests := []struct {
+		name      string
+		parser    usageParser
+		payload   string
+		wantModel string
+	}{
+		{
+			name:      "OpenAI SSE 顶层 model",
+			parser:    newSSEUsageParser("openai"),
+			payload:   "data: {\"model\":\"gpt-5.4-2026-08-27\",\"choices\":[]}\n\n",
+			wantModel: "gpt-5.4-2026-08-27",
+		},
+		{
+			name:      "Anthropic SSE message.model",
+			parser:    newSSEUsageParser("anthropic"),
+			payload:   "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5-20260827\"}}\n\n",
+			wantModel: "claude-sonnet-5-20260827",
+		},
+		{
+			name:      "Gemini SSE modelVersion",
+			parser:    newSSEUsageParser("gemini"),
+			payload:   "data: {\"modelVersion\":\"gemini-3.1-pro-002\",\"candidates\":[]}\n\n",
+			wantModel: "gemini-3.1-pro-002",
+		},
+		{
+			name:      "Codex SSE response.model",
+			parser:    newSSEUsageParser("codex"),
+			payload:   "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4-codex-served\",\"output\":[]}}\n\n",
+			wantModel: "gpt-5.4-codex-served",
+		},
+		{
+			name:      "OpenAI JSON 顶层 model",
+			parser:    newJSONUsageParser("openai"),
+			payload:   `{"model":"gpt-5.4-served","choices":[]}`,
+			wantModel: "gpt-5.4-served",
+		},
+		{
+			name:      "Anthropic JSON 顶层 model",
+			parser:    newJSONUsageParser("anthropic"),
+			payload:   `{"type":"message","model":"claude-opus-5-served","content":[]}`,
+			wantModel: "claude-opus-5-served",
+		},
+		{
+			name:      "Gemini JSON modelVersion",
+			parser:    newJSONUsageParser("gemini"),
+			payload:   `{"modelVersion":"gemini-3.1-flash-003","candidates":[]}`,
+			wantModel: "gemini-3.1-flash-003",
+		},
+		{
+			name:      "Codex JSON 顶层 model",
+			parser:    newJSONUsageParser("codex"),
+			payload:   `{"id":"resp_1","model":"gpt-5.4-codex-actual","output":[]}`,
+			wantModel: "gpt-5.4-codex-actual",
+		},
+		{
+			name:      "不读取任意嵌套 model",
+			parser:    newJSONUsageParser("openai"),
+			payload:   `{"output":[{"type":"tool_call","model":"image-tool-model"}]}`,
+			wantModel: "",
+		},
+		{
+			name:      "拒绝控制字符",
+			parser:    newJSONUsageParser("openai"),
+			payload:   `{"model":"gpt-5.4\nforged-log"}`,
+			wantModel: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.parser.Feed([]byte(tt.payload)); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			// JSON 解析器在完整响应结束后统一解析正文；SSE 解析器调用无副作用。
+			tt.parser.GetUsage()
+			if got := tt.parser.GetResponseModel(); got != tt.wantModel {
+				t.Fatalf("GetResponseModel() = %q, want %q", got, tt.wantModel)
+			}
+		})
+	}
+}
+
 func TestHasGeminiUsageFields(t *testing.T) {
 	t.Parallel()
 
@@ -723,6 +806,35 @@ func TestSSEUsageParser_StreamComplete(t *testing.T) {
 			sseData:          "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
 			want:             true,
 		},
+		{
+			// 上游给出 finish_reason 即语义终结，[DONE] 只是可选尾巴；
+			// 客户端常在此刻断开，不认终态会把完整响应记成 499。
+			name:             "OpenAI Chat finish_reason without [DONE]",
+			upstreamProtocol: "openai",
+			sseData:          "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+			want:             true,
+		},
+		{
+			name:             "OpenAI Chat finish_reason null",
+			upstreamProtocol: "openai",
+			sseData:          "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+		},
+		{
+			name:             "OpenAI Chat empty finish_reason",
+			upstreamProtocol: "openai",
+			sseData:          "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\"}]}\n\n",
+		},
+		{
+			name:             "Gemini finishReason",
+			upstreamProtocol: "gemini",
+			sseData:          "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n",
+			want:             true,
+		},
+		{
+			name:             "Gemini without finishReason",
+			upstreamProtocol: "gemini",
+			sseData:          "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1302,6 +1414,43 @@ func TestJSONUsageParser_ServiceTierResponsesAPI(t *testing.T) {
 	}
 }
 
+func TestSSEUsageParser_ResponsesServiceTierUsesTerminalEvent(t *testing.T) {
+	t.Parallel()
+
+	parser := newSSEUsageParser("codex")
+	created := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"model":"gpt-5.6","service_tier":"priority"}}` + "\n\n"
+	if err := parser.Feed([]byte(created)); err != nil {
+		t.Fatalf("Feed response.created: %v", err)
+	}
+	if parser.ServiceTier != "" {
+		t.Fatalf("response.created must not set ServiceTier, got %q", parser.ServiceTier)
+	}
+
+	completed := "event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"model":"gpt-5.6","service_tier":"default","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
+	if err := parser.Feed([]byte(completed)); err != nil {
+		t.Fatalf("Feed response.completed: %v", err)
+	}
+	if parser.ServiceTier != "default" {
+		t.Fatalf("ServiceTier=%q, want default", parser.ServiceTier)
+	}
+}
+
+func TestSSEUsageParser_ResponsesServiceTierAuto(t *testing.T) {
+	t.Parallel()
+
+	parser := newSSEUsageParser("codex")
+	completed := "event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"model":"gpt-5.6-sol","service_tier":"auto","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
+	if err := parser.Feed([]byte(completed)); err != nil {
+		t.Fatalf("Feed response.completed: %v", err)
+	}
+	if parser.ServiceTier != "auto" {
+		t.Fatalf("ServiceTier=%q, want auto", parser.ServiceTier)
+	}
+}
+
 func TestJSONUsageParser_DoesNotTreatEventTextAsSSE(t *testing.T) {
 	body := `{"object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"jsonUsageParser.GetUsage() detects event: text in this string"}]}],"usage":{"input_tokens":20070,"input_tokens_details":{"cached_tokens":11008},"output_tokens":544,"total_tokens":20614}}`
 	parser := newJSONUsageParser("codex")
@@ -1335,7 +1484,7 @@ func TestSSEUsageParser_SpeedFast(t *testing.T) {
 }
 
 func TestSSEUsageParser_SpeedStandard(t *testing.T) {
-	// speed:"standard" 不应设置 ServiceTier
+	// speed:"standard" 是上游明确声明的实际标准档位
 	sseData := `data: {"type":"message_delta","usage":{"input_tokens":100,"output_tokens":50,"speed":"standard"}}
 
 `
@@ -1343,8 +1492,8 @@ func TestSSEUsageParser_SpeedStandard(t *testing.T) {
 	if err := parser.Feed([]byte(sseData)); err != nil {
 		t.Fatalf("Feed失败: %v", err)
 	}
-	if parser.ServiceTier != "" {
-		t.Errorf("ServiceTier = %q, 期望空字符串（standard不设置tier）", parser.ServiceTier)
+	if parser.ServiceTier != "standard" {
+		t.Errorf("ServiceTier = %q, 期望 standard", parser.ServiceTier)
 	}
 }
 

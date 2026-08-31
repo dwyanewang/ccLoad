@@ -419,7 +419,7 @@ func TestMySQL(t *testing.T) {
 		defer func() { _ = store.Close() }()
 
 		// 验证 logs 表的新列存在
-		expectedColumns := []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "log_source"}
+		expectedColumns := []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "response_model", "log_source"}
 		for _, col := range expectedColumns {
 			var columnName string
 			err := env.db.QueryRow(
@@ -448,6 +448,16 @@ func TestMySQL(t *testing.T) {
 				t.Fatalf("列 auth_tokens.%s 不存在: %v", col, err)
 			}
 			t.Logf("列 auth_tokens.%s 存在", col)
+		}
+		for _, col := range []string{"allowed_models", "model_scope_empty"} {
+			var columnName string
+			err := env.db.QueryRow(
+				"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'api_keys' AND COLUMN_NAME = ?",
+				testMySQLDB, col,
+			).Scan(&columnName)
+			if err != nil {
+				t.Fatalf("列 api_keys.%s 不存在: %v", col, err)
+			}
 		}
 
 		// 验证 channels 表的新增列

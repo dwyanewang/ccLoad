@@ -2,7 +2,9 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	neturl "net/url"
 	"strings"
 	"time"
@@ -33,22 +35,91 @@ type ChannelRequest struct {
 	ScheduledCheckEnabled   bool                          `json:"scheduled_check_enabled"`
 	ScheduledCheckModel     string                        `json:"scheduled_check_model"`
 	DailyCostLimit          float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
-	CostMultiplier          float64                       `json:"cost_multiplier"`  // 成本倍率（默认1，0=免费，>=0）
 	CustomRequestRules      *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
 	CooldownDetectionRules  *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
 	ProxyURL                string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
 	AvailableTimeStart      string                        `json:"available_time_start,omitempty"`
 	AvailableTimeEnd        string                        `json:"available_time_end,omitempty"`
 	RetryOtherKeysOnFailure bool                          `json:"retry_other_keys_on_failure"`
+	ManagementAccount       *channelManagementInput       `json:"management_account,omitempty"`
+
+	managementAccountSet      bool
+	forbiddenCredentialFields bool
+}
+
+// UnmarshalJSON tracks JSON field presence for credential safety checks.
+func (cr *ChannelRequest) UnmarshalJSON(data []byte) error {
+	type plain ChannelRequest
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*cr = ChannelRequest(decoded)
+	_, cr.managementAccountSet = fields["management_account"]
+	for _, field := range []string{"oauth_credential", "credential", "access_token"} {
+		if _, present := fields[field]; present {
+			cr.forbiddenCredentialFields = true
+			break
+		}
+	}
+	return nil
 }
 
 // ChannelAPIKeyRequest describes one submitted API key and its admin-only note.
 type ChannelAPIKeyRequest struct {
-	APIKey string `json:"api_key"`
-	Note   string `json:"note,omitempty"`
+	APIKey          string   `json:"api_key"`
+	Note            string   `json:"note,omitempty"`
+	AllowedModels   []string `json:"allowed_models,omitempty"`
+	ModelScopeEmpty bool     `json:"model_scope_empty,omitempty"`
+	// CostMultiplier 用指针区分「未提交」：nil 保留现值（Key 更新）或取默认 1（创建）；
+	// 0 是合法的「免费 Key」。OAuth 渠道的合成 Key 行也用它携带渠道倍率。
+	CostMultiplier *float64 `json:"cost_multiplier,omitempty"`
+	// allowedModelsSet distinguishes an omitted field from an explicit empty list.
+	// Updates preserve an existing scope when old clients do not send the new field.
+	allowedModelsSet bool
 }
 
-const maxAPIKeyNoteLength = 512
+// UnmarshalJSON records whether allowed_models was submitted so updates can preserve omitted scopes.
+func (r *ChannelAPIKeyRequest) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		APIKey          string          `json:"api_key"`
+		Note            string          `json:"note,omitempty"`
+		AllowedModels   json.RawMessage `json:"allowed_models"`
+		ModelScopeEmpty bool            `json:"model_scope_empty,omitempty"`
+		CostMultiplier  *float64        `json:"cost_multiplier"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	r.APIKey = raw.APIKey
+	r.Note = raw.Note
+	r.ModelScopeEmpty = raw.ModelScopeEmpty
+	r.CostMultiplier = raw.CostMultiplier
+	r.AllowedModels = nil
+	r.allowedModelsSet = raw.AllowedModels != nil
+	if !r.allowedModelsSet || string(raw.AllowedModels) == "null" {
+		return nil
+	}
+	return json.Unmarshal(raw.AllowedModels, &r.AllowedModels)
+}
+
+// apiKeyCostMultiplier 解析提交的 Key 倍率：未提交默认 1（与 api_keys 列默认值一致），0 是合法的免费 Key。
+func apiKeyCostMultiplier(entry ChannelAPIKeyRequest) float64 {
+	if entry.CostMultiplier == nil {
+		return 1
+	}
+	return *entry.CostMultiplier
+}
+
+const (
+	maxAPIKeyNoteLength              = 512
+	maxAPIKeyAllowedModelsJSONLength = 2000
+)
 
 func (cr *ChannelRequest) normalizeAPIKeys() []ChannelAPIKeyRequest {
 	if len(cr.APIKeys) > 0 {
@@ -59,8 +130,12 @@ func (cr *ChannelRequest) normalizeAPIKeys() []ChannelAPIKeyRequest {
 				continue
 			}
 			keys = append(keys, ChannelAPIKeyRequest{
-				APIKey: apiKey,
-				Note:   strings.TrimSpace(item.Note),
+				APIKey:           apiKey,
+				Note:             strings.TrimSpace(item.Note),
+				AllowedModels:    append([]string(nil), item.AllowedModels...),
+				ModelScopeEmpty:  item.ModelScopeEmpty,
+				CostMultiplier:   item.CostMultiplier,
+				allowedModelsSet: item.allowedModelsSet,
 			})
 		}
 		return keys
@@ -184,12 +259,16 @@ func (cr *ChannelRequest) Validate() error {
 		return fmt.Errorf("invalid auth_type %q", cr.AuthType)
 	}
 	cr.AuthType = authType
+	if authType == model.AuthTypeZedOAuth && cr.Websockets {
+		return errors.New("zed OAuth channels do not support WebSocket transport")
+	}
 	apiKeys := cr.normalizeAPIKeys()
 	if authType == model.AuthTypeAPIKey && len(apiKeys) == 0 {
 		return fmt.Errorf("api_key cannot be empty")
 	}
-	if authType != model.AuthTypeAPIKey && len(apiKeys) != 0 {
-		return fmt.Errorf("OAuth channel cannot contain API keys")
+	// OAuth 渠道最多携带一条合成 Key 行（管理页现场合成），只用来回传倍率，永不落库。
+	if authType != model.AuthTypeAPIKey && len(apiKeys) > 1 {
+		return fmt.Errorf("OAuth channel accepts at most one synthetic API key row")
 	}
 	for i, key := range apiKeys {
 		if strings.ContainsAny(key.APIKey, "\x00\r\n") {
@@ -201,9 +280,13 @@ func (cr *ChannelRequest) Validate() error {
 		if strings.Contains(key.Note, "\x00") {
 			return fmt.Errorf("api_keys[%d].note contains illegal characters", i)
 		}
+		if key.ModelScopeEmpty && len(key.AllowedModels) != 0 {
+			return fmt.Errorf("api_keys[%d].model_scope_empty requires empty allowed_models", i)
+		}
+		if key.CostMultiplier != nil && (math.IsNaN(*key.CostMultiplier) || math.IsInf(*key.CostMultiplier, 0) || *key.CostMultiplier < 0) {
+			return fmt.Errorf("api_keys[%d].cost_multiplier must be finite and >= 0 (got %v)", i, *key.CostMultiplier)
+		}
 	}
-	cr.APIKeys = apiKeys
-	cr.APIKey = strings.Join(apiKeyStrings(apiKeys), ",")
 	if len(cr.Models) == 0 {
 		return fmt.Errorf("models cannot be empty")
 	}
@@ -215,17 +298,37 @@ func (cr *ChannelRequest) Validate() error {
 	}
 	// Fail-Fast: 同一渠道内模型名必须唯一（大小写不敏感，匹配数据库唯一约束语义）
 	seenModels := make(map[string]int, len(cr.Models))
+	canonicalModels := make(map[string]string, len(cr.Models))
 	for i := range cr.Models {
-		modelKey := strings.ToLower(cr.Models[i].Model)
-		if firstIdx, exists := seenModels[modelKey]; exists {
+		literalKey := strings.ToLower(cr.Models[i].Model)
+		if firstIdx, exists := seenModels[literalKey]; exists {
 			return fmt.Errorf("models[%d]: duplicate model %q (already defined at models[%d])", i, cr.Models[i].Model, firstIdx)
 		}
-		seenModels[modelKey] = i
+		seenModels[literalKey] = i
+		routingModel := model.RoutingModelName(cr.Models[i].Model)
+		canonicalModels[strings.ToLower(routingModel)] = routingModel
 	}
+	wildcardModels := canonicalModels["*"] != ""
+	for i := range apiKeys {
+		allowedModels, err := normalizeAPIKeyAllowedModels(apiKeys[i].AllowedModels, canonicalModels, wildcardModels)
+		if err != nil {
+			return fmt.Errorf("api_keys[%d].allowed_models: %w", i, err)
+		}
+		apiKeys[i].AllowedModels = allowedModels
+		encoded, err := json.Marshal(allowedModels)
+		if err != nil {
+			return fmt.Errorf("api_keys[%d].allowed_models: %w", i, err)
+		}
+		if len(encoded) > maxAPIKeyAllowedModelsJSONLength {
+			return fmt.Errorf("api_keys[%d].allowed_models is too long (max %d bytes)", i, maxAPIKeyAllowedModelsJSONLength)
+		}
+	}
+	cr.APIKeys = apiKeys
+	cr.APIKey = strings.Join(apiKeyStrings(apiKeys), ",")
 
 	cr.ScheduledCheckModel = strings.TrimSpace(cr.ScheduledCheckModel)
 	if cr.ScheduledCheckModel != "" {
-		if _, exists := seenModels[strings.ToLower(cr.ScheduledCheckModel)]; !exists {
+		if _, exists := canonicalModels[strings.ToLower(model.RoutingModelName(cr.ScheduledCheckModel))]; !exists {
 			return fmt.Errorf("scheduled_check_model %q must exist in models", cr.ScheduledCheckModel)
 		}
 	}
@@ -292,14 +395,38 @@ func (cr *ChannelRequest) Validate() error {
 		return fmt.Errorf("max_concurrency must be >= 0 (got %d)", cr.MaxConcurrency)
 	}
 
-	// CostMultiplier: 未传视为默认 1；0 表示免费渠道；负数拒绝
-	if cr.CostMultiplier == 0 {
-		// 0 是合法值（免费渠道），保持不变
-	} else if cr.CostMultiplier < 0 {
-		return fmt.Errorf("cost_multiplier must be >= 0 (got %v)", cr.CostMultiplier)
-	}
-
 	return nil
+}
+
+func normalizeAPIKeyAllowedModels(values []string, canonicalModels map[string]string, wildcard bool) ([]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		modelName := model.RoutingModelName(strings.TrimSpace(value))
+		if modelName == "" {
+			continue
+		}
+		if modelName == "*" {
+			return nil, nil
+		}
+		key := strings.ToLower(modelName)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		canonical, exists := canonicalModels[key]
+		if !exists && !wildcard {
+			return nil, fmt.Errorf("model %q must exist in channel models", modelName)
+		}
+		if exists {
+			modelName = canonical
+		}
+		seen[key] = struct{}{}
+		result = append(result, modelName)
+	}
+	return result, nil
 }
 
 // ToConfig 转换为Config结构(不包含API Key,API Key单独处理)
@@ -312,6 +439,13 @@ func (cr *ChannelRequest) ToConfig() *model.Config {
 		if m.RedirectModel == m.Model {
 			normalizedModels[i].RedirectModel = ""
 		}
+	}
+
+	// 倍率属于凭证：OAuth 渠道从合成 Key 行取，api_key 渠道的渠道级字段固定写 1
+	// （0 在 channels.cost_multiplier 语义是「免费」，渠道级写 0 会让 api_key 渠道整体免费）。
+	costMultiplier := 1.0
+	if model.NormalizeAuthType(cr.AuthType) != model.AuthTypeAPIKey && len(cr.APIKeys) > 0 && cr.APIKeys[0].CostMultiplier != nil {
+		costMultiplier = *cr.APIKeys[0].CostMultiplier
 	}
 
 	return &model.Config{
@@ -328,7 +462,7 @@ func (cr *ChannelRequest) ToConfig() *model.Config {
 		ScheduledCheckEnabled:   cr.ScheduledCheckEnabled,
 		ScheduledCheckModel:     cr.ScheduledCheckModel,
 		DailyCostLimit:          cr.DailyCostLimit,
-		CostMultiplier:          cr.CostMultiplier,
+		CostMultiplier:          costMultiplier,
 		CustomRequestRules:      cr.CustomRequestRules.Clone(),
 		CooldownDetectionRules:  cr.CooldownDetectionRules.Clone(),
 		ProxyURL:                cr.ProxyURL,
@@ -465,21 +599,30 @@ type ChannelModelStats struct {
 // ChannelWithCooldown 带冷却状态的渠道响应结构
 type ChannelWithCooldown struct {
 	*model.Config
-	CodexPlanType                string              `json:"codex_plan_type,omitempty"`
-	CodexSubscriptionActiveUntil *time.Time          `json:"codex_subscription_active_until,omitempty"`
-	AnthropicPlanType            string              `json:"anthropic_plan_type,omitempty"`
-	OAuthUsage                   *oauthUsageSummary  `json:"oauth_usage,omitempty"`
-	AntigravityPaidTier          string              `json:"antigravity_paid_tier,omitempty"`
-	XAIEmail                     string              `json:"xai_email,omitempty"`
-	XAISubscriptionTier          string              `json:"xai_subscription_tier,omitempty"`
-	XAIEntitlementStatus         string              `json:"xai_entitlement_status,omitempty"`
-	KeyStrategy                  string              `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
-	CooldownUntil                *time.Time          `json:"cooldown_until,omitempty"`
-	CooldownRemainingMS          int64               `json:"cooldown_remaining_ms,omitempty"`
-	KeyCooldowns                 []KeyCooldownInfo   `json:"key_cooldowns,omitempty"`
-	ModelCooldowns               []ModelCooldownInfo `json:"model_cooldowns,omitempty"`
-	EffectivePriority            *float64            `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
-	SuccessRate                  *float64            `json:"success_rate,omitempty"`       // 成功率(0-1)
+	CodexPlanType                 string                 `json:"codex_plan_type,omitempty"`
+	CodexSubscriptionActiveUntil  *time.Time             `json:"codex_subscription_active_until,omitempty"`
+	AnthropicPlanType             string                 `json:"anthropic_plan_type,omitempty"`
+	OAuthUsage                    *oauthUsageSummary     `json:"oauth_usage,omitempty"`
+	AntigravityPaidTier           string                 `json:"antigravity_paid_tier,omitempty"`
+	XAIEmail                      string                 `json:"xai_email,omitempty"`
+	XAISubscriptionTier           string                 `json:"xai_subscription_tier,omitempty"`
+	XAIEntitlementStatus          string                 `json:"xai_entitlement_status,omitempty"`
+	KeyStrategy                   string                 `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
+	CooldownUntil                 *time.Time             `json:"cooldown_until,omitempty"`
+	CooldownRemainingMS           int64                  `json:"cooldown_remaining_ms,omitempty"`
+	KeyCooldowns                  []KeyCooldownInfo      `json:"key_cooldowns,omitempty"`
+	ModelCooldowns                []ModelCooldownInfo    `json:"model_cooldowns,omitempty"`
+	ProtocolProbeRetryCount       int                    `json:"protocol_probe_retry_count,omitempty"`
+	ProtocolProbeRetryAt          *time.Time             `json:"protocol_probe_retry_at,omitempty"`
+	ProtocolProbeRetryRemainingMS int64                  `json:"protocol_probe_retry_remaining_ms,omitempty"`
+	EffectivePriority             *float64               `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
+	SuccessRate                   *float64               `json:"success_rate,omitempty"`       // 成功率(0-1)
+	ManagementAccount             *channelManagementView `json:"management_account,omitempty"`
+
+	// 成本倍率区间（角标展示）：api_key 渠道按启用 Key 计算，OAuth 渠道即渠道倍率；
+	// min 与 max 都为 1 时不下发。
+	CostMultiplierMin *float64 `json:"cost_multiplier_min,omitempty"`
+	CostMultiplierMax *float64 `json:"cost_multiplier_max,omitempty"`
 }
 
 // ChannelImportSummary 导入结果统计

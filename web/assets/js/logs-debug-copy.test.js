@@ -157,14 +157,25 @@ test('debug log copy works when the native Clipboard API is unavailable', async 
   }
 });
 
-test('model filter options contain request models but not redirected models', async () => {
+async function withLoadedLogsPage(options, assertions) {
   const previousGlobals = new Map();
   const setGlobal = (key, value) => {
     previousGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
     Object.defineProperty(global, key, { configurable: true, writable: true, value });
   };
-
+  const {
+    isTokenRole = false,
+    logSource = 'proxy',
+    entries = []
+  } = options;
   const windowListeners = {};
+  const requestedURLs = [];
+  const sourceGroup = { hidden: false };
+  const sourceSelect = {
+    value: logSource,
+    parentElement: sourceGroup,
+    closest: (selector) => selector === '.filter-group' ? sourceGroup : null
+  };
   const tbody = {
     innerHTML: '',
     appendChild() {},
@@ -173,41 +184,49 @@ test('model filter options contain request models but not redirected models', as
     querySelector: () => null,
     querySelectorAll: () => []
   };
-  const hoursInput = { value: 'today' };
+  const elements = {
+    tbody,
+    f_hours: { value: 'today' },
+    f_log_source: sourceSelect,
+    f_auth_token: { value: '' }
+  };
+  const restoredFilters = {
+    range: 'today',
+    authToken: '',
+    model: '',
+    channelName: '',
+    logSource,
+    status: ''
+  };
 
   setGlobal('window', {
-    t: (key) => key,
+    t: (key) => key === 'logs.sourceCheckinBadge' ? '签到' : key,
     initPageBootstrap() {},
     addEventListener: (type, handler) => {
       windowListeners[type] = handler;
     },
     FilterState: {
-      load: () => ({ range: 'today' }),
-      restore: () => ({
-        range: 'today',
-        authToken: '',
-        model: '',
-        channelName: '',
-        logSource: 'proxy',
-        status: ''
-      })
+      load: () => restoredFilters,
+      restore: () => ({ ...restoredFilters })
     },
     FilterQuery: {
-      buildRequestParams: (_values, _fields, options) => new URLSearchParams(options.baseParams)
+      buildRequestParams: (values, _fields, options) => {
+        const params = new URLSearchParams(options.baseParams);
+        params.set('log_source', values.logSource);
+        return params;
+      }
     },
     loadAuthTokensIntoSelect: async () => [],
-    applyFilterControlValues() {},
-    readFilterControlValues: () => ({ range: 'today', status: '', authToken: '' }),
+    applyFilterControlValues: (values) => {
+      sourceSelect.value = values.logSource;
+    },
+    readFilterControlValues: () => ({ range: 'today', clientProtocol: '', authToken: '' }),
     getDurationTimingColor: () => '',
-    isAPITokenRole: () => false
+    isAPITokenRole: () => isTokenRole
   });
   setGlobal('document', {
     addEventListener() {},
-    getElementById: (id) => {
-      if (id === 'tbody') return tbody;
-      if (id === 'f_hours') return hoursInput;
-      return null;
-    },
+    getElementById: (id) => elements[id] || null,
     querySelector: () => null,
     querySelectorAll: () => []
   });
@@ -224,28 +243,16 @@ test('model filter options contain request models but not redirected models', as
     if (!url.startsWith('/dashboard/logs?')) {
       throw new Error(`unexpected fetchAPIWithAuth call: ${url}`);
     }
-    return {
-      success: true,
-      count: 1,
-      data: [{
-        time: Date.now(),
-        model: 'requested-model',
-        actual_model: 'redirected-model',
-        status_code: 200,
-        duration: 0,
-        log_source: 'proxy'
-      }]
-    };
+    requestedURLs.push(url);
+    return { success: true, count: entries.length, data: entries };
   });
 
   try {
     delete require.cache[require.resolve('./logs.js')];
     require('./logs.js');
-
     await windowListeners.pageshow({ persisted: true });
     await new Promise(resolve => setImmediate(resolve));
-
-    assert.deepEqual(global.window.availableLogsModels, ['requested-model']);
+    await assertions({ requestedURLs, sourceGroup, sourceSelect, tbody });
   } finally {
     delete require.cache[require.resolve('./logs.js')];
     for (const [key, descriptor] of previousGlobals) {
@@ -253,4 +260,75 @@ test('model filter options contain request models but not redirected models', as
       else Object.defineProperty(global, key, descriptor);
     }
   }
+}
+
+test('admins can select checkin logs when scheduled model detection is disabled', async () => {
+  await withLoadedLogsPage({ logSource: 'checkin' }, ({ sourceGroup, sourceSelect }) => {
+    assert.equal(sourceGroup.hidden, false);
+    assert.equal(sourceSelect.value, 'checkin');
+  });
+});
+
+test('API token sessions cannot select management log sources', async () => {
+  await withLoadedLogsPage({ isTokenRole: true, logSource: 'checkin' }, ({ sourceGroup, sourceSelect }) => {
+    assert.equal(sourceGroup.hidden, true);
+    assert.equal(sourceSelect.value, 'proxy');
+  });
+});
+
+test('checkin log filter is sent unchanged in the dashboard request', async () => {
+  await withLoadedLogsPage({ logSource: 'checkin' }, ({ requestedURLs }) => {
+    assert.equal(requestedURLs.length, 1);
+    const requestURL = new URL(requestedURLs[0], 'http://localhost');
+    assert.deepEqual(requestURL.searchParams.getAll('log_source'), ['checkin']);
+  });
+});
+
+test('model filter options contain request models but not redirected models', async () => {
+  await withLoadedLogsPage({
+    entries: [{
+      time: Date.now(),
+      model: 'requested-model',
+      actual_model: 'redirected-model',
+      status_code: 200,
+      duration: 0,
+      log_source: 'proxy'
+    }]
+  }, () => {
+    assert.deepEqual(global.window.availableLogsModels, ['requested-model']);
+  });
+});
+
+test('log model display prefers the upstream response model over the sent model', async () => {
+  await withLoadedLogsPage({
+    entries: [{
+      time: Date.now(),
+      model: 'requested-model',
+      actual_model: 'sent-model',
+      response_model: 'served-model',
+      status_code: 200,
+      duration: 0,
+      log_source: 'proxy'
+    }]
+  }, ({ tbody }) => {
+    assert.match(tbody.innerHTML, /requested-model/);
+    assert.match(tbody.innerHTML, /served-model/);
+    assert.doesNotMatch(tbody.innerHTML, /sent-model/);
+  });
+});
+
+test('log model display falls back to the sent model when the response omits model', async () => {
+  await withLoadedLogsPage({
+    entries: [{
+      time: Date.now(),
+      model: 'requested-model',
+      actual_model: 'sent-model',
+      status_code: 200,
+      duration: 0,
+      log_source: 'proxy'
+    }]
+  }, ({ tbody }) => {
+    assert.match(tbody.innerHTML, /requested-model/);
+    assert.match(tbody.innerHTML, /sent-model/);
+  });
 });

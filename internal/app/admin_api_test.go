@@ -62,10 +62,11 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 
 		// 创建API Key
 		apiKey := &model.APIKey{
-			ChannelID:   created.ID,
-			KeyIndex:    0,
-			APIKey:      "sk-test-key-" + created.Name,
-			KeyStrategy: model.KeyStrategySequential,
+			ChannelID:     created.ID,
+			KeyIndex:      0,
+			APIKey:        "sk-test-key-" + created.Name,
+			AllowedModels: []string{cfg.ModelEntries[0].Model},
+			KeyStrategy:   model.KeyStrategySequential,
 		}
 		if err := server.store.CreateAPIKeysBatch(ctx, []*model.APIKey{apiKey}); err != nil {
 			t.Fatalf("创建API Key失败: %v", err)
@@ -112,7 +113,7 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 		header[0] = strings.TrimPrefix(header[0], "\ufeff")
 	}
 
-	expectedHeaders := []string{"id", "name", "api_key", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "websockets"}
+	expectedHeaders := []string{"id", "name", "api_key", "api_key_allowed_models", "api_key_cost_multipliers", "api_key_model_scope_empty", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "management_daily_checkin_enabled", "management_daily_checkin_time", "websockets"}
 	if len(header) != len(expectedHeaders) {
 		t.Fatalf("Header字段数量不匹配: 期望 %d, 实际: %d\nHeader: %v", len(expectedHeaders), len(header), header)
 	}
@@ -123,11 +124,16 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 		}
 	}
 
-	if len(records[1]) < 16 {
-		t.Errorf("数据行字段不足，期望至少16个字段，实际: %d", len(records[1]))
+	if len(records[1]) < len(expectedHeaders) {
+		t.Errorf("数据行字段不足，期望至少%d个字段，实际: %d", len(expectedHeaders), len(records[1]))
 	}
-	if len(records[1]) >= 16 && records[1][15] != "true" {
-		t.Errorf("retry_other_keys_on_failure 导出值错误: got %q, want true", records[1][15])
+	retryIndex := slices.Index(header, "retry_other_keys_on_failure")
+	if retryIndex < 0 || records[1][retryIndex] != "true" {
+		t.Errorf("retry_other_keys_on_failure 导出值错误: row=%v", records[1])
+	}
+	allowedModelsIndex := slices.Index(header, "api_key_allowed_models")
+	if allowedModelsIndex < 0 || records[1][allowedModelsIndex] != `[["model-1"]]` {
+		t.Errorf("api_key_allowed_models 导出值错误: row=%v", records[1])
 	}
 	websocketsIndex := slices.Index(header, "websockets")
 	if websocketsIndex < 0 || records[1][websocketsIndex] != "true" {
@@ -181,6 +187,164 @@ func TestAdminAPI_ExportChannelsCSVSelectedIDs(t *testing.T) {
 	server.HandleExportChannelsCSV(badC)
 	if badW.Code != http.StatusBadRequest {
 		t.Fatalf("invalid ids status=%d, want 400", badW.Code)
+	}
+}
+
+func TestAdminAPI_CSVExportImportsChannelManagementEnvelope(t *testing.T) {
+	t.Parallel()
+	server := newInMemoryServer(t)
+	ctx := context.Background()
+	managementEnvelope := `{"kind":"channel_management","version":1,"profile":"new_api","settings":{"base_url":"https://panel.example.com","access_token":"management-export-token","daily_checkin_enabled":true,"daily_checkin_time":"09:30"},"state":{"last_scheduled_day":"2026-08-25","last_checkin_status":"success"}}`
+	oauthCredential := `{"type":"codex","access_token":"oauth-export-access","refresh_token":"oauth-export-refresh","expired":"2030-01-01T00:00:00Z"}`
+
+	managed, err := server.store.CreateConfig(ctx, &model.Config{
+		Name: "Managed API Key", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "model-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := server.store.CompareAndSwapChannelManagement(ctx, managed.ID, "", managementEnvelope)
+	if err != nil || !updated {
+		t.Fatalf("seed management envelope = (%v, %v)", updated, err)
+	}
+	if err := server.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: managed.ID, KeyIndex: 0, APIKey: "sk-managed-export", KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	oauth, err := server.store.CreateConfig(ctx, &model.Config{
+		Name: "OAuth Export", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: oauthCredential,
+		URLs: model.ChannelURLs{{URL: "https://oauth.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := fmt.Sprintf("/admin/channels/export?ids=%d,%d", managed.ID, oauth.ID)
+	c, w := newTestContext(t, newRequest(http.MethodGet, target, nil))
+	server.HandleExportChannelsCSV(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export status=%d, want 200", w.Code)
+	}
+	records, err := csv.NewReader(bytes.NewReader(w.Body.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse exported CSV: %v", err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("exported row count=%d, want header plus two channels", len(records))
+	}
+	headerIndex := buildCSVColumnIndex(records[0])
+	rowsByName := map[string][]string{
+		records[1][headerIndex["name"]]: records[1],
+		records[2][headerIndex["name"]]: records[2],
+	}
+	if got := rowsByName[managed.Name][headerIndex["oauth_credential"]]; got != managementEnvelope {
+		t.Fatalf("API Key management envelope=%q, want exported envelope", got)
+	}
+	if got := rowsByName[managed.Name][headerIndex["management_daily_checkin_enabled"]]; got != "true" {
+		t.Fatalf("management_daily_checkin_enabled=%q, want true", got)
+	}
+	if got := rowsByName[managed.Name][headerIndex["management_daily_checkin_time"]]; got != "09:30" {
+		t.Fatalf("management_daily_checkin_time=%q, want 09:30", got)
+	}
+	if got := rowsByName[oauth.Name][headerIndex["oauth_credential"]]; got != oauthCredential {
+		t.Fatalf("OAuth oauth_credential=%q, want original credential", got)
+	}
+	if got := rowsByName[oauth.Name][headerIndex["management_daily_checkin_enabled"]]; got != "" {
+		t.Fatalf("OAuth management_daily_checkin_enabled=%q, want empty", got)
+	}
+	if got := rowsByName[oauth.Name][headerIndex["management_daily_checkin_time"]]; got != "" {
+		t.Fatalf("OAuth management_daily_checkin_time=%q, want empty", got)
+	}
+
+	importCSV := func(fileName string, header, row []string) (int, string) {
+		t.Helper()
+		var csvBody bytes.Buffer
+		csvWriter := csv.NewWriter(&csvBody)
+		if err := csvWriter.Write(header); err != nil {
+			t.Fatal(err)
+		}
+		if err := csvWriter.Write(row); err != nil {
+			t.Fatal(err)
+		}
+		csvWriter.Flush()
+		if err := csvWriter.Error(); err != nil {
+			t.Fatal(err)
+		}
+
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", fileName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(csvBody.Bytes()); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		request := newRequest(http.MethodPost, "/admin/channels/import", bytes.NewReader(body.Bytes()))
+		request.Header.Set("Content-Type", writer.FormDataContentType())
+		importC, importW := newTestContext(t, request)
+		server.HandleImportChannelsCSV(importC)
+		return importW.Code, importW.Body.String()
+	}
+	baseHeader := []string{"name", "api_key", "urls", "models", "auth_type"}
+	baseRow := []string{managed.Name, "sk-managed-export", `[{"url":"https://api.example.com"}]`, "model-1", model.AuthTypeAPIKey}
+	if status, body := importCSV("legacy.csv", baseHeader, baseRow); status != http.StatusOK {
+		t.Fatalf("legacy import status=%d body=%s", status, body)
+	}
+	persisted, err := server.store.GetConfig(ctx, managed.ID)
+	if err != nil || persisted.OAuthCredential != managementEnvelope {
+		t.Fatalf("legacy CSV changed management account: credential=%q err=%v", persisted.OAuthCredential, err)
+	}
+	if updated, err := server.store.CompareAndSwapChannelManagement(ctx, managed.ID, managementEnvelope, ""); err != nil || !updated {
+		t.Fatalf("clear target management envelope = (%v, %v)", updated, err)
+	}
+	migrationStatus, migrationBody := importCSV("migration.csv", records[0], rowsByName[managed.Name])
+	if migrationStatus != http.StatusOK {
+		t.Fatalf("migration import status=%d body=%s", migrationStatus, migrationBody)
+	}
+	persisted, err = server.store.GetConfig(ctx, managed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedManagement, err := model.ParseChannelManagementEnvelope(persisted.OAuthCredential)
+	if err != nil {
+		t.Fatalf("parse imported management account: %v response=%s", err, migrationBody)
+	}
+	if persistedManagement.Settings.AccessToken != "management-export-token" ||
+		!persistedManagement.Settings.DailyCheckinEnabled || persistedManagement.Settings.DailyCheckinTime != "09:30" {
+		t.Fatalf("imported management settings=%+v", persistedManagement.Settings)
+	}
+	if persistedManagement.State.LastScheduledDay != "2026-08-25" || persistedManagement.State.LastCheckinStatus != "success" {
+		t.Fatalf("imported management state changed: %+v", persistedManagement.State)
+	}
+	checkinHeader := append(append([]string(nil), baseHeader...), "management_daily_checkin_enabled", "management_daily_checkin_time")
+	if status, body := importCSV(
+		"explicit-empty.csv",
+		checkinHeader,
+		append(append([]string(nil), baseRow...), "", ""),
+	); status != http.StatusOK {
+		t.Fatalf("explicit-empty import status=%d body=%s", status, body)
+	}
+	persisted, err = server.store.GetConfig(ctx, managed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedManagement, err = model.ParseChannelManagementEnvelope(persisted.OAuthCredential)
+	if err != nil {
+		t.Fatalf("parse cleared management account: %v", err)
+	}
+	if persistedManagement.Settings.DailyCheckinEnabled || persistedManagement.Settings.DailyCheckinTime != "" {
+		t.Fatalf("explicit empty checkin settings=%+v", persistedManagement.Settings)
+	}
+	if persistedManagement.Settings.AccessToken != "management-export-token" ||
+		persistedManagement.State.LastScheduledDay != "2026-08-25" || persistedManagement.State.LastCheckinStatus != "success" {
+		t.Fatalf("explicit empty checkin changed private management data: %+v", persistedManagement)
 	}
 }
 
@@ -308,6 +472,77 @@ func TestAdminAPI_CSVExportImportOAuthChannelWithFilters(t *testing.T) {
 	keys, err := server.store.GetAPIKeys(ctx, restored.ID)
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("restored OAuth channel API key count=%d err=%v", len(keys), err)
+	}
+}
+
+func TestAdminAPI_CSVExportImportRoundtripsAPIKeyCostMultipliers(t *testing.T) {
+	source := newInMemoryServer(t)
+	ctx := context.Background()
+
+	cfg := &model.Config{
+		Name:         "Key Multiplier Source",
+		AuthType:     model.AuthTypeAPIKey,
+		URLs:         model.ChannelURLs{{URL: "https://key.example.com"}},
+		Enabled:      true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.4"}},
+	}
+	created, err := source.store.CreateConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	if err := source.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-half", CostMultiplier: 0.5},
+		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-double", CostMultiplier: 2.0},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	exportC, exportW := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/export", nil))
+	source.HandleExportChannelsCSV(exportC)
+	if exportW.Code != http.StatusOK {
+		t.Fatalf("export status=%d", exportW.Code)
+	}
+
+	target := newInMemoryServer(t)
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "key-multipliers.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(exportW.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := newRequest(http.MethodPost, "/admin/channels/import", bytes.NewReader(body.Bytes()))
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	importC, importW := newTestContext(t, request)
+	target.HandleImportChannelsCSV(importC)
+	if importW.Code != http.StatusOK {
+		t.Fatalf("import status=%d", importW.Code)
+	}
+
+	configs, err := target.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 1 {
+		t.Fatalf("restored channel count=%d, want 1", len(configs))
+	}
+	keys, err := target.store.GetAPIKeys(ctx, configs[0].ID)
+	if err != nil {
+		t.Fatalf("GetAPIKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("restored API key count=%d, want 2", len(keys))
+	}
+	want := map[int]float64{0: 0.5, 1: 2.0}
+	for _, key := range keys {
+		if got, ok := want[key.KeyIndex]; !ok || key.CostMultiplier != got {
+			t.Fatalf("restored key %d multiplier=%v, want %v", key.KeyIndex, key.CostMultiplier, got)
+		}
 	}
 }
 
@@ -504,9 +739,9 @@ func TestAdminAPI_ImportChannelsCSV(t *testing.T) {
 	server := newInMemoryServer(t)
 
 	// 创建测试CSV文件（注意：列名是api_key而不是api_keys）
-	csvContent := `name,urls,priority,rpm_limit,max_concurrency,websockets,models,model_redirects,protocol_transform_mode,protocol_transforms,enabled,api_key,key_strategy,scheduled_check_model
-Import-Test-1,"[{""url"":""https://import1.example.com"",""protocols"" : [""anthropic"",""openai""]}]",10,0,3,true,test-model-1,{},local,openai,true,sk-import-key-1,sequential,test-model-1
-Import-Test-2,"[{""url"":""https://import2.example.com"",""exact"":true}]",5,0,0,false,"test-model-2,test-model-3","{""old"":""new""}",upstream,"openai,anthropic",false,sk-import-key-2,round_robin,test-model-3
+	csvContent := `name,urls,priority,rpm_limit,max_concurrency,websockets,models,model_redirects,protocol_transform_mode,protocol_transforms,enabled,api_key,key_strategy,scheduled_check_model,api_key_allowed_models
+Import-Test-1,"[{""url"":""https://import1.example.com"",""protocols"" : [""anthropic"",""openai""]}]",10,0,3,true,test-model-1,{},local,openai,true,sk-import-key-1,sequential,test-model-1,"[[""test-model-1""]]"
+Import-Test-2,"[{""url"":""https://import2.example.com"",""exact"":true}]",5,0,0,false,"test-model-2,test-model-3","{""old"":""new""}",upstream,"openai,anthropic",false,sk-import-key-2,round_robin,test-model-3,"[[""test-model-3""]]"
 `
 
 	// 创建multipart表单
@@ -588,6 +823,15 @@ Import-Test-2,"[{""url"":""https://import2.example.com"",""exact"":true}]",5,0,0
 
 		if len(keys) != 1 {
 			t.Errorf("渠道 %s 应有1个API Key，实际: %d", cfg.Name, len(keys))
+		}
+		if len(keys) == 1 {
+			wantModel := "test-model-1"
+			if cfg.Name == "Import-Test-2" {
+				wantModel = "test-model-3"
+			}
+			if !slices.Equal(keys[0].AllowedModels, []string{wantModel}) {
+				t.Errorf("渠道 %s Key 模型范围=%v, want [%s]", cfg.Name, keys[0].AllowedModels, wantModel)
+			}
 		}
 		if cfg.Name == "Import-Test-1" && cfg.ScheduledCheckModel != "test-model-1" {
 			t.Errorf("渠道 %s scheduled_check_model = %q", cfg.Name, cfg.ScheduledCheckModel)
@@ -805,16 +1049,17 @@ func TestAdminAPI_ImportChannelsCSV_MissingScheduledCheckColumnPreservesExisting
 		t.Fatalf("创建现有渠道失败: %v", err)
 	}
 	if err := server.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
-		ChannelID:   created.ID,
-		KeyIndex:    0,
-		APIKey:      "sk-old-key",
-		KeyStrategy: model.KeyStrategySequential,
+		ChannelID:     created.ID,
+		KeyIndex:      0,
+		APIKey:        "sk-old-key",
+		AllowedModels: []string{"old-model"},
+		KeyStrategy:   model.KeyStrategySequential,
 	}}); err != nil {
 		t.Fatalf("创建现有 key 失败: %v", err)
 	}
 
 	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
-Import-Preserve-Scheduled,"[{""url"":""https://new.example.com""}]",20,"old-model,new-model",{},true,sk-new-key,sequential
+Import-Preserve-Scheduled,"[{""url"":""https://new.example.com""}]",20,"old-model,new-model",{},true,sk-old-key,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -875,8 +1120,8 @@ Import-Preserve-Scheduled,"[{""url"":""https://new.example.com""}]",20,"old-mode
 	if err != nil {
 		t.Fatalf("查询更新后的 key 失败: %v", err)
 	}
-	if len(keys) != 1 || keys[0].APIKey != "sk-new-key" {
-		t.Fatalf("期望 key 已更新，实际为 %+v", keys)
+	if len(keys) != 1 || keys[0].APIKey != "sk-old-key" || !slices.Equal(keys[0].AllowedModels, []string{"old-model"}) {
+		t.Fatalf("旧 CSV 缺少 api_key_allowed_models 列时应保留范围，实际为 %+v", keys)
 	}
 }
 
@@ -1340,7 +1585,6 @@ func TestAdminAPI_ExportImportRoundTrip(t *testing.T) {
 	if err := server.store.CreateAPIKeysBatch(ctx, apiKeys); err != nil {
 		t.Fatalf("创建API Keys失败: %v", err)
 	}
-
 	// 步骤2：导出CSV
 	exportC, exportW := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/export", nil))
 	server.HandleExportChannelsCSV(exportC)
@@ -1420,7 +1664,6 @@ func TestAdminAPI_ExportImportRoundTrip(t *testing.T) {
 	if restoredRule.Name != "Round-trip cooldown" || restoredRule.Scope != model.CooldownScopeKey || restoredRule.CooldownSeconds != 90 {
 		t.Fatalf("恢复的冷却探测规则不匹配: %#v", restoredRule)
 	}
-
 	// 验证API Keys
 	restoredKeys, err := server.store.GetAPIKeys(ctx, restoredConfig.ID)
 	if err != nil {

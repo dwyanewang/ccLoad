@@ -403,6 +403,13 @@ func (s *Server) executeResponsesWebsocketTurn(
 	if requestedModel == "" {
 		return responsesWebsocketTurnResult{}, errors.New("missing model in normalized websocket request")
 	}
+	clientModel := model.RoutingModelName(requestedModel)
+	// 多模态回退：按完整 transcript 检测。一旦某轮带图，历史里会一直留着这张图，
+	// 用完整体检测才能让后续每一轮的判定保持稳定。改写必须在 Token 白名单
+	// （:431 modelName）与候选选择之前，与 HTTP 入口同契约。
+	if fallback := s.multimodalFallbackModel(requestedModel, requestHasNonTextContent(protocol.Codex, requestBody)); fallback != "" {
+		requestedModel = fallback
+	}
 	// 完整 transcript 与增量回合都是 Codex 协议原始体，后缀改写必须同时落到两者上，
 	// 否则重放和增量提交会带着不同的思考参数。
 	requestBody = applyThinkingSuffix(requestBody, protocol.Codex, requestedModel)
@@ -464,6 +471,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 	header := responsesWebsocketUpstreamHeaders(c.Request.Header)
 	header.Set("Content-Type", "application/json")
 	reqCtx := &proxyRequestContext{
+		clientModel:                clientModel,
 		originalModel:              modelName,
 		requestedModel:             requestedModel,
 		clientProtocol:             protocol.Codex,
@@ -490,8 +498,8 @@ func (s *Server) executeResponsesWebsocketTurn(
 		OnBytesRead: func(n int64) {
 			s.activeRequests.AddBytes(reqCtx.activeReqID, n)
 		},
-		OnFirstByteRead: func() {
-			s.activeRequests.SetClientFirstByteTime(reqCtx.activeReqID, time.Since(reqCtx.attemptStartTime))
+		OnFirstByteRead: func(firstByteTime time.Duration) {
+			s.activeRequests.SetClientFirstByteTime(reqCtx.activeReqID, firstByteTime)
 		},
 		OnUpstreamWebsocket: func(upstreamWebsocket bool) {
 			s.activeRequests.SetUpstreamWebsocket(reqCtx.activeReqID, upstreamWebsocket)
@@ -610,7 +618,7 @@ func responsesWebsocketGenerateDisabled(payload []byte) bool {
 }
 
 func isNativeCodexWebsocketCandidate(candidate *model.Config) bool {
-	return candidate != nil && candidate.Websockets && !candidate.UsesXAIOAuth() &&
+	return candidate != nil && candidate.Websockets && !candidate.UsesXAIOAuth() && !candidate.UsesZedOAuth() &&
 		configCanUseUpstreamProtocol(candidate, protocol.Codex)
 }
 

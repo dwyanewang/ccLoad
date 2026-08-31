@@ -29,7 +29,10 @@ let oauthLoginDialogTrigger = null;
 let oauthCredentialImportDialogTrigger = null;
 const oauthUsageStateByChannelID = new Map();
 const oauthUsageOperationByChannelID = new Map();
+const oauthUsageLastOperationByChannelID = new Map();
 let oauthUsageOperationSequence = 0;
+const activeChannelUsageAutoRefreshPendingIDs = new Set();
+const activeChannelUsageAutoRefreshCompletedIDs = new Set();
 const OAUTH_PROVIDER_CONFIGS = Object.freeze({
   codex: Object.freeze({
     provider: 'codex', label: 'Codex', i18n: 'channels.codex',
@@ -52,6 +55,10 @@ const OAUTH_PROVIDER_CONFIGS = Object.freeze({
   zai: Object.freeze({
     provider: 'zai', label: 'Z.ai', i18n: 'channels.zai',
     callbackPlaceholder: '', pollOnly: true
+  }),
+  zed: Object.freeze({
+    provider: 'zed', label: 'Zed', i18n: 'channels.zed',
+    callbackPlaceholder: 'http://localhost:PORT/?user_id=...&access_token=...'
   })
 });
 
@@ -155,7 +162,8 @@ function applyChannelAuthEditorMode(
   const anthropicOAuth = authType === 'anthropic_oauth';
   const zaiOAuth = authType === 'zai_oauth';
   const cursorOAuth = authType === 'cursor_oauth';
-  const credentialVisible = codexOAuth || authType === 'antigravity_oauth' || xaiOAuth || anthropicOAuth || zaiOAuth || cursorOAuth;
+  const zedOAuth = authType === 'zed_oauth';
+  const credentialVisible = codexOAuth || authType === 'antigravity_oauth' || xaiOAuth || anthropicOAuth || zaiOAuth || cursorOAuth || zedOAuth;
   const oauth = credentialVisible;
   const notice = document.getElementById('codexCredentialReadOnlyNotice');
   const keyHeader = document.getElementById('channelAPIKeyHeader');
@@ -165,6 +173,8 @@ function applyChannelAuthEditorMode(
   const batchDeleteButton = document.getElementById('batchDeleteKeysBtn');
   const selectAll = document.getElementById('selectAllKeys');
   const credentialTab = document.getElementById('codexCredentialTab');
+  const credentialViewDescription = document.getElementById('codexCredentialViewDescription');
+  const credentialViewSwitch = document.getElementById('codexCredentialViewSwitch');
   const credentialRefreshButton = document.getElementById('codexCredentialRefreshButton');
   const planBadge = document.getElementById('channelCodexPlanBadge');
   const planType = codexOAuth
@@ -189,8 +199,15 @@ function applyChannelAuthEditorMode(
     planBadge.textContent = planBadgeText;
     planBadge.hidden = !planBadgeText;
   }
-  if (keyHeader) keyHeader.hidden = xaiOAuth;
-  if (keyTable) keyTable.hidden = xaiOAuth;
+  // xAI OAuth now receives a masked synthetic Key row from the editor API so
+  // its channel-level multiplier remains editable. Keep the empty create form
+  // uncluttered until such a row exists.
+  const hasOAuthSyntheticKey = typeof inlineKeyTableData !== 'undefined' &&
+    Array.isArray(inlineKeyTableData) &&
+    inlineKeyTableData.some(row => String(row?.api_key || '').trim() !== '');
+  const hideXAIKeySurface = xaiOAuth && !hasOAuthSyntheticKey;
+  if (keyHeader) keyHeader.hidden = hideXAIKeySurface;
+  if (keyTable) keyTable.hidden = hideXAIKeySurface;
   if (hiddenKey) {
     hiddenKey.required = !oauth;
     if (oauth) hiddenKey.value = '';
@@ -199,6 +216,8 @@ function applyChannelAuthEditorMode(
   if (batchDeleteButton) batchDeleteButton.disabled = oauth;
   if (selectAll) selectAll.disabled = oauth;
   if (credentialTab) credentialTab.hidden = !credentialVisible;
+  if (credentialViewDescription) credentialViewDescription.hidden = !codexOAuth;
+  if (credentialViewSwitch) credentialViewSwitch.hidden = !codexOAuth;
   if (credentialRefreshButton) {
     credentialRefreshButton.hidden = !oauthCredentialRefreshTarget(authType) || Boolean(
       codexPersonalAccessToken || (zaiOAuth && !String(credential?.access_token || '').trim())
@@ -515,6 +534,7 @@ function syncOAuthProviderFields() {
   const codex = provider === 'codex';
   const zai = provider === 'zai';
   const cursor = provider === 'cursor';
+  const zed = provider === 'zed';
   const zaiAPIKey = zai && zaiMethod === 'api_key';
   const cursorAPIKey = cursor;
   const codexPersonalAccessToken = codex && codexMethod === 'personalAccessToken';
@@ -531,6 +551,8 @@ function syncOAuthProviderFields() {
   const cursorControls = document.getElementById('cursorOAuthControls');
   const cursorAPIKeyField = document.getElementById('cursorAPIKeyField');
   const cursorAPIKeyInput = document.getElementById('cursorUserAPIKey');
+  const zedControls = document.getElementById('zedOAuthControls');
+  const zedSystemID = document.getElementById('zedSystemID');
   const codexControls = document.getElementById('codexOAuthControls');
   const codexPersonalAccessTokenField = document.getElementById('codexPersonalAccessTokenField');
   const codexPersonalAccessTokenInput = document.getElementById('codexPersonalAccessToken');
@@ -543,6 +565,8 @@ function syncOAuthProviderFields() {
   if (anthropicControls) anthropicControls.hidden = !anthropic;
   if (zaiControls) zaiControls.hidden = !zai;
   if (cursorControls) cursorControls.hidden = !cursor;
+  if (zedControls) zedControls.hidden = !zed;
+  if (zedSystemID && !zed) zedSystemID.removeAttribute?.('aria-invalid');
   if (zaiAPIKeyField) zaiAPIKeyField.hidden = !zaiAPIKey;
   if (zaiAPIKeyInput) {
     zaiAPIKeyInput.required = zaiAPIKey;
@@ -573,6 +597,8 @@ function syncOAuthProviderFields() {
   if (description) {
     const descriptionKey = codexPersonalAccessToken
       ? 'channels.codex.personalAccessTokenDescription'
+      : zed
+      ? 'channels.zed.oauthDescription'
       : cursor
       ? 'channels.cursor.apiKeyDescription'
       : zai
@@ -1018,7 +1044,19 @@ async function startOAuth(provider, button) {
   try {
     if (button) button.disabled = true;
     setCodexAuthStatus(window.t(`${config.i18n}.oauthStarting`));
-    const session = await fetchDataWithAuth(`/admin/${config.provider}/oauth/start`, { method: 'POST' });
+    let startOptions = { method: 'POST' };
+    if (config.provider === 'zed') {
+      const systemIDInput = document.getElementById('zedSystemID');
+      try {
+        startOptions = zedOAuthStartOptions(systemIDInput?.value);
+        systemIDInput?.removeAttribute?.('aria-invalid');
+      } catch (error) {
+        systemIDInput?.setAttribute?.('aria-invalid', 'true');
+        systemIDInput?.focus?.();
+        throw error;
+      }
+    }
+    const session = await fetchDataWithAuth(`/admin/${config.provider}/oauth/start`, startOptions);
     if (!session?.url || !session?.state) throw new Error(window.t(`${config.i18n}.oauthFailed`));
     flow.state = session.state;
     flow.readySettled = true;
@@ -1054,6 +1092,19 @@ async function startOAuth(provider, button) {
       if (button) button.disabled = false;
     }
   }
+}
+
+function zedOAuthStartOptions(rawSystemID) {
+  const systemID = String(rawSystemID || '').trim();
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (systemID && (!uuidPattern.test(systemID) || /^0{8}-0{4}-0{4}-0{4}-0{12}$/i.test(systemID))) {
+    throw new Error(window.t('channels.zed.systemIDInvalid'));
+  }
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ system_id: systemID })
+  };
 }
 
 async function stopActiveXAIImport(options = {}) {
@@ -1492,7 +1543,8 @@ function oauthCredentialCleanupProviderLabel(authType) {
     xai_oauth: 'xAI',
     anthropic_oauth: 'Anthropic',
     zai_oauth: 'Z.ai',
-    cursor_oauth: 'Cursor'
+    cursor_oauth: 'Cursor',
+    zed_oauth: 'Zed'
   })[authType] || authType;
 }
 
@@ -1901,6 +1953,8 @@ function oauthCredentialRefreshTarget(authType) {
       return { resource: 'anthropic-credential', label: 'Anthropic', i18n: 'channels.anthropic', keyNote: 'Anthropic OAuth AT' };
     case 'cursor_oauth':
       return { resource: 'cursor-credential', label: 'Cursor', i18n: 'channels.cursor', keyNote: 'Cursor OAuth AT' };
+    case 'zed_oauth':
+      return { resource: 'zed-credential', label: 'Zed', i18n: 'channels.zed', keyNote: 'Zed LLM JWT' };
     case 'xai_oauth':
       return { resource: 'xai-credential', label: 'xAI', i18n: 'channels.xai', keyNote: 'xAI OAuth AT' };
     case 'zai_oauth':
@@ -1980,12 +2034,84 @@ function rerenderOAuthUsage() {
   if (typeof filterChannels === 'function') filterChannels();
 }
 
+function resetActiveChannelUsageAutoRefreshState() {
+  activeChannelUsageAutoRefreshPendingIDs.clear();
+  activeChannelUsageAutoRefreshCompletedIDs.clear();
+}
+
+async function maybeAutoRefreshActiveChannelUsage(channelIDs, fetcher = fetchWithAuth) {
+  const readOnly = typeof isTokenChannelsReadOnly === 'function' && isTokenChannelsReadOnly();
+  if (readOnly) return null;
+  const pendingIDs = Array.from(new Set((Array.isArray(channelIDs) ? channelIDs : [])
+    .map(Number)
+    .filter(channelID => Number.isInteger(channelID) && channelID > 0)))
+    .filter(channelID => !activeChannelUsageAutoRefreshPendingIDs.has(channelID)
+      && !activeChannelUsageAutoRefreshCompletedIDs.has(channelID));
+  if (pendingIDs.length === 0) return null;
+  for (const channelID of pendingIDs) activeChannelUsageAutoRefreshPendingIDs.add(channelID);
+  const oauthOperationFloor = oauthUsageOperationSequence;
+  const managementOperationFloor = typeof getManagementBalanceOperationSequence === 'function'
+    ? getManagementBalanceOperationSequence()
+    : 0;
+  try {
+    const response = await fetcher('/admin/channels/usage/active/batch/stream', {
+      method: 'POST',
+      headers: { Accept: 'text/event-stream', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_ids: pendingIDs })
+    });
+    const complete = await readAdminSSEStream(
+      response,
+      event => {
+        if (event.event !== 'progress' || !event.result) return;
+        const result = event.result;
+        const channelID = Number(result.channel_id);
+        if (!Number.isInteger(channelID) || channelID <= 0) return;
+        if (result.kind === 'management') {
+          if (typeof applyManagementBalanceBatchResult === 'function') {
+            applyManagementBalanceBatchResult(channelID, result, managementOperationFloor);
+          }
+          return;
+        }
+        // A manual refresh started after list-open always wins over this
+        // background result.
+        if (oauthUsageOperationByChannelID.has(channelID) ||
+            (oauthUsageLastOperationByChannelID.get(channelID) || 0) > oauthOperationFloor) return;
+        if (result.status === 'succeeded' && result.usage && Array.isArray(result.usage.windows)) {
+          oauthUsageStateByChannelID.set(channelID, { status: 'ready', data: result.usage });
+        } else {
+          oauthUsageStateByChannelID.set(channelID, {
+            status: 'error', error: result.error || window.t('channels.oauth.usageFailed')
+          });
+        }
+        rerenderOAuthUsage();
+      },
+      'channels.batchOAuthUsageFailed',
+      'channels.batchOAuthUsageIncomplete'
+    );
+    const total = Number(complete.total) || 0;
+    const processed = Number(complete.processed) || 0;
+    const succeeded = Number(complete.succeeded) || 0;
+    const failed = Number(complete.failed) || 0;
+    if (processed !== total || succeeded + failed !== total) {
+      throw new Error(window.t('channels.batchOAuthUsageIncomplete'));
+    }
+    for (const channelID of pendingIDs) activeChannelUsageAutoRefreshCompletedIDs.add(channelID);
+    return { total, succeeded, failed };
+  } catch (error) {
+    console.error('Failed to auto-refresh active channel usage', error);
+    return null;
+  } finally {
+    for (const channelID of pendingIDs) activeChannelUsageAutoRefreshPendingIDs.delete(channelID);
+  }
+}
+
 async function refreshOAuthUsage(channelID, fetcher = fetchDataWithAuth, options = {}) {
   const numericID = Number(channelID);
   if (!Number.isInteger(numericID) || numericID <= 0) {
     throw new Error('A saved OAuth channel is required');
   }
   const operationID = ++oauthUsageOperationSequence;
+  oauthUsageLastOperationByChannelID.set(numericID, operationID);
   oauthUsageOperationByChannelID.set(numericID, operationID);
   oauthUsageStateByChannelID.set(numericID, { status: 'loading' });
   rerenderOAuthUsage();
@@ -2024,6 +2150,7 @@ async function resetCodexQuota(channelID, fetcher = fetchDataWithAuth, options =
   const previous = oauthUsageStateByChannelID.get(numericID) ||
     (persistedUsage ? { status: 'ready', data: persistedUsage } : null);
   const operationID = ++oauthUsageOperationSequence;
+  oauthUsageLastOperationByChannelID.set(numericID, operationID);
   oauthUsageOperationByChannelID.set(numericID, operationID);
   oauthUsageStateByChannelID.set(numericID, {
     ...(previous || {}),
@@ -2077,7 +2204,7 @@ async function resetCodexQuota(channelID, fetcher = fetchDataWithAuth, options =
   }
 }
 
-async function refreshOAuthUsageBatch(channelIDs, fetcher = fetchWithAuth) {
+async function refreshOAuthUsageBatch(channelIDs, fetcher = fetchWithAuth, options = {}) {
   const ids = Array.from(new Set((channelIDs || [])
     .map(id => Number(id))
     .filter(id => Number.isInteger(id) && id > 0)));
@@ -2087,6 +2214,7 @@ async function refreshOAuthUsageBatch(channelIDs, fetcher = fetchWithAuth) {
   const idSet = new Set(ids);
   const operationID = ++oauthUsageOperationSequence;
   ids.forEach(id => {
+    oauthUsageLastOperationByChannelID.set(id, operationID);
     oauthUsageOperationByChannelID.set(id, operationID);
     oauthUsageStateByChannelID.set(id, { status: 'loading' });
   });
@@ -2131,7 +2259,7 @@ async function refreshOAuthUsageBatch(channelIDs, fetcher = fetchWithAuth) {
       throw new Error(window.t('channels.batchOAuthUsageIncomplete'));
     }
 
-    if (typeof loadChannels === 'function') {
+    if (options.reload !== false && typeof loadChannels === 'function') {
       await loadChannels();
     } else {
       rerenderOAuthUsage();
@@ -2160,7 +2288,7 @@ async function batchRefreshSelectedOAuthUsage(fetcher = fetchWithAuth) {
   const channelList = typeof channels !== 'undefined' && Array.isArray(channels) ? channels : [];
   const eligibleIDs = selectedIDs.filter(id => {
     const channel = channelList.find(item => Number(item.id) === id);
-    return channel && ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth'].includes(channel.auth_type);
+    return channel && ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(channel.auth_type);
   });
   const skipped = selectedIDs.length - eligibleIDs.length;
   if (eligibleIDs.length === 0) {
@@ -2829,6 +2957,7 @@ if (typeof module !== 'undefined' && module.exports) {
     copyCodexOAuthLink,
     formatCodexPlanBadgeText,
     getOAuthUsageState,
+    maybeAutoRefreshActiveChannelUsage,
     importOAuthCredentials,
     loadOAuthCredentialCleanupModels,
     openOAuthCredentialImportDialog,
@@ -2840,11 +2969,13 @@ if (typeof module !== 'undefined' && module.exports) {
     refreshOAuthCredential,
     refreshOAuthUsage,
     refreshOAuthUsageBatch,
+    resetActiveChannelUsageAutoRefreshState,
     resetCodexQuota,
     renderOAuthCredential,
     resetCodexQuotaOverdraftDraft,
     saveCodexQuotaOverdraftFromAdvancedSettings,
     updateCodexQuotaOverdraft,
+    zedOAuthStartOptions,
     setOAuthCredentialView,
     setupOAuthActions,
     showOAuthSession,

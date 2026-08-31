@@ -352,6 +352,9 @@ func (s *SQLStore) UpdateConfig(ctx context.Context, id int64, upd *model.Config
 		if err := s.saveModelEntriesTx(ctx, tx, id, upd.ModelEntries); err != nil {
 			return fmt.Errorf("save model entries: %w", err)
 		}
+		if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, id, upd.ModelEntries, updatedAtUnix); err != nil {
+			return fmt.Errorf("prune API key model scopes: %w", err)
+		}
 
 		return nil
 	})
@@ -408,6 +411,50 @@ func (s *SQLStore) CompareAndSwapOAuthCredential(
 	})
 	if err != nil {
 		return false, fmt.Errorf("compare and swap OAuth credential: %w", err)
+	}
+	return matched, nil
+}
+
+// CompareAndSwapChannelManagement replaces the private management envelope of
+// an API-key channel while the complete previously persisted payload matches.
+func (s *SQLStore) CompareAndSwapChannelManagement(
+	ctx context.Context,
+	channelID int64,
+	expectedEnvelope, nextEnvelope string,
+) (bool, error) {
+	if nextEnvelope != "" {
+		envelope, err := model.ParseChannelManagementEnvelope(nextEnvelope)
+		if err != nil {
+			return false, fmt.Errorf("invalid next channel management envelope: %w", err)
+		}
+		nextEnvelope, err = envelope.Marshal()
+		if err != nil {
+			return false, fmt.Errorf("marshal next channel management envelope: %w", err)
+		}
+	}
+
+	matched := false
+	err := s.WithTransaction(ctx, func(tx *sql.Tx) error {
+		currentAuthType, currentEnvelope, loadErr := s.loadOAuthCredentialForUpdate(ctx, tx, channelID)
+		if errors.Is(loadErr, sql.ErrNoRows) {
+			return nil
+		}
+		if loadErr != nil {
+			return loadErr
+		}
+		if currentAuthType != model.AuthTypeAPIKey || currentEnvelope != expectedEnvelope {
+			return nil
+		}
+		if _, updateErr := s.execTx(ctx, tx, `
+			UPDATE channels SET oauth_credential = ?, updated_at = ? WHERE id = ?
+		`, nextEnvelope, timeToUnix(time.Now()), channelID); updateErr != nil {
+			return updateErr
+		}
+		matched = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("compare and swap channel management envelope: %w", err)
 	}
 	return matched, nil
 }
@@ -660,7 +707,7 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 
 	result := model.BatchConfigPatchResult{}
 	err = s.WithTransaction(ctx, func(tx *sql.Tx) error {
-		states, err := s.loadBatchConfigPatchStates(ctx, tx, channelIDs, patch.ModelImportMode != "")
+		states, err := s.loadBatchConfigPatchStates(ctx, tx, channelIDs, patch.ModelImportMode != "", patch.CostMultiplier != nil)
 		if err != nil {
 			return err
 		}
@@ -676,9 +723,21 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 			if patch.Priority != nil {
 				nextPriority = *patch.Priority
 			}
+			// 倍率属于凭证：api_key 渠道批量设置落到该渠道全部 Key，OAuth 渠道维持渠道级列。
 			nextCostMultiplier := state.costMultiplier
+			keyMultiplierChanged := false
 			if patch.CostMultiplier != nil {
-				nextCostMultiplier = *patch.CostMultiplier
+				if model.NormalizeAuthType(state.authType) == model.AuthTypeAPIKey {
+					targetMultiplier := normalizeCostMultiplier(*patch.CostMultiplier)
+					for _, currentMultiplier := range state.keyCostMultipliers {
+						if currentMultiplier != targetMultiplier {
+							keyMultiplierChanged = true
+							break
+						}
+					}
+				} else {
+					nextCostMultiplier = *patch.CostMultiplier
+				}
 			}
 			nextDailyCostLimit := state.dailyCostLimit
 			if patch.DailyCostLimit != nil {
@@ -706,31 +765,44 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 				nextScheduledCheckModel = reconciledScheduledCheckModel(nextScheduledCheckModel, nextModels)
 			}
 
-			changed := state.priority != nextPriority ||
+			channelChanged := state.priority != nextPriority ||
 				state.costMultiplier != nextCostMultiplier ||
 				state.dailyCostLimit != nextDailyCostLimit ||
 				state.rpmLimit != nextRPMLimit ||
 				state.maxConcurrency != nextMaxConcurrency ||
 				state.protocolTransformMode != nextProtocolMode ||
-				state.scheduledCheckModel != nextScheduledCheckModel ||
-				modelsChanged
+				state.scheduledCheckModel != nextScheduledCheckModel
+			changed := channelChanged || keyMultiplierChanged || modelsChanged
 			if !changed {
 				result.Unchanged++
 				continue
 			}
 
-			if _, err := s.execTx(ctx, tx, `
-				UPDATE channels
-				SET priority = ?, cost_multiplier = ?, daily_cost_limit = ?, rpm_limit = ?, max_concurrency = ?,
-					protocol_transform_mode = ?, scheduled_check_model = ?, updated_at = ?
-				WHERE id = ?
-			`, nextPriority, nextCostMultiplier, nextDailyCostLimit, nextRPMLimit, nextMaxConcurrency,
-				nextProtocolMode, nextScheduledCheckModel, timeToUnix(time.Now()), channelID); err != nil {
-				return fmt.Errorf("patch channel %d: %w", channelID, err)
+			updatedAtUnix := timeToUnix(time.Now())
+			if channelChanged || modelsChanged {
+				if _, err := s.execTx(ctx, tx, `
+					UPDATE channels
+					SET priority = ?, cost_multiplier = ?, daily_cost_limit = ?, rpm_limit = ?, max_concurrency = ?,
+						protocol_transform_mode = ?, scheduled_check_model = ?, updated_at = ?
+					WHERE id = ?
+				`, nextPriority, nextCostMultiplier, nextDailyCostLimit, nextRPMLimit, nextMaxConcurrency,
+					nextProtocolMode, nextScheduledCheckModel, updatedAtUnix, channelID); err != nil {
+					return fmt.Errorf("patch channel %d: %w", channelID, err)
+				}
+			}
+			if keyMultiplierChanged {
+				if _, err := s.execTx(ctx, tx, `
+					UPDATE api_keys SET cost_multiplier = ?, updated_at = ? WHERE channel_id = ?
+				`, normalizeCostMultiplier(*patch.CostMultiplier), updatedAtUnix, channelID); err != nil {
+					return fmt.Errorf("patch channel %d api key cost multipliers: %w", channelID, err)
+				}
 			}
 			if modelsChanged {
 				if err := s.saveModelEntriesTx(ctx, tx, channelID, nextModels); err != nil {
 					return fmt.Errorf("patch channel %d models: %w", channelID, err)
+				}
+				if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, channelID, nextModels, updatedAtUnix); err != nil {
+					return fmt.Errorf("patch channel %d API key model scopes: %w", channelID, err)
 				}
 			}
 			result.Updated++
@@ -751,7 +823,9 @@ type batchConfigPatchState struct {
 	maxConcurrency        int
 	protocolTransformMode string
 	scheduledCheckModel   string
+	authType              string
 	modelEntries          []model.ModelEntry
+	keyCostMultipliers    []float64
 }
 
 func normalizeBatchPatchChannelIDs(channelIDs []int64) []int64 {
@@ -770,7 +844,7 @@ func normalizeBatchPatchChannelIDs(channelIDs []int64) []int64 {
 	return result
 }
 
-func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, channelIDs []int64, withModels bool) (map[int64]*batchConfigPatchState, error) {
+func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, channelIDs []int64, withModels, withKeyMultipliers bool) (map[int64]*batchConfigPatchState, error) {
 	placeholders := make([]string, len(channelIDs))
 	args := make([]any, len(channelIDs))
 	for i, channelID := range channelIDs {
@@ -780,7 +854,7 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 
 	//nolint:gosec // placeholders are generated internally and contain only "?".
 	query := `SELECT id, priority, cost_multiplier, daily_cost_limit, rpm_limit, max_concurrency,
-		protocol_transform_mode, scheduled_check_model
+		protocol_transform_mode, scheduled_check_model, auth_type
 		FROM channels WHERE id IN (` + strings.Join(placeholders, ",") + `) ORDER BY id`
 	if s.supportsRowLock() {
 		query += ` FOR UPDATE`
@@ -795,7 +869,7 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 		state := &batchConfigPatchState{}
 		if err := rows.Scan(
 			&channelID, &state.priority, &state.costMultiplier, &state.dailyCostLimit, &state.rpmLimit, &state.maxConcurrency,
-			&state.protocolTransformMode, &state.scheduledCheckModel,
+			&state.protocolTransformMode, &state.scheduledCheckModel, &state.authType,
 		); err != nil {
 			_ = rows.Close()
 			return nil, fmt.Errorf("scan channel for batch patch: %w", err)
@@ -809,29 +883,63 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close channels for batch patch: %w", err)
 	}
-	if !withModels || len(states) == 0 {
+	if len(states) == 0 {
 		return states, nil
 	}
 
-	modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled
-		FROM channel_models WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
-		ORDER BY channel_id, created_at ASC, model ASC`), normalizeSQLArgs(args)...)
-	if err != nil {
-		return nil, fmt.Errorf("query models for batch patch: %w", err)
+	if withModels {
+		modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled
+			FROM channel_models WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
+			ORDER BY channel_id, created_at ASC, model ASC`), normalizeSQLArgs(args)...)
+		if err != nil {
+			return nil, fmt.Errorf("query models for batch patch: %w", err)
+		}
+		for modelRows.Next() {
+			var channelID int64
+			var entry model.ModelEntry
+			if err := modelRows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
+				_ = modelRows.Close()
+				return nil, fmt.Errorf("scan model for batch patch: %w", err)
+			}
+			if state := states[channelID]; state != nil {
+				state.modelEntries = append(state.modelEntries, entry)
+			}
+		}
+		if err := modelRows.Err(); err != nil {
+			_ = modelRows.Close()
+			return nil, fmt.Errorf("iterate models for batch patch: %w", err)
+		}
+		if err := modelRows.Close(); err != nil {
+			return nil, fmt.Errorf("close models for batch patch: %w", err)
+		}
 	}
-	defer func() { _ = modelRows.Close() }()
-	for modelRows.Next() {
+	if !withKeyMultipliers {
+		return states, nil
+	}
+
+	keyRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, cost_multiplier
+		FROM api_keys WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY channel_id, key_index ASC`), normalizeSQLArgs(args)...)
+	if err != nil {
+		return nil, fmt.Errorf("query API key multipliers for batch patch: %w", err)
+	}
+	for keyRows.Next() {
 		var channelID int64
-		var entry model.ModelEntry
-		if err := modelRows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
-			return nil, fmt.Errorf("scan model for batch patch: %w", err)
+		var multiplier float64
+		if err := keyRows.Scan(&channelID, &multiplier); err != nil {
+			_ = keyRows.Close()
+			return nil, fmt.Errorf("scan API key multiplier for batch patch: %w", err)
 		}
 		if state := states[channelID]; state != nil {
-			state.modelEntries = append(state.modelEntries, entry)
+			state.keyCostMultipliers = append(state.keyCostMultipliers, multiplier)
 		}
 	}
-	if err := modelRows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate models for batch patch: %w", err)
+	if err := keyRows.Err(); err != nil {
+		_ = keyRows.Close()
+		return nil, fmt.Errorf("iterate API key multipliers for batch patch: %w", err)
+	}
+	if err := keyRows.Close(); err != nil {
+		return nil, fmt.Errorf("close API key multipliers for batch patch: %w", err)
 	}
 	return states, nil
 }
@@ -878,6 +986,103 @@ func reconciledScheduledCheckModel(current string, entries []model.ModelEntry) s
 		}
 	}
 	return ""
+}
+
+func (s *SQLStore) pruneAPIKeyAllowedModelsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	channelID int64,
+	entries []model.ModelEntry,
+	updatedAtUnix int64,
+) error {
+	configured := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(entry.Model)))
+		if name == "*" {
+			return nil
+		}
+		if name != "" {
+			configured[name] = struct{}{}
+		}
+	}
+
+	type scopeUpdate struct {
+		keyIndex        int
+		value           string
+		modelScopeEmpty bool
+		disabled        bool
+	}
+	query := `
+		SELECT key_index, allowed_models, model_scope_empty, disabled
+		FROM api_keys
+		WHERE channel_id = ?
+		ORDER BY key_index ASC
+	`
+	if s.supportsRowLock() {
+		query += " FOR UPDATE"
+	}
+	rows, err := s.queryTx(ctx, tx, query, channelID)
+	if err != nil {
+		return fmt.Errorf("query API key model scopes: %w", err)
+	}
+
+	updates := make([]scopeUpdate, 0)
+	for rows.Next() {
+		var keyIndex int
+		var raw string
+		var modelScopeEmpty, disabled int
+		if err := rows.Scan(&keyIndex, &raw, &modelScopeEmpty, &disabled); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan API key model scope: %w", err)
+		}
+		if raw == "" {
+			continue
+		}
+
+		var allowedModels []string
+		if err := json.Unmarshal([]byte(raw), &allowedModels); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode API key index %d allowed_models: %w", keyIndex, err)
+		}
+		kept := make([]string, 0, len(allowedModels))
+		for _, allowedModel := range allowedModels {
+			if _, ok := configured[strings.ToLower(strings.TrimSpace(allowedModel))]; ok {
+				kept = append(kept, allowedModel)
+			}
+		}
+		if len(kept) == len(allowedModels) {
+			continue
+		}
+		value, err := marshalAllowedModels(kept)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("encode API key index %d allowed_models: %w", keyIndex, err)
+		}
+		updates = append(updates, scopeUpdate{
+			keyIndex:        keyIndex,
+			value:           value,
+			modelScopeEmpty: len(kept) == 0,
+			disabled:        disabled != 0 || len(kept) == 0,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate API key model scopes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close API key model scopes: %w", err)
+	}
+
+	for _, update := range updates {
+		if _, err := s.execTx(ctx, tx, `
+			UPDATE api_keys
+			SET allowed_models = ?, model_scope_empty = ?, disabled = ?, updated_at = ?
+			WHERE channel_id = ? AND key_index = ?
+		`, update.value, update.modelScopeEmpty, update.disabled, updatedAtUnix, channelID, update.keyIndex); err != nil {
+			return fmt.Errorf("update API key index %d model scope: %w", update.keyIndex, err)
+		}
+	}
+	return nil
 }
 
 // DeleteConfig 删除渠道配置

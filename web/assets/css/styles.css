@@ -1025,6 +1025,34 @@ body {
   background: linear-gradient(135deg, #4285f4, #1a73e8);
 }
 
+.channel-icon--api {
+  background: linear-gradient(135deg, #64748b, #334155);
+}
+
+.channel-icon--antigravity {
+  background: linear-gradient(135deg, #7c3aed, #4f46e5);
+}
+
+.channel-icon--xai {
+  background: linear-gradient(135deg, #111827, #374151);
+}
+
+.channel-icon--zed {
+  background: linear-gradient(135deg, #2563eb, #0ea5e9);
+}
+
+.channel-icon--zai {
+  background: linear-gradient(135deg, #0f766e, #14b8a6);
+}
+
+.channel-icon--cursor {
+  background: linear-gradient(135deg, #18181b, #3f3f46);
+}
+
+.channel-icon--grok {
+  background: linear-gradient(135deg, #ca8a04, #eab308);
+}
+
 .channel-cost {
   text-align: right;
 }
@@ -2747,16 +2775,53 @@ body {
 
 .filter-combobox {
   width: 100%;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M6 8l4 4 4-4' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 10px center;
-  background-size: 14px 14px;
-  padding-right: 32px;
+  /* Select-specific background/padding shorthands must not erase the combobox affordance. */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M6 8l4 4 4-4' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 10px center !important;
+  background-size: 14px 14px !important;
+  padding-inline-end: 32px !important;
 }
 
 .filter-combobox-wrapper {
   position: relative;
   flex: 1;
+}
+
+.searchable-select-native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  clip-path: inset(50%) !important;
+}
+
+.searchable-select-wrapper {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.searchable-select-wrapper--auto {
+  width: auto;
+  flex: 0 1 auto;
+}
+
+.searchable-select-wrapper .searchable-select-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.searchable-select-wrapper .channel-batch-select {
+  width: 132px;
+}
+
+.searchable-select-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .filter-control--narrow {
@@ -3912,7 +3977,7 @@ body {
 .settings-save-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
   padding: 16px 0 0 0;
 }
@@ -3920,6 +3985,10 @@ body {
 .settings-save-btn,
 .settings-runtime-metrics-btn {
   min-width: 120px;
+}
+
+.settings-save-btn {
+  margin-inline-start: auto;
 }
 
 .global-cooldown-rules-control {
@@ -3932,6 +4001,87 @@ body {
 .global-cooldown-rules-summary {
   color: var(--color-text-secondary);
   font-size: 0.875rem;
+}
+
+.settings-multimodal-fallback-btn {
+  min-width: 0;
+}
+
+.settings-update-channel-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-update-check-btn {
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.settings-multimodal-fallback-summary {
+  color: var(--color-text-secondary);
+  font-size: 0.875rem;
+}
+
+.multimodal-fallback-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.multimodal-fallback-intro {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+
+.multimodal-fallback-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.multimodal-fallback-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.multimodal-fallback-select {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.multimodal-fallback-arrow {
+  color: var(--color-text-secondary);
+  flex: 0 0 auto;
+}
+
+.multimodal-fallback-remove-btn {
+  flex: 0 0 auto;
+}
+
+.multimodal-fallback-empty {
+  border: 1px dashed var(--color-text-secondary);
+  border-radius: 8px;
+  color: var(--color-text-secondary);
+  margin: 0;
+  padding: 16px;
+  text-align: center;
 }
 
 .modal-content.runtime-metrics-modal {
@@ -6711,8 +6861,8 @@ body.web-role-api-token .filter-group--auth-token {
   }
 
   .filter-combobox {
-    background-position: right 8px center;
-    padding-right: 26px;
+    background-position: right 8px center !important;
+    padding-inline-end: 26px !important;
   }
 
   .filter-dropdown-item {
@@ -7929,6 +8079,11 @@ body.web-role-api-token .filter-group--auth-token {
 
   .model-test-table .model-test-col-priority {
     order: 12;
+  }
+
+  /* 移动卡片沿用横向 label+输入框布局，动态优先级行仅在桌面显示 */
+  .model-test-table .model-test-col-priority .model-test-dyn-priority {
+    display: none;
   }
 
   .model-test-table .model-test-col-speed {

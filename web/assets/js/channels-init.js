@@ -264,7 +264,7 @@ window.initPageBootstrap({
       }
     } else if (savedFilters) {
       filters.status = savedFilters.status || 'all';
-      filters.authType = ['api_key', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth'].includes(savedFilters.authType) ? savedFilters.authType : 'all';
+      filters.authType = ['api_key', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(savedFilters.authType) ? savedFilters.authType : 'all';
       filters.model = savedFilters.model || 'all';
       filters.modelExact = filters.model !== 'all' && savedFilters.modelExact !== false;
       filters.search = savedFilters.search || '';
@@ -311,6 +311,7 @@ window.initPageBootstrap({
       updateChannelAuthTypeOptions();
       updateModelOptions();
       updateChannelsPagination();
+      if (typeof syncChannelSaveButtonLabel === 'function') syncChannelSaveButtonLabel();
     });
 
     // 自动刷新（system_settings.auto_refresh_interval_seconds，0=禁用）

@@ -22,12 +22,9 @@ import (
 const cursorSDKBridgeRequestURL = "http://cursor-sdk-bridge/sdk.v1.SdkAgentService/CreateAgent+Send"
 
 // tryCursorOAuthChannel runs inference through the managed Cursor SDK bridge.
-// The bridge receives an empty built-in tool set, so the gateway host never
-// executes shell or file tools.
-//
-// Client tools are mapped through the prompt: the model emits <cc_tool_call>
-// blocks which are translated to Anthropic tool_use or OpenAI tool_calls. The
-// client executes them and sends tool_result / role=tool on the next turn.
+// Built-in tools stay disabled. Client tools are registered as native Cursor
+// custom tools; their callbacks suspend inside ccLoad until the client returns
+// tool_result / role=tool on the next turn.
 func (s *Server) tryCursorOAuthChannel(
 	ctx context.Context,
 	cfg *model.Config,
@@ -76,7 +73,36 @@ func (s *Server) tryCursorOAuthChannel(
 		}
 		return oauthCredentialUnavailableResult(cfg, "Cursor"), nil
 	}
-	return s.forwardCursorAgent(ctx, cfg, credential, reqCtx, w)
+	for attempt := 0; attempt < 2; attempt++ {
+		result, forwardErr := s.forwardCursorAgent(ctx, cfg, credential, reqCtx, w)
+		if forwardErr != nil || result == nil {
+			return result, forwardErr
+		}
+		credentialRejected := result.status == http.StatusUnauthorized &&
+			(result.nextAction == cooldown.ActionRetryChannel || result.succeeded)
+		if !credentialRejected {
+			return result, nil
+		}
+		if attempt == 1 {
+			s.cooldownRejectedOAuthCredential(ctx, cfg, "Cursor")
+			return result, nil
+		}
+		refreshed, refreshErr := s.cursorCredentials.credentialAfterUnauthorized(ctx, cfg, credential.AccessToken)
+		if refreshErr != nil {
+			s.cooldownRejectedOAuthCredential(ctx, cfg, "Cursor")
+			return result, nil
+		}
+		credential = refreshed
+		if result.succeeded {
+			// The SSE error is already committed. Rotate the rejected credential
+			// for the next request, but never replay this run.
+			return result, nil
+		}
+		if s.activeRequests != nil {
+			s.activeRequests.Retry(reqCtx.activeReqID)
+		}
+	}
+	return nil, errors.New("cursor credential retry loop exhausted")
 }
 
 func (s *Server) forwardCursorAgent(
@@ -92,7 +118,8 @@ func (s *Server) forwardCursorAgent(
 	}
 	originalResponseBody := reqCtx.body
 	request := cursorauth.ParseRequest(body)
-	if request.Prompt == "" {
+	request.InputTokenEstimate = estimateCursorInputTokens(request)
+	if request.Prompt == "" && len(request.ToolResults) == 0 {
 		return cursorClientErrorResult(cfg, http.StatusBadRequest, "cursor prompt is required"), nil
 	}
 	requested := request.Model
@@ -163,7 +190,8 @@ func (s *Server) forwardCursorAgent(
 	}
 	runCtx, cancelRun := context.WithCancel(runBaseCtx)
 	defer cancelRun()
-	events, err := runner.Run(runCtx, credential, modelID, request.Prompt)
+	request.Model = modelID
+	events, err := runner.Run(runCtx, credential, request)
 	if err != nil {
 		status := http.StatusBadGateway
 		action := cooldown.ActionRetryChannel
@@ -181,7 +209,6 @@ func (s *Server) forwardCursorAgent(
 			action = cooldown.ActionReturnClient
 		} else if cursorauth.IsCredentialRejected(err) {
 			status = http.StatusUnauthorized
-			s.cooldownRejectedOAuthCredential(ctx, cfg, "Cursor")
 		}
 		result := cursorErrorResult(cfg, status, err.Error(), action)
 		result.duration = time.Since(started).Seconds()
@@ -202,7 +229,6 @@ func (s *Server) forwardCursorAgent(
 	}
 
 	format := cursorResponseFormat(reqCtx)
-	mapTools := request.AllowsTools()
 	msgID := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	var responseTransformState any
 	var responseTransformErr error
@@ -211,6 +237,7 @@ func (s *Server) forwardCursorAgent(
 	firstByte := time.Duration(0)
 	wroteHeader := false
 	streamedPlain := 0
+	var calls []cursorauth.ToolCall
 	flush := func() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -255,12 +282,18 @@ func (s *Server) forwardCursorAgent(
 
 	var runErr error
 	var usage *cursorauth.Usage
+	resumedToolRun := len(request.ToolResults) > 0
+	if resumedToolRun {
+		usage = estimatedCursorResponseUsage(request.InputTokenEstimate, "", nil)
+	}
+	var billableUsage *cursorauth.Usage
+	replayed := false
 	for event := range events {
 		if debugCapture != nil && debugCapture.respBuf != nil && len(event.RawResponse) > 0 {
 			_, _ = debugCapture.respBuf.Write(event.RawResponse)
 			_, _ = debugCapture.respBuf.Write([]byte("\n"))
 		}
-		if firstByte == 0 && (event.Delta != "" || event.Text != "" || (event.Done && event.Err == nil)) {
+		if firstByte == 0 && (event.Delta != "" || event.Text != "" || event.ToolCall != nil || (event.Done && event.Err == nil)) {
 			firstByte = time.Since(started)
 			timeoutCtx.stopFirstByteTimer()
 			if s.activeRequests != nil {
@@ -285,18 +318,23 @@ func (s *Server) forwardCursorAgent(
 			runErr = event.Err
 		}
 		if event.Usage != nil {
-			usage = event.Usage
+			if event.Done && !event.UsageEstimated && !event.Replayed {
+				billableUsage = event.Usage
+			}
+			// A terminal Cursor SDK usage value is cumulative for the whole native
+			// run, which may span many Chat Completions requests. It is valid for
+			// billing once, but invalid as this request's context usage.
+			if !resumedToolRun || event.UsageEstimated {
+				usage = event.Usage
+			}
 		}
-		if streaming && !mapTools && event.Delta != "" {
+		replayed = replayed || event.Replayed
+		if event.ToolCall != nil {
+			calls = append(calls, *event.ToolCall)
+		}
+		if streaming && event.Delta != "" {
 			writeStream(event.Delta)
 			streamedPlain += len(event.Delta)
-		}
-		if streaming && mapTools && full != "" {
-			plain, _, incomplete := cursorauth.SplitToolOutput(full)
-			if !incomplete && len(plain) > streamedPlain {
-				writeStream(plain[streamedPlain:])
-				streamedPlain = len(plain)
-			}
 		}
 		if responseTransformErr != nil {
 			break
@@ -317,7 +355,6 @@ func (s *Server) forwardCursorAgent(
 			action = cooldown.ActionReturnClient
 		} else if cursorauth.IsCredentialRejected(runErr) {
 			status = http.StatusUnauthorized
-			s.cooldownRejectedOAuthCredential(ctx, cfg, "Cursor")
 		}
 		if streaming && wroteHeader && !clientDisconnected {
 			if format == "responses" {
@@ -331,17 +368,17 @@ func (s *Server) forwardCursorAgent(
 		result.duration = duration
 		result.firstByteTime = firstByte.Seconds()
 		finishCursorSDKDebug(reqCtx, debugCapture, status, result.body, runErr)
-		if !reqCtx.skipProxyLog {
+		if !reqCtx.skipProxyLog && !replayed {
 			failed := &fwResult{
 				Status: status, Body: result.body, FirstByteTime: firstByte.Seconds(),
 			}
-			applyCursorUsage(failed, usage)
+			applyCursorUsage(failed, billableUsage)
 			s.logProxyResult(reqCtx, cfg, modelID, "cursor-oauth", status, duration, failed, runErr.Error())
 			if status != StatusClientClosedRequest {
 				s.updateTokenStatsForProxy(reqCtx, cfg, false, duration, failed, modelID)
 			}
 		}
-		result.proxyLogWritten = !reqCtx.skipProxyLog
+		result.proxyLogWritten = !reqCtx.skipProxyLog && !replayed
 		result.isClientCanceled = clientDisconnected
 		if streaming && wroteHeader && !clientDisconnected {
 			// The SSE envelope is already on the wire; the attempt loop must not
@@ -362,18 +399,8 @@ func (s *Server) forwardCursorAgent(
 	}
 
 	plain := full
-	var calls []cursorauth.ToolCall
-	if mapTools {
-		var incomplete bool
-		plain, calls, incomplete = cursorauth.SplitToolOutput(full)
-		if incomplete {
-			plain = full
-			calls = nil
-		}
-		calls = cursorauth.FilterToolCalls(calls, request.Tools)
-		if choice := request.ToolChoice; choice != "" && choice != "auto" && choice != "required" && choice != "none" {
-			calls = cursorauth.FilterToolCalls(calls, []cursorauth.Tool{{Name: choice}})
-		}
+	if resumedToolRun {
+		usage = estimatedCursorResponseUsage(request.InputTokenEstimate, plain, calls)
 	}
 
 	var responseBody []byte
@@ -387,8 +414,9 @@ func (s *Server) forwardCursorAgent(
 			_, _ = w.Write(cursorAnthropicStreamFinish(calls, usage))
 		} else {
 			ensureStream()
-			if streamedPlain == 0 && plain != "" && len(calls) == 0 {
-				writeStream(plain)
+			if len(plain) > streamedPlain {
+				writeStream(plain[streamedPlain:])
+				streamedPlain = len(plain)
 			}
 			finish := cursorOpenAIFinish(msgID, modelID, plain, calls, streamedPlain > 0, usage)
 			if format == "responses" {
@@ -436,15 +464,15 @@ func (s *Server) forwardCursorAgent(
 	forwarded := &fwResult{
 		Status: http.StatusOK, Header: header, Body: responseBody, FirstByteTime: firstByte.Seconds(),
 	}
-	applyCursorUsage(forwarded, usage)
-	if !reqCtx.skipProxyLog {
+	applyCursorUsage(forwarded, billableUsage)
+	if !reqCtx.skipProxyLog && !replayed {
 		s.logProxyResult(reqCtx, cfg, modelID, "cursor-oauth", http.StatusOK, duration, forwarded, "")
 		s.updateTokenStatsForProxy(reqCtx, cfg, true, duration, forwarded, modelID)
 	}
 	return &proxyResult{
 		status: http.StatusOK, header: header, body: responseBody, channelID: &channelID,
 		duration: duration, firstByteTime: firstByte.Seconds(), succeeded: true,
-		nextAction: cooldown.ActionReturnClient, proxyLogWritten: !reqCtx.skipProxyLog,
+		nextAction: cooldown.ActionReturnClient, proxyLogWritten: !reqCtx.skipProxyLog && !replayed,
 	}, nil
 }
 
@@ -756,6 +784,41 @@ func applyCursorUsage(result *fwResult, usage *cursorauth.Usage) {
 	// cache creation at the standard 5-minute write rate, matching other
 	// providers that do not report a TTL breakdown.
 	result.Cache5mInputTokens = usage.CacheWriteTokens
+}
+
+// estimateCursorInputTokens gives clients a context signal while Cursor's
+// native run is suspended inside a custom-tool callback. The bridge does not
+// expose a reliable usage snapshot at that point, so this estimate is only
+// returned to the client and is intentionally excluded from billing/logging.
+func estimateCursorInputTokens(request cursorauth.Request) int {
+	count := CountTokensRequest{
+		Model:    request.Model,
+		Messages: []MessageParam{{Role: "user", Content: request.Prompt}},
+	}
+	for _, tool := range request.Tools {
+		var schema any
+		if len(tool.Parameters) > 0 {
+			_ = json.Unmarshal(tool.Parameters, &schema)
+		}
+		count.Tools = append(count.Tools, Tool{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: schema,
+		})
+	}
+	return max(1, estimateTokens(&count))
+}
+
+func estimatedCursorResponseUsage(inputTokens int, text string, calls []cursorauth.ToolCall) *cursorauth.Usage {
+	outputTokens := estimateTextTokens(text)
+	for _, call := range calls {
+		outputTokens += estimateToolName(call.Name) + max(1, len(call.Arguments)/4) + 8
+	}
+	inputTokens = max(1, inputTokens)
+	return &cursorauth.Usage{
+		InputTokens: inputTokens, OutputTokens: outputTokens,
+		TotalTokens: inputTokens + outputTokens,
+	}
 }
 
 func openaiToolCallID(id string) string {

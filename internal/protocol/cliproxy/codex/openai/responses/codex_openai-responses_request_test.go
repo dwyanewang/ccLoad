@@ -244,6 +244,8 @@ func TestConvertOpenAIResponsesRequestToCodexNormalizesRequiredFields(t *testing
 		"top_p":0.9,
 		"service_tier":"standard",
 		"truncation":"auto",
+		"prompt_cache_options":{"mode":"implicit"},
+		"prompt_cache_retention":"24h",
 		"user":"request-owner",
 		"input":[{"type":"message","role":"system","content":"hello"}]
 	}`)
@@ -273,11 +275,37 @@ func TestConvertOpenAIResponsesRequestToCodexNormalizesRequiredFields(t *testing
 		"top_p",
 		"service_tier",
 		"truncation",
+		"prompt_cache_options",
+		"prompt_cache_retention",
 		"user",
 	} {
 		if gjson.GetBytes(output, path).Exists() {
 			t.Fatalf("%s should be removed: %s", path, output)
 		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodexPreservesUltrafastServiceTier(t *testing.T) {
+	inputJSON := []byte(`{"model":"gpt-5.3-codex","service_tier":"ultrafast","input":[]}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
+	if got := gjson.GetBytes(output, "service_tier").String(); got != "ultrafast" {
+		t.Fatalf("service_tier = %q, want ultrafast; body=%s", got, output)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_FiltersPromptCacheRetention(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.6-terra",
+		"prompt_cache_retention": "24h",
+		"input": [
+			{"type": "message", "role": "user", "content": "hello"}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6-terra", inputJSON, true)
+	if gjson.GetBytes(output, "prompt_cache_retention").Exists() {
+		t.Fatalf("prompt_cache_retention should be removed: %s", string(output))
 	}
 }
 

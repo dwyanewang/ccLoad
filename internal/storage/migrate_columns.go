@@ -207,6 +207,9 @@ func ensureLogsNewColumns(ctx context.Context, db *sql.DB, dialect Dialect) erro
 		if err := ensureLogsActualModelMySQL(ctx, db); err != nil {
 			return err
 		}
+		if err := ensureLogsResponseModelMySQL(ctx, db); err != nil {
+			return err
+		}
 		if err := ensureLogsBaseURLMySQL(ctx, db); err != nil {
 			return err
 		}
@@ -233,6 +236,7 @@ func ensureLogsColumnsPostgres(ctx context.Context, db *sql.DB) error {
 		{name: "cache_5m_input_tokens", definition: "BIGINT NOT NULL DEFAULT 0"},
 		{name: "cache_1h_input_tokens", definition: "BIGINT NOT NULL DEFAULT 0"},
 		{name: "actual_model", definition: "VARCHAR(191) NOT NULL DEFAULT ''"},
+		{name: "response_model", definition: "VARCHAR(191) NOT NULL DEFAULT ''"},
 		{name: "log_source", definition: "VARCHAR(32) NOT NULL DEFAULT 'proxy'"},
 		{name: "api_key_hash", definition: "VARCHAR(64) NOT NULL DEFAULT ''"},
 		{name: "base_url", definition: "VARCHAR(500) NOT NULL DEFAULT ''"},
@@ -280,7 +284,8 @@ func ensureLogsColumnsSQLite(ctx context.Context, db *sql.DB) error {
 		{name: "client_ip", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "cache_5m_input_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "cache_1h_input_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
-		{name: "actual_model", definition: "TEXT NOT NULL DEFAULT ''"}, // 实际转发的模型
+		{name: "actual_model", definition: "TEXT NOT NULL DEFAULT ''"},   // 实际发给上游的模型
+		{name: "response_model", definition: "TEXT NOT NULL DEFAULT ''"}, // 上游成功响应声明的模型
 		{name: "log_source", definition: "TEXT NOT NULL DEFAULT 'proxy'"},
 		{name: "api_key_hash", definition: "TEXT NOT NULL DEFAULT ''"}, // API Key SHA256（用于精确定位 key_index）
 		{name: "base_url", definition: "TEXT NOT NULL DEFAULT ''"},     // 请求使用的上游URL（多URL场景）
@@ -420,7 +425,13 @@ func ensureLogsMinuteBucketMySQL(ctx context.Context, db *sql.DB) error {
 // ensureLogsActualModelMySQL 确保logs表有actual_model字段(MySQL增量迁移)
 func ensureLogsActualModelMySQL(ctx context.Context, db *sql.DB) error {
 	return ensureMySQLColumns(ctx, db, "logs", []mysqlColumnDef{
-		{name: "actual_model", definition: "VARCHAR(191) NOT NULL DEFAULT '' COMMENT '实际转发的模型(空表示未重定向)'"},
+		{name: "actual_model", definition: "VARCHAR(191) NOT NULL DEFAULT '' COMMENT '实际发给上游的模型(空表示未重定向)'"},
+	})
+}
+
+func ensureLogsResponseModelMySQL(ctx context.Context, db *sql.DB) error {
+	return ensureMySQLColumns(ctx, db, "logs", []mysqlColumnDef{
+		{name: "response_model", definition: "VARCHAR(191) NOT NULL DEFAULT '' COMMENT '上游成功响应声明的模型'"},
 	})
 }
 
@@ -861,6 +872,25 @@ func ensureAPIKeysNote(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	return ensureColumn(ctx, db, dialect, "api_keys", "note",
 		"VARCHAR(512) NOT NULL DEFAULT ''",
 		"TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureAPIKeysAllowedModels(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "api_keys", "allowed_models",
+		"VARCHAR(2000) NOT NULL DEFAULT ''",
+		"TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureAPIKeysModelScopeEmpty(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "api_keys", "model_scope_empty",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
+// ensureAPIKeysCostMultiplier 确保api_keys表有cost_multiplier字段（Key级成本倍率，api_key渠道的权威存储）
+func ensureAPIKeysCostMultiplier(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "api_keys", "cost_multiplier",
+		"DOUBLE NOT NULL DEFAULT 1",
+		"REAL NOT NULL DEFAULT 1")
 }
 
 // ensureAuthTokensEffectiveCost 确保auth_tokens表有effective_cost_usd字段（2026-07新增）

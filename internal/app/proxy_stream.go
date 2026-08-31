@@ -5,9 +5,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 )
+
+const maxSSEEventBytes = 50 * 1024 * 1024
 
 var (
 	errAbortStreamBeforeWrite = errors.New("abort stream before first client write")
@@ -32,9 +35,10 @@ func (e *stopStreamAfterWriteError) Unwrap() error {
 
 // streamReadStats 流式传输统计信息
 type streamReadStats struct {
-	readCount    int
-	totalBytes   int64
-	firstByteSec float64 // 首字节读取耗时（秒），attachFirstByteDetector 写入
+	readCount          int
+	totalBytes         int64
+	firstByteSec       float64 // 上游首个有效事件耗时（秒），用于首字超时控制
+	clientFirstByteSec float64 // 首个客户端可见事件耗时（秒），用于实时状态和日志
 }
 
 // firstByteDetector 检测首字节读取时间和传输统计的Reader包装器
@@ -79,7 +83,11 @@ func streamCopyWithBufferSize(ctx context.Context, src io.Reader, dst http.Respo
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// context.Cause 而不是 ctx.Err()：取消原因决定后续分类。管理端手动中断以
+			// WithCancelCause 注入「上游断链」语义，退化成 ctx.Err() 会一律变成
+			// context.Canceled，被 isClientDisconnectError 误判为客户端取消（499、
+			// 不冷却）。无 cause 的普通取消/超时下两者返回值相同。
+			return context.Cause(ctx)
 		default:
 		}
 
@@ -123,9 +131,10 @@ func streamCopyWithBufferSize(ctx context.Context, src io.Reader, dst http.Respo
 
 // normalizeStreamReadError 保留 Read 的真实终止原因。
 // context 取消会主动 Close 源，底层可能因此返回 EOF；此时取消/超时必须优先。
+// 用 context.Cause 而不是 ctx.Err()：手动中断的「上游断链」语义只存在于 cause 里。
 func normalizeStreamReadError(ctx context.Context, err error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
 	}
 	if err == io.EOF {
 		return nil
@@ -232,6 +241,22 @@ func streamCopySSE(ctx context.Context, src io.Reader, dst http.ResponseWriter, 
 	return streamCopyWithBufferSize(ctx, src, dst, onData, SSEBufferSize)
 }
 
+// writeSSEChunks 把已成帧的 SSE chunk 依次写给客户端并立即 flush。
+func writeSSEChunks(dst http.ResponseWriter, chunks [][]byte) error {
+	for _, chunk := range chunks {
+		if len(chunk) == 0 {
+			continue
+		}
+		if _, err := dst.Write(chunk); err != nil {
+			return err
+		}
+		if flusher, ok := dst.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	return nil
+}
+
 func streamTransformSSEEvents(
 	ctx context.Context,
 	src io.Reader,
@@ -253,21 +278,25 @@ func streamTransformSSEEventsUntil(
 	stopCloseOnCancel := closeReaderOnContextCancel(ctx, src)
 	defer stopCloseOnCancel()
 
-	reader := bufio.NewReader(src)
+	reader := bufio.NewReaderSize(src, SSEBufferSize)
 	var eventBuf bytes.Buffer
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// 同 streamCopyWithBufferSize：必须返回 cause，否则手动中断退化成 context.Canceled。
+			return context.Cause(ctx)
 		default:
 		}
 
-		line, err := reader.ReadBytes('\n')
+		line, err := reader.ReadSlice('\n')
 		if len(line) > 0 {
+			if len(line) > maxSSEEventBytes-eventBuf.Len() {
+				return fmt.Errorf("SSE event exceeds %d bytes", maxSSEEventBytes)
+			}
 			eventBuf.Write(line)
-			if bytes.Equal(bytes.TrimRight(line, "\r\n"), []byte{}) {
-				rawEvent := append([]byte(nil), eventBuf.Bytes()...)
+			if !errors.Is(err, bufio.ErrBufferFull) && bytes.Equal(bytes.TrimRight(line, "\r\n"), []byte{}) {
+				rawEvent := eventBuf.Bytes()
 				if len(rawEvent) > 0 {
 					if onRawEvent != nil {
 						if hookErr := onRawEvent(rawEvent); hookErr != nil {
@@ -282,16 +311,8 @@ func streamTransformSSEEventsUntil(
 						if transformErr != nil {
 							return transformErr
 						}
-						for _, chunk := range chunks {
-							if len(chunk) == 0 {
-								continue
-							}
-							if _, writeErr := dst.Write(chunk); writeErr != nil {
-								return writeErr
-							}
-							if flusher, ok := dst.(http.Flusher); ok {
-								flusher.Flush()
-							}
+						if writeErr := writeSSEChunks(dst, chunks); writeErr != nil {
+							return writeErr
 						}
 					}
 					if stopAfterEvent != nil && stopAfterEvent() {
@@ -302,6 +323,9 @@ func streamTransformSSEEventsUntil(
 			}
 		}
 
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
 		if err != nil {
 			return normalizeStreamReadError(ctx, err)
 		}

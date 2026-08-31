@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -193,6 +194,29 @@ func (s *Server) logProxyResult(
 	s.AddLogAsync(buildProxyLogEntry(reqCtx, cfg, actualModel, selectedKey, statusCode, duration, res, errMsg))
 }
 
+// logProtocolCapabilityFallback 记录一次真实发生的协议能力探测失败。
+// 它只改变可观测性，不参与冷却；管理测试等外层统一落日志的调用路径继续跳过。
+func (s *Server) logProtocolCapabilityFallback(
+	reqCtx *proxyRequestContext,
+	cfg *model.Config,
+	actualModel string,
+	selectedKey string,
+	statusCode int,
+	duration float64,
+	res *fwResult,
+	detail string,
+) bool {
+	if reqCtx == nil || reqCtx.skipProxyLog {
+		return false
+	}
+	message := "protocol capability fallback"
+	if detail = strings.TrimSpace(detail); detail != "" {
+		message += ": " + detail
+	}
+	s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, statusCode, duration, res, message)
+	return true
+}
+
 func buildProxyLogEntry(
 	reqCtx *proxyRequestContext,
 	cfg *model.Config,
@@ -203,9 +227,14 @@ func buildProxyLogEntry(
 	res *fwResult,
 	errMsg string,
 ) *model.LogEntry {
+	responseModel := ""
+	if res != nil && statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices && res.ResponseModel != "" {
+		responseModel = res.ResponseModel
+	}
 	return buildLogEntry(logEntryParams{
-		RequestModel:     reqCtx.originalModel,
+		RequestModel:     reqCtx.requestLogModel(),
 		ActualModel:      actualModel,
+		ResponseModel:    responseModel,
 		RequestPath:      reqCtx.requestPath,
 		ChannelID:        cfg.ID,
 		StatusCode:       statusCode,
@@ -221,7 +250,7 @@ func buildProxyLogEntry(
 		ErrMsg:           errMsg,
 		StartTime:        reqCtx.attemptStartTime,
 		DebugData:        reqCtx.debugData,
-		CostMultiplier:   cfg.CostMultiplier,
+		CostMultiplier:   reqCtx.attemptCostMultiplier,
 		ThinkingEffort:   reqCtx.thinkingEffort,
 	})
 }
@@ -241,7 +270,7 @@ func (s *Server) updateTokenStatsForProxy(
 		requestPath = reqCtx.requestPath
 	}
 	billingModel := resolveProxyBillingModel(requestPath, actualModel, requestModel)
-	s.updateTokenStatsAsync(reqCtx.tokenHash, cfg.CostMultiplier, isSuccess, duration, reqCtx.isStreaming, res, billingModel)
+	s.updateTokenStatsAsync(reqCtx.tokenHash, reqCtx.attemptCostMultiplier, isSuccess, duration, reqCtx.isStreaming, res, billingModel)
 }
 
 // handleNetworkError 处理网络错误
@@ -718,6 +747,9 @@ func (s *Server) handleProxyErrorResponse(
 	}
 
 	input := cooldownInputForModel(httpErrorInput(cfg.ID, keyIndex, res), actualModel)
+	if cfg.UsesZedOAuth() && zedModelPlanRejected(res.Status, res.Body) {
+		input.ModelScoped = true
+	}
 	if modelCapacityRateLimited {
 		// The original 503 already installed the model cooldown before URL retry.
 		// Only decide where to continue; applying this converted 429 again would

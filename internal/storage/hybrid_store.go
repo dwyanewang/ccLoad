@@ -215,6 +215,22 @@ func (h *HybridStore) CompareAndSwapOAuthCredential(
 	return true, nil
 }
 
+func (h *HybridStore) CompareAndSwapChannelManagement(
+	ctx context.Context,
+	channelID int64,
+	expectedEnvelope, nextEnvelope string,
+) (bool, error) {
+	h.oauthCredentialMu.Lock()
+	defer h.oauthCredentialMu.Unlock()
+
+	updated, err := h.sqlite.CompareAndSwapChannelManagement(ctx, channelID, expectedEnvelope, nextEnvelope)
+	if err != nil || !updated {
+		return updated, err
+	}
+	h.markChannelDirty(channelID, false)
+	return true, nil
+}
+
 func (h *HybridStore) ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error {
 	h.oauthCredentialMu.Lock()
 	defer h.oauthCredentialMu.Unlock()
@@ -428,6 +444,28 @@ func (h *HybridStore) UpdateAPIKeyNotes(ctx context.Context, channelID int64, no
 	return nil
 }
 
+func (h *HybridStore) UpdateAPIKeyCostMultipliers(ctx context.Context, channelID int64, multipliersByIndex map[int]float64) error {
+	if err := h.sqlite.UpdateAPIKeyCostMultipliers(ctx, channelID, multipliersByIndex); err != nil {
+		return err
+	}
+
+	h.markChannelDirty(channelID, false)
+	return nil
+}
+
+func (h *HybridStore) UpdateAPIKeyModelScopes(
+	ctx context.Context,
+	channelID int64,
+	scopesByIndex map[int]model.APIKeyModelScope,
+) error {
+	if err := h.sqlite.UpdateAPIKeyModelScopes(ctx, channelID, scopesByIndex); err != nil {
+		return err
+	}
+
+	h.markChannelDirty(channelID, false)
+	return nil
+}
+
 func (h *HybridStore) DeleteAPIKey(ctx context.Context, channelID int64, keyIndex int) error {
 	if err := h.sqlite.DeleteAPIKey(ctx, channelID, keyIndex); err != nil {
 		return err
@@ -464,6 +502,10 @@ func (h *HybridStore) ConfigureCooldown(settings util.CooldownSettings) {
 
 func (h *HybridStore) GetAllChannelCooldowns(ctx context.Context) (map[int64]time.Time, error) {
 	return h.sqlite.GetAllChannelCooldowns(ctx)
+}
+
+func (h *HybridStore) FetchChannelInfoBatch(ctx context.Context, channelIDs map[int64]bool) (map[int64]model.ChannelInfo, error) {
+	return h.sqlite.FetchChannelInfoBatch(ctx, channelIDs)
 }
 
 func (h *HybridStore) BumpChannelCooldown(ctx context.Context, channelID int64, now time.Time, statusCode int) (time.Duration, error) {
@@ -725,6 +767,12 @@ func (h *HybridStore) GetStatsLite(ctx context.Context, startTime, endTime time.
 func (h *HybridStore) GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error) {
 	return readAnalytics(h, "GetClientProtocolStats", func(store *sqlstore.SQLStore) ([]model.ClientProtocolStats, error) {
 		return store.GetClientProtocolStats(ctx, startTime, endTime, filter)
+	})
+}
+
+func (h *HybridStore) GetAuthTypeStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.AuthTypeStats, error) {
+	return readAnalytics(h, "GetAuthTypeStats", func(store *sqlstore.SQLStore) ([]model.AuthTypeStats, error) {
+		return store.GetAuthTypeStats(ctx, startTime, endTime, filter)
 	})
 }
 

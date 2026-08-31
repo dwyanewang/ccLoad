@@ -27,7 +27,8 @@
     '/web/assets/js/channels-urls.js',
     '/web/assets/js/channels-custom-rules.js',
     '/web/assets/js/channels-cooldown-detection.js',
-    '/web/assets/js/channels-modals.js'
+    '/web/assets/js/channels-modals.js',
+    '/web/assets/js/channels-management.js'
   ];
 
   const loadedScriptPromises = new Map();
@@ -193,6 +194,9 @@
 
     if (typeof initChannelEditorActions === 'function') {
       initChannelEditorActions();
+    }
+    if (typeof setupOAuthActions === 'function') {
+      setupOAuthActions();
     }
     if (typeof initChannelFormDirtyTracking === 'function') {
       initChannelFormDirtyTracking();

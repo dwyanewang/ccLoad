@@ -19,8 +19,8 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	// 批量创建 API Keys
 	keys := []*model.APIKey{
 		{ChannelID: channelID, KeyIndex: 0, APIKey: "sk-key-0", KeyStrategy: model.KeyStrategySequential},
-		{ChannelID: channelID, KeyIndex: 1, APIKey: "sk-key-1", KeyStrategy: model.KeyStrategySequential},
-		{ChannelID: channelID, KeyIndex: 2, APIKey: "sk-key-2", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: channelID, KeyIndex: 1, APIKey: "sk-key-1", AllowedModels: []string{"gpt-5", "gpt-4.1"}, KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: channelID, KeyIndex: 2, APIKey: "sk-key-2", ModelScopeEmpty: true, Disabled: true, KeyStrategy: model.KeyStrategySequential},
 	}
 	if err := store.CreateAPIKeysBatch(ctx, keys); err != nil {
 		t.Fatalf("create api keys batch: %v", err)
@@ -37,6 +37,9 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	if key.KeyIndex != 1 {
 		t.Errorf("key index: got %d, want %d", key.KeyIndex, 1)
 	}
+	if len(key.AllowedModels) != 2 || key.AllowedModels[0] != "gpt-5" || key.AllowedModels[1] != "gpt-4.1" {
+		t.Errorf("allowed models: got %v, want [gpt-5 gpt-4.1]", key.AllowedModels)
+	}
 
 	// 获取渠道所有 API Keys
 	allKeys, err := store.GetAPIKeys(ctx, channelID)
@@ -45,6 +48,56 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	}
 	if len(allKeys) != 3 {
 		t.Errorf("expected 3 keys, got %d", len(allKeys))
+	}
+	if !allKeys[2].ModelScopeEmpty || allKeys[2].AllowsModel("gpt-5") {
+		t.Fatalf("empty model scope did not persist: %+v", allKeys[2])
+	}
+}
+
+func TestAPIKey_UpdateAllowedModelsPreservesRuntimeState(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, "allowed_models.db")
+	ctx := context.Background()
+	channelID := createTestChannel(t, ctx, store, "allowed-models-channel")
+
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: channelID, KeyIndex: 0, APIKey: "sk-key", Note: "primary",
+		KeyStrategy: model.KeyStrategyRoundRobin, Disabled: true,
+		CooldownUntil: 1234, CooldownDurationMs: 5678,
+	}}); err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if err := store.UpdateAPIKeyModelScopes(ctx, channelID, map[int]model.APIKeyModelScope{
+		0: {AllowedModels: []string{"gpt-5", "gpt-4.1"}, Disabled: true},
+	}); err != nil {
+		t.Fatalf("update allowed models: %v", err)
+	}
+
+	got, err := store.GetAPIKey(ctx, channelID, 0)
+	if err != nil {
+		t.Fatalf("get api key: %v", err)
+	}
+	if len(got.AllowedModels) != 2 || got.AllowedModels[0] != "gpt-5" || got.AllowedModels[1] != "gpt-4.1" {
+		t.Fatalf("allowed models = %v, want [gpt-5 gpt-4.1]", got.AllowedModels)
+	}
+	if got.Note != "primary" || got.KeyStrategy != model.KeyStrategyRoundRobin || !got.Disabled ||
+		got.CooldownUntil != 1234 || got.CooldownDurationMs != 5678 {
+		t.Fatalf("runtime state changed after metadata update: %+v", got)
+	}
+
+	if err := store.UpdateAPIKeyModelScopes(ctx, channelID, map[int]model.APIKeyModelScope{0: {Disabled: true}}); err != nil {
+		t.Fatalf("clear allowed models: %v", err)
+	}
+	got, err = store.GetAPIKey(ctx, channelID, 0)
+	if err != nil {
+		t.Fatalf("get unrestricted api key: %v", err)
+	}
+	if len(got.AllowedModels) != 0 {
+		t.Fatalf("allowed models after clear = %v, want unrestricted", got.AllowedModels)
+	}
+	if got.ModelScopeEmpty {
+		t.Fatal("explicit unrestricted scope remained deny-all")
 	}
 }
 
@@ -562,5 +615,95 @@ func TestAPIKey_ImportChannelBatchPreservesModelEntryOrder(t *testing.T) {
 	}
 	if got[0].Model != "z-last" || got[1].Model != "a-first" {
 		t.Fatalf("expected model order [z-last a-first], got %+v", got)
+	}
+}
+
+func TestAPIKey_ImportChannelBatchMigratesChannelManagementEnvelope(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t, "import-channel-management-migration.db")
+	ctx := context.Background()
+	envelope := `{"kind":"channel_management","version":1,"profile":"sub2api","settings":{"base_url":"https://panel.example.com","access_token":"csv-private-token"},"state":{}}`
+	invalidCredential := `{"type":"codex","access_token":"must-not-persist"}`
+
+	_, _, err := store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: "must-reject-oauth-credential", AuthType: model.AuthTypeAPIKey, OAuthCredential: invalidCredential,
+			URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "invalid channel management envelope") {
+		t.Fatalf("ImportChannelBatch() credential error = %v, want management envelope validation", err)
+	}
+
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "already-unmanaged", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://old.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createdCount, updatedCount, err := store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: created.Name, AuthType: model.AuthTypeAPIKey, OAuthCredential: envelope,
+			URLs: model.ChannelURLs{{URL: "https://migrated.example.com"}}, Enabled: true,
+		},
+	}})
+	if err != nil || createdCount != 0 || updatedCount != 1 {
+		t.Fatalf("management envelope migration = (%d, %d, %v), want (0, 1, nil)", createdCount, updatedCount, err)
+	}
+	persisted, err := store.GetConfig(ctx, created.ID)
+	if err != nil || persisted.OAuthCredential != envelope {
+		t.Fatalf("migrated management envelope=%q err=%v, want imported envelope", persisted.OAuthCredential, err)
+	}
+
+	createdCount, updatedCount, err = store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			ID: created.ID, Name: created.Name, AuthType: model.AuthTypeAPIKey,
+			URLs: model.ChannelURLs{{URL: "https://preserve.example.com"}}, Enabled: true,
+		},
+	}})
+	if err != nil || createdCount != 0 || updatedCount != 1 {
+		t.Fatalf("legacy management import = (%d, %d, %v), want (0, 1, nil)", createdCount, updatedCount, err)
+	}
+	persisted, err = store.GetConfig(ctx, created.ID)
+	if err != nil || persisted.OAuthCredential != envelope {
+		t.Fatalf("legacy import changed management envelope=%q err=%v", persisted.OAuthCredential, err)
+	}
+
+	createdCount, updatedCount, err = store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: "new-managed", AuthType: model.AuthTypeAPIKey, OAuthCredential: envelope,
+			URLs: model.ChannelURLs{{URL: "https://new-managed.example.com"}}, Enabled: true,
+		},
+	}})
+	if err != nil || createdCount != 1 || updatedCount != 0 {
+		t.Fatalf("new managed import = (%d, %d, %v), want (1, 0, nil)", createdCount, updatedCount, err)
+	}
+
+	createdCount, updatedCount, err = store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: "new-unmanaged", AuthType: model.AuthTypeAPIKey,
+			URLs: model.ChannelURLs{{URL: "https://new-unmanaged.example.com"}}, Enabled: true,
+		},
+	}})
+	if err != nil || createdCount != 1 || updatedCount != 0 {
+		t.Fatalf("new ImportChannelBatch() = (%d, %d, %v), want (1, 0, nil)", createdCount, updatedCount, err)
+	}
+	configs, err := store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range configs {
+		switch cfg.Name {
+		case "new-managed":
+			if cfg.OAuthCredential != envelope {
+				t.Fatalf("new managed channel envelope=%q, want imported envelope", cfg.OAuthCredential)
+			}
+		case "new-unmanaged":
+			if cfg.OAuthCredential != "" {
+				t.Fatalf("new unmanaged channel inherited private envelope=%q", cfg.OAuthCredential)
+			}
+		}
 	}
 }

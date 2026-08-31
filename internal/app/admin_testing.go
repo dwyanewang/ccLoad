@@ -28,6 +28,7 @@ import (
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
@@ -158,6 +159,7 @@ type channelTestRequestPlan struct {
 	upstreamHeaders  http.Header
 	requestBody      []byte
 	clientBody       []byte
+	zedWire          *zedWirePlan
 	timeout          *channelTestTimeout
 	debugCapture     *debugCapture
 	antigravityOAuth bool
@@ -629,7 +631,7 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		return
 	}
 	runtimeCfg, keySelection, err := s.prepareChannelTestAuth(
-		c.Request.Context(), cfg, apiKeys, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
+		c.Request.Context(), cfg, apiKeys, testReq.Model, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
 		oauthCredentialUseCurrent,
 	)
 	if err != nil {
@@ -715,7 +717,8 @@ func (s *Server) prepareChannelTestAuth(
 	ctx context.Context,
 	cfg *model.Config,
 	apiKeys []*model.APIKey,
-	requestedKeyIndex int,
+	requestedModel string,
+	requestedKeyIndex *int,
 	requestAPIKey string,
 	oauthMode oauthCredentialLoadMode,
 ) (*model.Config, channelTestKeySelection, error) {
@@ -724,11 +727,25 @@ func (s *Server) prepareChannelTestAuth(
 	if runtimeCfg, selection, handled, err := s.prepareOAuthChannelTestAuth(ctx, cfg, oauthMode); handled {
 		return runtimeCfg, selection, err
 	}
-
 	if len(apiKeys) == 0 && requestAPIKey == "" {
 		return nil, channelTestKeySelection{}, errors.New("渠道未配置有效的 API Key")
 	}
-	selection, err := s.selectChannelTestKey(apiKeys, requestedKeyIndex, requestAPIKey)
+	channelModel := s.resolveChannelRoutingModel(cfg, requestedModel)
+	if requestAPIKey != "" {
+		if requestedKeyIndex != nil {
+			if persisted, ok := findAPIKeyByIndex(apiKeys, *requestedKeyIndex); ok &&
+				persisted.APIKey == requestAPIKey && !persisted.AllowsModel(channelModel) {
+				return nil, channelTestKeySelection{}, fmt.Errorf("key #%d 不允许模型 %s", *requestedKeyIndex, requestedModel)
+			}
+		}
+	} else {
+		apiKeys, _ = filterAPIKeysForModel(apiKeys, channelModel)
+		if len(apiKeys) == 0 {
+			return nil, channelTestKeySelection{}, fmt.Errorf("模型 %s 没有可用的 API Key", requestedModel)
+		}
+	}
+
+	selection, err := s.selectChannelTestKey(cfg, apiKeys, requestedKeyIndex, requestAPIKey)
 	return cfg, selection, err
 }
 
@@ -891,7 +908,7 @@ func (s *Server) prepareOAuthChannelTestAuthForRejectedToken(
 		case oauthCredentialUseCurrent:
 			credential, err = cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
 		case oauthCredentialForceRefresh:
-			credential, err = s.cursorCredentials.credential(ctx, cfg, true)
+			credential, err = s.cursorCredentials.credentialAfterUnauthorized(ctx, cfg, rejectedAccessToken)
 		default:
 			credential, err = s.cursorCredentials.credential(ctx, cfg, false)
 		}
@@ -906,28 +923,71 @@ func (s *Server) prepareOAuthChannelTestAuthForRejectedToken(
 			return cfg.Clone(), selection, true, fmt.Errorf("加载 Cursor 凭证失败: %w", err)
 		}
 		return cfg.Clone(), selection, true, nil
+	case cfg.UsesZedOAuth():
+		var credential *zedauth.Credential
+		var err error
+		switch mode {
+		case oauthCredentialUseCurrent:
+			credential, err = zedauth.ParseCredential([]byte(cfg.OAuthCredential))
+		case oauthCredentialForceRefresh:
+			credential, err = s.zedCredentials.credential(ctx, cfg, true)
+		default:
+			credential, err = s.zedCredentials.credential(ctx, cfg, false)
+		}
+		if credential == nil {
+			if err == nil {
+				err = errors.New("zed credential is unavailable")
+			}
+			return nil, selection, true, fmt.Errorf("加载 Zed 凭证失败: %w", err)
+		}
+		selection.requestCredential = credential.AccessToken
+		if err != nil {
+			return cfg.Clone(), selection, true, fmt.Errorf("加载 Zed 凭证失败: %w", err)
+		}
+		return cfg.Clone(), selection, true, nil
 	default:
 		return nil, selection, true, fmt.Errorf("不支持的 OAuth 认证类型 %q", cfg.GetAuthType())
 	}
 }
 
-func (s *Server) selectChannelTestKey(apiKeys []*model.APIKey, requestedKeyIndex int, requestAPIKey string) (channelTestKeySelection, error) {
+func (s *Server) selectChannelTestKey(
+	cfg *model.Config,
+	apiKeys []*model.APIKey,
+	requestedKeyIndex *int,
+	requestAPIKey string,
+) (channelTestKeySelection, error) {
 	if requestAPIKey != "" {
-		matchedKey, ok := findAPIKeyByIndex(apiKeys, requestedKeyIndex)
+		keyIndex := cooldown.NoKeyIndex
+		if requestedKeyIndex != nil {
+			keyIndex = *requestedKeyIndex
+		}
+		matchedKey, ok := findAPIKeyByIndex(apiKeys, keyIndex)
 		return channelTestKeySelection{
-			keyIndex:                requestedKeyIndex,
+			keyIndex:                keyIndex,
 			apiKey:                  requestAPIKey,
 			requestCredential:       requestAPIKey,
 			updatePersistedCooldown: ok && matchedKey.APIKey == requestAPIKey,
+		}, nil
+	}
+	if requestedKeyIndex == nil {
+		keyIndex, apiKey, err := s.selectKeyWithFallback(cfg, apiKeys, nil)
+		if err != nil {
+			return channelTestKeySelection{}, err
+		}
+		return channelTestKeySelection{
+			keyIndex:                keyIndex,
+			apiKey:                  apiKey,
+			requestCredential:       apiKey,
+			updatePersistedCooldown: true,
 		}, nil
 	}
 
 	// 显式优于隐式：调用方指定了 key_index 就严格使用该 Key（无视冷却状态）。
 	// 既往的"冷却时静默回退到其他可用 Key"会导致 tested_key_index 与请求不一致，
 	// 让用户困惑（点了 key 0 却测了 key 4）。要测全部冷却中的渠道，请显式指定 key_index 或调用方自行选择。
-	requestedKey, ok := findAPIKeyByIndex(apiKeys, requestedKeyIndex)
+	requestedKey, ok := findAPIKeyByIndex(apiKeys, *requestedKeyIndex)
 	if !ok {
-		return channelTestKeySelection{}, fmt.Errorf("未找到 Key #%d", requestedKeyIndex)
+		return channelTestKeySelection{}, fmt.Errorf("未找到 Key #%d", *requestedKeyIndex)
 	}
 	return channelTestKeySelection{
 		keyIndex:                requestedKey.KeyIndex,
@@ -1417,7 +1477,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	}
 	defer cancel()
 	ctx := req.Context()
-	useNativeCodexWebsocket := cfg.Websockets && !requestPlan.xaiOAuth && testReq.Stream &&
+	useNativeCodexWebsocket := cfg.Websockets && !requestPlan.xaiOAuth && !cfg.UsesZedOAuth() && testReq.Stream &&
 		clientProtocol == string(protocol.Codex) && requestPlan.upstreamProtocol == string(protocol.Codex)
 	if useNativeCodexWebsocket {
 		copyCodexWebsocketInputHeaders(req.Header, requestPlan.upstreamHeaders)
@@ -1506,6 +1566,15 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	}
 	s.persistCodexPassiveUsage(ctx, cfg, resp)
 	defer func() { _ = resp.Body.Close() }()
+	if cfg.UsesZedOAuth() {
+		if zedErr := prepareZedResponsesResponse(resp, requestPlan.zedWire, s.protocolRegistry); zedErr != nil {
+			return attachTestDebugData(requestPlan, resp, map[string]any{
+				"success": false, "error": "解包 Zed 测试响应失败: " + zedErr.Error(),
+				"duration_ms": time.Since(start).Milliseconds(), "status_code": resp.StatusCode,
+				"is_streaming": testReq.Stream,
+			})
+		}
+	}
 	if isAnthropicClaudeCodeMessagesRequest(cfg, protocol.Protocol(requestPlan.upstreamProtocol), requestPlan.endpointPath) {
 		if decodeErr := decodeAnthropicResponse(resp); decodeErr != nil {
 			return attachTestDebugData(requestPlan, resp, map[string]any{
@@ -1835,6 +1904,17 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		requestPlan.requestBody = injectCodexPromptCacheKey(requestPlan.requestBody, sessionID)
 		ensureCodexSessionHeader(requestPlan.headers, sessionID)
 	}
+	if cfgForBuild.UsesZedOAuth() {
+		var originalAnthropicRequest []byte
+		if protocol.Protocol(requestPlan.clientProtocol) == protocol.Anthropic {
+			originalAnthropicRequest = requestPlan.clientBody
+		}
+		requestPlan.requestBody, requestPlan.zedWire, err = finalizeZedResponsesBody(s.protocolRegistry, requestPlan.requestBody, originalAnthropicRequest)
+		if err != nil {
+			return nil, nil, fmt.Errorf("finalize Zed test request body: %w", err)
+		}
+		requestPlan.upstreamStreaming = true
+	}
 	requestPlan.endpointPath = requestPath
 	return cfgForBuild, requestPlan, nil
 }
@@ -1872,7 +1952,10 @@ func (s *Server) newTestUpstreamRequest(
 	}
 	applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
 	wireRebuilt := false
-	if requestPlan.xaiOAuth {
+	if cfgForBuild.UsesZedOAuth() {
+		injectZedResponsesHeaders(req, requestPlan.apiKey)
+		wireRebuilt = true
+	} else if requestPlan.xaiOAuth {
 		injectXAIResponsesHeaders(req, requestPlan.apiKey, requestPlan.xaiConversationID)
 	} else if requestProtocol == protocol.Codex {
 		injectCodexHeaders(req, cfgForBuild, requestPlan.apiKey, requestPlan.upstreamStreaming)
@@ -1903,7 +1986,7 @@ func (s *Server) newTestUpstreamRequest(
 	// Admin tests need the wire body for diagnostics, so never negotiate compression.
 	req.Header.Set("Accept-Encoding", "identity")
 	requestPlan.debugCapture = s.captureDebugRequest(req, requestPlan.requestBody)
-	if requestPlan.clientProtocol != requestPlan.upstreamProtocol {
+	if requestPlan.clientProtocol != requestPlan.upstreamProtocol || cfgForBuild.UsesZedOAuth() {
 		originalHeaders := cloneHeaders(requestPlan.clientHeaders)
 		for key, value := range testReq.Headers {
 			originalHeaders.Set(key, value)

@@ -17,14 +17,17 @@ const {
   pollAnthropicOAuthStatus,
   pollXAIOAuthStatus,
   getOAuthUsageState,
+  maybeAutoRefreshActiveChannelUsage,
   refreshOAuthUsage,
   refreshOAuthUsageBatch,
+  resetActiveChannelUsageAutoRefreshState,
   resetCodexQuota,
   batchRefreshSelectedOAuthUsage,
   refreshOAuthCredential,
   renderOAuthCredential,
   saveCodexQuotaOverdraftFromAdvancedSettings,
   updateCodexQuotaOverdraft,
+  zedOAuthStartOptions,
   openOAuthCredentialImportDialog,
   openOAuthLoginDialog,
   setOAuthCredentialView,
@@ -39,6 +42,19 @@ const {
   submitCursorCredential,
   submitXAIOAuthCallback
 } = require('./channels-codex-auth.js');
+
+test('Zed login submits the registered installation identity', () => {
+  const previousWindow = global.window;
+  global.window = { t: key => key };
+  try {
+    const options = zedOAuthStartOptions(' 9d4b8c17-12ae-4091-96bc-1a79ce2de601 ');
+    assert.equal(options.method, 'POST');
+    assert.deepEqual(JSON.parse(options.body), { system_id: '9d4b8c17-12ae-4091-96bc-1a79ce2de601' });
+    assert.throws(() => zedOAuthStartOptions('not-a-uuid'), /channels\.zed\.systemIDInvalid/);
+  } finally {
+    global.window = previousWindow;
+  }
+});
 
 test('Cursor credential import accepts only a user API key', async () => {
   const previousWindow = global.window;
@@ -839,7 +855,7 @@ test('closing and pagehide abort active OAuth secret submissions and clear brows
   }
 });
 
-test('logs channel editor loads Codex auth before opening a Codex channel', async () => {
+test('logs channel editor opens a channel and displays Codex auth', async () => {
   const requiredMarkupIDs = new Set([
     'channelModal',
     'commonModelsModal',
@@ -879,6 +895,7 @@ test('logs channel editor loads Codex auth before opening a Codex channel', asyn
 
   const scripts = [{ src: 'http://localhost/web/assets/js/logs-channel-editor.js?v=test' }];
   let openedChannelID = null;
+  let oauthSetupCalls = 0;
   const previous = new Map();
   const installGlobal = (name, value) => {
     previous.set(name, Object.getOwnPropertyDescriptor(global, name));
@@ -890,6 +907,7 @@ test('logs channel editor loads Codex auth before opening a Codex channel', asyn
     t: key => key,
     showError() {}
   });
+  installGlobal('setupOAuthActions', () => { oauthSetupCalls++; });
   installGlobal('document', {
     scripts,
     head: {
@@ -931,8 +949,10 @@ test('logs channel editor loads Codex auth before opening a Codex channel', asyn
     await global.window.openLogChannelEditor(42);
 
     assert.equal(openedChannelID, 42);
+    assert.equal(oauthSetupCalls, 1);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
     assert.match(elements.get('codexCredentialContent').textContent, /at-from-log-editor/);
+
   } finally {
     delete require.cache[modulePath];
     for (const [name, descriptor] of previous) {
@@ -1677,7 +1697,6 @@ test('advanced settings confirmation persists only a changed Codex quota overdra
     assert.equal(saved.enabled, false);
     assert.equal(writes, 1);
     assert.equal(elements.get('codexQuotaOverdraftEnabled').checked, false);
-    assert.match(content.textContent, /"enabled": false/);
 
     await saveCodexQuotaOverdraftFromAdvancedSettings(42, async () => {
       writes++;
@@ -1773,6 +1792,22 @@ test('manual Z.ai credential refresh targets the saved channel', async () => {
     options: { method: 'POST' }
   });
   await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'zai_oauth'), /saved Z.ai channel/);
+});
+
+test('manual Zed credential refresh targets the saved channel', async () => {
+  let captured;
+  const response = { oauth_credential: { access_token: 'zed-jwt' } };
+  const result = await refreshOAuthCredential(42, async (url, options) => {
+    captured = { url, options };
+    return response;
+  }, 'zed_oauth');
+
+  assert.equal(result, response);
+  assert.deepEqual(captured, {
+    url: '/admin/channels/42/zed-credential/refresh',
+    options: { method: 'POST' }
+  });
+  await assert.rejects(() => refreshOAuthCredential(0, async () => response, 'zed_oauth'), /saved Zed channel/);
 });
 
 test('manual credential refresh rejects unsupported auth types', async () => {
@@ -2025,6 +2060,146 @@ test('newer batch OAuth usage result is not overwritten by an older single refre
   }
 });
 
+test('channel list auto-refresh submits only newly displayed page channel IDs', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previous = {
+    isTokenChannelsReadOnly: global.isTokenChannelsReadOnly,
+    filterChannels: global.filterChannels,
+    loadChannels: global.loadChannels,
+    window: global.window
+  };
+  let reloads = 0;
+  const requested = [];
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  global.loadChannels = async () => { reloads++; };
+  global.window = { t: key => key };
+
+  try {
+    const first = await maybeAutoRefreshActiveChannelUsage([81, 82, 83, 83, 0], async (url, options) => {
+      requested.push({ url, options });
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 2, succeeded: 0, failed: 0 },
+        {
+          event: 'progress', processed: 1, total: 2, succeeded: 1, failed: 0,
+          result: { channel_id: 81, kind: 'oauth', status: 'succeeded', usage: { windows: [{ kind: 'gemini-5h' }] } }
+        },
+        {
+          event: 'progress', processed: 2, total: 2, succeeded: 2, failed: 0,
+          result: { channel_id: 83, kind: 'oauth', status: 'succeeded', usage: { windows: [{ kind: 'spend' }] } }
+        },
+        { event: 'complete', processed: 2, total: 2, succeeded: 2, failed: 0 }
+      ]);
+    });
+    const repeated = await maybeAutoRefreshActiveChannelUsage([81, 82, 83], async () => {
+      throw new Error('displayed channels should refresh once');
+    });
+    const secondPage = await maybeAutoRefreshActiveChannelUsage([83, 85], async (url, options) => {
+      requested.push({ url, options });
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 0, succeeded: 0, failed: 0 },
+        { event: 'complete', processed: 0, total: 0, succeeded: 0, failed: 0 }
+      ]);
+    });
+    assert.deepEqual(first, { total: 2, succeeded: 2, failed: 0 });
+    assert.equal(repeated, null);
+    assert.deepEqual(secondPage, { total: 0, succeeded: 0, failed: 0 });
+    assert.equal(reloads, 0);
+    assert.equal(requested.length, 2);
+    assert.equal(requested[0].url, '/admin/channels/usage/active/batch/stream');
+    assert.equal(requested[0].options.method, 'POST');
+    assert.deepEqual(JSON.parse(requested[0].options.body), { channel_ids: [81, 82, 83] });
+    assert.deepEqual(JSON.parse(requested[1].options.body), { channel_ids: [85] });
+    assert.equal(getOAuthUsageState(81).status, 'ready');
+    assert.equal(getOAuthUsageState(83).status, 'ready');
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.isTokenChannelsReadOnly = previous.isTokenChannelsReadOnly;
+    global.filterChannels = previous.filterChannels;
+    global.loadChannels = previous.loadChannels;
+    global.window = previous.window;
+  }
+});
+
+test('a completed manual quota refresh is not overwritten by an older list refresh', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previous = {
+    isTokenChannelsReadOnly: global.isTokenChannelsReadOnly,
+    filterChannels: global.filterChannels,
+    window: global.window
+  };
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  global.window = { t: key => key };
+  let releaseAuto;
+  try {
+    const automatic = maybeAutoRefreshActiveChannelUsage([84], async () => ({
+      ok: true,
+      status: 200,
+      text: () => new Promise(resolve => { releaseAuto = resolve; })
+    }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    const manualUsage = { windows: [{ limit_name: 'manual-newer' }] };
+    await refreshOAuthUsage(84, async () => manualUsage, { reload: false });
+    const stale = await oauthUsageBatchSSE([
+      { event: 'start', processed: 0, total: 1, succeeded: 0, failed: 0 },
+      {
+        event: 'progress', processed: 1, total: 1, succeeded: 1, failed: 0,
+        result: {
+          channel_id: 84, kind: 'oauth', status: 'succeeded',
+          usage: { windows: [{ limit_name: 'automatic-older' }] }
+        }
+      },
+      { event: 'complete', processed: 1, total: 1, succeeded: 1, failed: 0 }
+    ]).text();
+    releaseAuto(stale);
+    await automatic;
+
+    assert.deepEqual(getOAuthUsageState(84), { status: 'ready', data: manualUsage });
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.isTokenChannelsReadOnly = previous.isTokenChannelsReadOnly;
+    global.filterChannels = previous.filterChannels;
+    global.window = previous.window;
+  }
+});
+
+test('list auto-refresh can retry after the batch stream fails', async () => {
+  resetActiveChannelUsageAutoRefreshState();
+  const previousWindow = global.window;
+  const previousReadOnly = global.isTokenChannelsReadOnly;
+  const previousFilterChannels = global.filterChannels;
+  const previousConsoleError = console.error;
+  global.window = { t: key => key };
+  global.isTokenChannelsReadOnly = () => false;
+  global.filterChannels = () => {};
+  console.error = () => {};
+  let attempts = 0;
+  try {
+    const first = await maybeAutoRefreshActiveChannelUsage([91], async () => {
+      attempts++;
+      throw new Error('temporary network error');
+    });
+    const second = await maybeAutoRefreshActiveChannelUsage([91], async () => {
+      attempts++;
+      return oauthUsageBatchSSE([
+        { event: 'start', processed: 0, total: 0, succeeded: 0, failed: 0 },
+        { event: 'complete', processed: 0, total: 0, succeeded: 0, failed: 0 }
+      ]);
+    });
+    assert.equal(first, null);
+    assert.deepEqual(second, { total: 0, succeeded: 0, failed: 0 });
+    assert.equal(attempts, 2);
+  } finally {
+    resetActiveChannelUsageAutoRefreshState();
+    global.window = previousWindow;
+    global.isTokenChannelsReadOnly = previousReadOnly;
+    global.filterChannels = previousFilterChannels;
+    console.error = previousConsoleError;
+  }
+});
+
 test('selected quota refresh skips non-OAuth channels and reports one batch result', async () => {
   const previousGlobals = new Map();
   const setGlobal = (name, value) => {
@@ -2126,6 +2301,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     'selectAllKeys',
     'codexCredentialTab',
     'codexCredentialContent',
+    'codexCredentialViewDescription',
+    'codexCredentialViewSwitch',
     'codexCredentialRefreshButton',
     'channelCodexPlanBadge',
     'codexQuotaOverdraftSettings',
@@ -2181,6 +2358,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('batchDeleteKeysBtn').disabled, true);
     assert.equal(elements.get('selectAllKeys').disabled, true);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, false);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, false);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, false);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, 'plus · 2030-02-03');
     assert.equal(elements.get('codexQuotaOverdraftSettings').hidden, false);
@@ -2217,6 +2396,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('codexCredentialReadOnlyNotice').hidden, false);
     assert.equal(elements.get('channelApiKey').required, false);
     assert.equal(elements.get('codexCredentialTab').hidden, false);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, true);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, true);
     assert.equal(elements.get('codexQuotaOverdraftSettings').hidden, true);
     assert.equal(elements.get('codexCredentialContent').textContent, JSON.stringify(antigravityCredential, null, 2));
@@ -2278,6 +2459,8 @@ test('OAuth editor keeps credentials read-only and applies provider-specific con
     assert.equal(elements.get('importKeysBtn').disabled, false);
     assert.equal(elements.get('selectAllKeys').disabled, false);
     assert.equal(elements.get('codexCredentialTab').hidden, true);
+    assert.equal(elements.get('codexCredentialViewDescription').hidden, true);
+    assert.equal(elements.get('codexCredentialViewSwitch').hidden, true);
     assert.equal(elements.get('codexCredentialRefreshButton').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').hidden, true);
     assert.equal(elements.get('channelCodexPlanBadge').textContent, '');

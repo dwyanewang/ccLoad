@@ -68,7 +68,7 @@ ccLoad 直接处理这些问题：
 | 🛡️ **故障秒切** | Key/模型/渠道统一指数退避，优先尊重上游精确恢复时间 | 单模型故障不误伤整个渠道 |
 | 📊 **数据大屏** | 趋势图+日志+Token统计+进程指标(CPU/RSS/GC) | 一眼看清用量与运行状态 |
 | 🎯 **多API兼容** | Claude Code/Codex/Gemini/OpenAI | 一套配置走天下 |
-| 🔑 **OAuth 渠道** | Codex(ChatGPT)/Anthropic(Claude)/Antigravity/xAI OAuth 凭证 + Codex 个人访问令牌(PAT) + Z.ai Coding Plan(ZCode) 浏览器授权或 API Key 导入 + Cursor User API Key 导入 | 支持的提供商自动刷新令牌，支持文本/文件/聚合导入、批量额度刷新、失效凭证清理，凭证被上游永久拒绝时自动禁用渠道 |
+| 🔑 **OAuth 渠道** | Codex(ChatGPT)/Anthropic(Claude)/Antigravity/xAI OAuth 凭证 + Codex 个人访问令牌(PAT) + Z.ai Coding Plan(ZCode) 浏览器授权或 API Key 导入 + Cursor User API Key 导入 + Zed 原生登录 | 支持的提供商自动刷新令牌，支持文本/文件/聚合导入、批量额度刷新、失效凭证清理，凭证被上游永久拒绝时自动禁用渠道；Zed 试用权限绑定真实 Zed 安装的 system_id |
 | 📅 **OAuth 额度成本** | 按凭证累计周/月标准成本，对齐上游额度窗口 | 有重置额度时可手动重置 Codex 配额 |
 | 🔌 **Responses WebSocket** | 下游长连接+原生 WS/HTTP-SSE 桥接 | 保留会话并按安全边界故障切换 |
 | 📦 **开箱即用** | 单文件+嵌入式SQLite | 零依赖，下载就能跑 |
@@ -77,6 +77,9 @@ ccLoad 直接处理这些问题：
 | 💰 **成本限额** | 渠道每日成本上限 | 达到限额自动跳过 |
 | 🚦 **渠道RPM限制** | 每渠道滚动60秒请求上限 | 0=不限，超限自动跳过 |
 | 🚧 **渠道并发限制** | 每渠道同时在飞请求上限 | 0=不限，超限自动跳过 |
+| 🗝️ **Key 模型白名单** | 每个渠道 Key 限定可服务的模型 | 空=不限制；全部 Key 都不匹配则跳过该渠道 |
+| 🧠 **模型思考后缀** | `model(high)` / `model(16384)` 语法糖 | 跨协议映射思考参数，基名路由不受影响 |
+| 🖼️ **多模态回退** | `model_multimodal_fallback` 非视觉模型→回退模型映射 | 含图片/文件的请求在选路前整体改用回退模型 |
 | 🕒 **渠道可用时段** | HH:MM 起止时间，服务器本地时区，支持跨午夜 | 时段外渠道完全不参与路由 |
 | 🔐 **令牌限额** | 费用上限+模型/渠道限制+并发上限 | 精细化访问控制 |
 | ⏱️ **首字节监控** | 流式请求TTFB记录 | 便于诊断上游延迟 |
@@ -90,56 +93,15 @@ ccLoad 直接处理这些问题：
 | 🎨 **图片生成测试** | 独立标签页，可选 Images API 或 Chat Completions | 尺寸/质量/背景/输出格式可调，直接看到生成结果 |
 | 🔍 **调试日志** | 上游请求/响应原始数据捕获 | 敏感头脱敏，排障利器 |
 | 🕐 **定时检测** | 渠道可用性后台定时探测 | 自动发现故障渠道 |
-| 🔄 **更新渠道** | 默认稳定版，可选择包含测试版 | 可在设置页调整渠道和检测间隔 |
+| 🔄 **更新渠道** | 默认稳定版，可选择包含测试版 | 设置页可调整渠道和检测间隔，并支持一键手动检测 |
 | 🧩 **自定义请求规则** | 渠道级请求头/JSON 请求体改写（remove/override/append） | 认证头保护 + CRLF 防护 + 容量上限 |
 | 🎛️ **日志列自定义** | 表格列显隐可配置，设置持久化到浏览器 | 按需查看，减少信息噪音 |
 
 ## 🏗️ 架构概览
 
-每个渠道默认接受四种客户端协议。实际上游协议由 `protocol_transform_mode` 和每个结构化 URL 的 `protocols` 声明共同决定：`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 探测并跳过已试协议，仅在响应未提交的能力错误后继续；`local` 优先使用显式声明协议的 URL，并保持每个 URL 的声明顺序。只有全部 URL 都未声明协议时，`local` 才按 Anthropic → Codex → OpenAI → Gemini 尝试。不兼容 URL 不发请求、不冷却；自动探测成功结果按 URL 和请求族缓存到进程重启或渠道配置变更，全部协议不支持时 10 分钟后重新探测。
+每个渠道默认接受四种客户端协议。实际上游协议由 `protocol_transform_mode` 和每个结构化 URL 的 `protocols` 声明共同决定：`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 探测并跳过已试协议，仅在响应未提交的能力错误后继续；`local` 优先使用显式声明协议的 URL，并保持每个 URL 的声明顺序。只有全部 URL 都未声明协议时，`local` 才按 Anthropic → Codex → OpenAI → Gemini 尝试。不兼容 URL 不发请求、不冷却。自动探测成功结果按 URL 和请求族缓存到进程重启或渠道配置变更；只有稳定的端点级非模型 404/405 才会缓存该 URL 与请求族的“全部协议不支持”结果，并在 10 分钟后重新探测。请求相关的 400/403/500 和本地转换失败会在下次请求时重新尝试。
 
-```mermaid
-graph TB
-    subgraph "客户端"
-        A[Claude Code / Codex / Gemini / OpenAI 客户端]
-    end
-
-    subgraph "ccLoad服务"
-        B[HTTP代理]
-        C[认证 + 路由分发]
-        D[渠道选择器<br/>优先级 + 平滑加权轮询]
-        E[协议 Registry<br/>原生透传 / 本地转换]
-        F[URL选择器<br/>探索 + 1/EWMA加权]
-        G[(存储工厂<br/>SQLite / MySQL / PostgreSQL)]
-        H[日志 + 指标 + 成本控制]
-
-        A --> B --> C --> D --> E --> F
-        D <--> G
-        H <--> G
-        B --> H
-    end
-
-    subgraph "上游服务"
-        U1[Anthropic]
-        U2[OpenAI兼容服务]
-        U3[Gemini]
-        U4[Codex Responses]
-    end
-
-    F --> U1
-    F --> U2
-    F --> U3
-    F --> U4
-    U1 -. JSON / SSE .-> E
-    U2 -. JSON / SSE .-> E
-    U3 -. JSON / SSE .-> E
-    U4 -. JSON / SSE .-> E
-    E -. 客户端协议 .-> B
-
-    style B fill:#4F46E5,stroke:#000,color:#fff
-    style D fill:#059669,stroke:#000,color:#fff
-    style E fill:#0EA5E9,stroke:#000,color:#fff
-```
+![ccLoad 程序架构](images/ccload-architecture.jpg)
 
 ## 🚀 快速开始
 
@@ -417,7 +379,7 @@ git push
 **版本锁定**（可选）:
 如果需要锁定特定版本，修改 Dockerfile：
 ```dockerfile
-FROM ghcr.io/caidaoli/ccload:v2.44.1  # 指定版本号
+FROM ghcr.io/caidaoli/ccload:v4.7.0  # 指定版本号
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
 ENV SQLITE_PATH=/tmp/ccload.db
@@ -588,9 +550,13 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**图像生成（Images API）**：
+
+`POST /v1/images/generations` 兼容 OpenAI Images 接口，请求体上限独立由 `max_image_body_bytes` 控制。渠道模型是 `grok-4.6` 及之后的 xAI 对话模型时，ccLoad 会把请求自动桥接成 xAI Responses 的 `image_generation` 工具调用：非流请求聚合为标准 Images JSON，流式请求输出 `partial_image` / `completed` SSE 事件。
+
 **Codex Responses WebSocket**：
 
-下游 WebSocket 和上游 WebSocket 是两个独立开关：认证后的客户端始终可以升级 `GET /v1/responses`，也可以使用 Codex 直连别名 `GET /backend-api/codex/responses`；渠道的 `websockets` 只决定 ccLoad 是否尝试连接原生 Codex 上游 WebSocket。未启用该字段的渠道仍可通过 HTTP/SSE 桥接参与候选和故障切换。
+下游 WebSocket 和上游 WebSocket 是两个独立开关：认证后的客户端始终可以升级 `GET /v1/responses`，也可以使用 Codex 直连别名 `GET /v1/codex/responses` 或 `GET /backend-api/codex/responses`；渠道的 `websockets` 只决定 ccLoad 是否尝试连接原生 Codex 上游 WebSocket。未启用该字段的渠道仍可通过 HTTP/SSE 桥接参与候选和故障切换。
 
 在 `/web/channels.html` 中选择包含 Codex 能力 URL 的渠道，勾选“原生 WebSocket”并点击“检测”即可启用。使用 Admin API 时对应的关键字段如下；URL 仍填写 `http://` 或 `https://` 地址，ccLoad 会在原生 WS 请求时转换为 `ws://` 或 `wss://`：
 
@@ -652,6 +618,21 @@ curl -X POST http://localhost:8080/v1/alpha/search \
 ```
 
 普通渠道 URL 会自动追加 `/v1/alpha/search`。精确 URL 需要设置 `exact: true`，且 `url` 已指向完整端点，例如 `{"url":"https://upstream.example.com/v1/alpha/search","exact":true,"protocols":["codex"]}`。转发前会移除 Responses 专用字段 `prompt_cache_key` 和 `prompt_cache_retention`。
+
+### 模型思考后缀
+
+任意协议入口都支持在模型名尾部追加思考后缀，例如 `claude-sonnet-4-6(high)`、`gpt-5.2(xhigh)`、`gemini-3.1-pro(8192)`。ccLoad 先剥离后缀完成路由，再按实际转发的上游协议把等级写进请求体的思考参数（Anthropic `thinking`、OpenAI/Codex `reasoning.effort`、Gemini `thinkingBudget`）：
+
+- **等级**：`minimal` / `low` / `medium` / `high` / `xhigh` / `max`；超出上游模型能力时收敛到最近可用档
+- **关闭**：`(none)` 或 `(0)` 关闭思考
+- **自动**：`(auto)` 交由上游默认思考策略
+- **数字预算**：`(16384)` 等非负整数按 token 预算下发（Anthropic `budget_tokens`、Gemini `thinkingBudget`）
+
+后缀不是模型身份：选路、鉴权、冷却、日志和发往上游的模型名一律使用基名，渠道模型列表无需登记带后缀的条目。HTTP 代理、Responses WebSocket 和管理后台的渠道测试都支持该后缀；渠道自定义请求规则晚于后缀生效，可覆盖它写入的字段。括号内容不是已知等级或非负整数的模型名（如上游真的叫 `foo(bar)`）原样透传。
+
+### 多模态回退
+
+系统设置 `model_multimodal_fallback` 以 JSON 对象 `{"文本模型":"回退模型"}` 为不支持视觉的模型配置回退模型（最多 64 条映射 / 8 KB；key 按小写基名归一，value 可带思考后缀）。请求含图片、文件等非文本内容时，ccLoad 在思考后缀处理与令牌、渠道、Key 过滤**之前**把模型整体改写为回退模型——选路、冷却与日志全部跟随回退模型。HTTP 入口检测客户端协议的请求体；Responses WebSocket 回合检测**完整 transcript**，因此历史里进入过的图片会让后续每一轮都稳定落在回退模型上。在设置页打开 **多模态回退模型** 即可编辑映射。与其他所有系统设置不同，只保存该映射时立即生效；单次提交触及其他设置仍会在约 2 秒后重启进程。
 
 ### 本地 Token 计数
 
@@ -736,6 +717,8 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > **模型条目说明**：`models` 的每个元素是 `{model, redirect_model, disabled}`。`redirect_model` 只改写发往上游的模型名，客户端仍按原名请求。`disabled: true` 表示该渠道彻底不提供这个模型——不再对外暴露、不参与精确/模糊匹配、也不再写入模型冷却，但条目本身保留。用 `replace` 模式刷新模型列表时，已有的停用标记会按原名、归一化别名和重定向目标三种方式回填到新拉取的条目上，因此刷新不会把手动停用的模型悄悄改回启用。
 
+> **Key 模型白名单**：`api_keys` 的每个元素可带 `allowed_models` 字符串数组，限定这个 Key 只服务哪些模型；省略、留空或写 `"*"` 都表示不限制，保持原有行为。列出的模型必须已存在于该渠道的 `models` 中（渠道声明通配模型时除外），否则保存被拒；保存时按渠道模型名归一大小写并去重，编码后不超过 2000 字节。匹配的是**渠道逻辑模型**：先模糊匹配、再比对白名单，`redirect_model` 重定向在这之后发生，所以白名单填渠道模型名而不是上游模型名。请求先按模型过滤 Key 再进入 Key 重试；某渠道所有 Key 都不服务该模型时直接跳过该渠道，不冷却也不记失败。Web 界面在 Key 行的 **模型范围** 中勾选，并可用 **检测此 Key** 探测上游实际支持的模型再自动匹配渠道模型。适合同一中转站下不同 Key 拥有不同模型权限的场景。
+
 > **独立 Key 中转回退**：当同一中转站下的不同 Key 实际对应不同服务商时，可在渠道编辑器的 **高级设置 → 其他** 中启用 **渠道故障优先换 Key**。遇到可重试的模型级或渠道级上游故障（如 5xx、连接错误、首字节超时）时，ccLoad 会先冷却当前 Key 并尝试本渠道的其他 Key，全部 Key 都不可用后才切换其他渠道。该选项默认关闭，保持原有的模型/渠道冷却行为。
 
 > **RPM限制说明**：`rpm_limit` 是渠道级请求数上限，按滚动 60 秒窗口统计；`0` 表示不限制。代理转发、手动测试、单 URL 测试和定时检测都会计入，达到上限后该渠道会被跳过；多 URL 故障重试按实际发出的上游 HTTP 请求计数。计数保存在当前进程内，服务重启会清空，多实例部署时各实例独立统计。
@@ -750,11 +733,42 @@ ccLoad 会在创建或刷新渠道时优先读取账号的 Coding Plan 模型目
 
 #### Cursor
 
-在渠道管理中选择 **Cursor** 并导入 Cursor User API Key。ccLoad 会用它换取控制面会话；不提供无法用于推理的浏览器登录和 `accessToken` 导入。身份和额度刷新走 `api2.cursor.sh`；模型目录直接读取 SDK Bridge 的 `ListModels`，只保存 Cursor 返回的原始模型 ID，不生成思考等级变体。启动时只要存在 Cursor 渠道，ccLoad 就会在后台查找并探活已有 `cursor-sdk-bridge`；没有可用 Bridge 时下载官方锁定版本、校验内置 SHA-256，并原子安装到 `cursor-sdk/bin/<version>`：设置 `SQLITE_PATH` 时位于数据库旁，否则使用操作系统用户缓存，最后才回退系统临时目录。该过程不阻塞 HTTP 服务启动，不需要安装 Cursor CLI；手动或离线安装可从 [Cursor SDK Bridge 官方发布页](https://github.com/cursor/sdk-bridge/releases)下载。
+在渠道管理中选择 **Cursor** 并导入 Cursor User API Key。ccLoad 会用它换取控制面会话；不提供无法用于推理的浏览器登录和 `accessToken` 导入。身份和额度刷新走 `api2.cursor.sh`；模型目录直接读取 SDK Bridge 的 `ListModels`，保存 Cursor 返回的模型 ID，并补充 SDK 支持的 `-fast` 形式，不生成思考等级变体。启动时只要存在 Cursor 渠道，ccLoad 就会在后台查找并探活已有 `cursor-sdk-bridge`；没有可用 Bridge 时下载官方锁定版本、校验内置 SHA-256，并原子安装到 `cursor-sdk/bin/<version>`：设置 `SQLITE_PATH` 时位于数据库旁，否则使用操作系统用户缓存，最后才回退系统临时目录。该过程不阻塞 HTTP 服务启动，不需要安装 Cursor CLI；手动或离线安装可从 [Cursor SDK Bridge 官方发布页](https://github.com/cursor/sdk-bridge/releases)下载。
 
-SDK Agent 会收到显式的空内建工具列表，因此 Cursor 不会在网关本机执行 shell 或写文件。客户端工具仍走 prompt 映射：模型输出 `<cc_tool_call>`，ccLoad 再译成 Anthropic `tool_use` 或 OpenAI `tool_calls`；工具由客户端执行，下一轮把结果送回来。
+SDK Agent 只开放 Cursor 的 `mcp` capability group：SDK custom tools 通过 Cursor 合成的 `custom-user-tools` MCP server 暴露，网关本机的 shell、文件等其他内建工具仍被禁用。客户端函数通过 `LocalAgentOptions.custom_tools` 注册；ccLoad 在经过鉴权的 loopback 地址提供 `SdkCustomToolCallbackService`，把原生回调转换为 Anthropic `tool_use` 或 OpenAI `tool_calls`，并挂起对应 Agent，直到客户端下一轮交回匹配结果。同一 Cursor 渠道的并发请求按 `agent_id` 隔离会话、按 `call_id` 路由回调。
 
 渠道卡片可刷新包含额度 / API / Auto 三个花费窗口（`DashboardService/GetCurrentPeriodUsage`）。
+
+#### Zed
+
+在渠道管理中选择 **Zed** 并完成原生登录。这不是 OAuth code/PKCE 流程：每次登录在随机 loopback 端口生成临时 RSA-2048 密钥，把 PKCS#1 DER 公钥以 base64url 传给 `zed.dev/native_app_signin`，再用 RSA-OAEP/SHA-256 把回调的 `access_token` 解密成长期 native credential；临时私钥绝不持久化。试用权限绑定真实 Zed 安装的 `system_id`（表单值 → `CCLOAD_ZED_SYSTEM_ID` → 本机 Zed `db/0-global/db.sqlite`）；没有可信来源就拒绝登录，同账号重授权保留已存值。
+
+数据请求先用 native credential 经 `/client/llm_tokens` 换短期 JWT（提前 60 秒单飞刷新并 CAS 持久化），再以 `Authorization: Bearer` 调 `/completions`。渠道固定 exact `/completions`、codex 协议 + local 转换、禁用 WebSocket；ccLoad 动态暴露 `/models` 中能跨 OpenAI/Anthropic/Google 提供商完成 wire 转换的模型。请求会包进 Zed `thread_id/prompt_id/intent/provider/model/provider_request` envelope；`plan` 403 只冷却当前模型并切换渠道，其他 401/403 才刷新凭证。
+
+#### 管理账户（API Key 渠道）
+
+API Key 渠道可以选择绑定上游管理账户，用于余额查询和每日签到。在渠道编辑器中打开 **高级设置 → 管理账户**，选择 profile 并填入上游凭据：
+
+| Profile | 余额 | 签到 | 说明 |
+|---------|------|------|------|
+| **New API** | ✅ | ✅ | 可选 `user_id`，适配多租户站点 |
+| **Sub2API** | ✅ | ❌ | 仅查询余额 |
+| **Sub2API Pro** | ✅ | ✅ | 基于订阅的余额，含日/周/月额度窗口 |
+
+**每日自动签到**：在管理账户面板中启用并设置时间（HH:MM，服务器本地时间）。ccLoad 每分钟扫描一次；错过的时间窗口会在下次扫描时补偿。签到结果以 `checkin` 日志来源记录审计日志，可在日志页面查看。不支持签到的 profile（Sub2API）会被静默跳过。
+
+**手动操作**：渠道卡片提供 **刷新余额** 和 **签到** 按钮，也可通过 Admin API 调用：
+```bash
+# 刷新余额
+curl -X POST http://localhost:8080/admin/channels/:id/management-account/balance \
+  -H "Authorization: Bearer your_admin_token"
+
+# 手动签到
+curl -X POST http://localhost:8080/admin/channels/:id/management-account/checkin \
+  -H "Authorization: Bearer your_admin_token"
+```
+
+> **CSV 往返**：导出包含 `management_daily_checkin_enabled` 和 `management_daily_checkin_time` 列；导入可以只更新签到设置而不影响凭据。`oauth_credential` 列同时承载 OAuth 凭据和管理封套，可用于跨实例迁移。
 
 ### 自定义请求规则（高级）
 
@@ -830,6 +844,7 @@ Claude-API-2,sk-ant-yyy,"[{""url"":""https://api.anthropic.com""}]",5,claude-opu
 - 智能数据验证和错误提示
 - 增量导入和覆盖更新
 - UTF-8编码，Excel兼容
+- `oauth_credential` 同时包含 OAuth 凭据和 API Key 渠道管理账号封套，可用于跨实例迁移；CSV 属于敏感文件，使用后应立即妥善删除
 
 ## 📊 监控指标
 
@@ -841,7 +856,7 @@ Claude-API-2,sk-ant-yyy,"[{""url"":""https://api.anthropic.com""}]",5,claude-opu
 
 **核心功能**：
 - 📈 **24小时趋势图** - 请求量一目了然，高峰低谷清清楚楚
-- 🔴 **实时错误日志** - 渠道异常可秒级发现
+- 🔴 **实时错误日志** - 渠道异常可秒级发现；可直接从日志页中断进行中的请求——中断按上游断链分类并触发故障切换，不会被当作客户端取消
 - 📊 **渠道调用统计** - 用数据判断渠道负载和可用性
 - 💬 **模型测试工作台** - 支持按渠道、按模型和对话式模型测试：
   - 对话模式支持图片上传与粘贴，直接验证多模态请求
@@ -872,7 +887,7 @@ ccLoad 使用的核心技术栈：
 |------|------|------|----------|
 | **Go** | 1.26.0+ | 运行时环境 | 原生并发支持，现代工具链 |
 | **Gin** | v1.12.0 | Web框架 | 高性能HTTP路由 |
-| **modernc/sqlite** | v1.54.0 | 嵌入式数据库 | 纯Go实现，零CGO依赖，单文件存储（默认） |
+| **modernc/sqlite** | v1.57.0 | 嵌入式数据库 | 纯Go实现，零CGO依赖，单文件存储（默认） |
 | **MySQL** | v1.10.0 | 关系型数据库 | 可选，适合高并发生产环境 |
 | **PostgreSQL (pgx)** | v5.10.0 | 关系型数据库 | 可选，支持 URL 和 libpq DSN |
 | **Sonic** | v1.15.2 | JSON库 | 比标准库快2-3倍 |
@@ -995,6 +1010,7 @@ ccLoad 使用的核心技术栈：
 | `CURSOR_SDK_BRIDGE_BIN` | 自动发现 | 显式指定 Cursor SDK Bridge 可执行文件；存在 Cursor 渠道时，无效覆盖会导致启动失败 |
 | `SQLITE_JOURNAL_MODE` | `WAL` | SQLite Journal 模式（WAL/TRUNCATE/DELETE 等，容器环境建议 TRUNCATE） |
 | `CCLOAD_HOST_OVERRIDES` | 无 | DNS 覆盖：将上游域名钉到固定 IP，绕过 DNS 解析。格式：`host1=ip1,host2=ip2`，例如 `anyrouter.top=47.246.23.200`。不影响 TLS SNI/证书/Host 头 |
+| `CCLOAD_MODEL_CATALOG_CACHE` | 无 | models.dev 模型目录缓存文件路径（默认 `data/model-catalog.json`，默认目录不可写时回退临时目录） |
 
 > 如果你的服务挂在反向代理或负载均衡后面，建议显式设置 `TRUSTED_PROXIES`，避免伪造 `X-Forwarded-For` 干扰客户端 IP 识别和登录限速。
 > 可通过 `GET /admin/runtime-metrics` 查看 Responses WebSocket、日志队列/落库失败，以及混合存储主库待同步、失败、丢弃与最后成功时间。
@@ -1032,7 +1048,7 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 
 ### Web 管理配置（数据库存储，保存后自动重启）
 
-这些配置存在数据库中，在 Web 界面 `/web/settings.html` 修改。保存会先写库，随后约 2 秒自动重启进程——重启本身就是生效机制，因此没有热重载，进行中的请求会先跑完再退出：
+这些配置存在数据库中，在 Web 界面 `/web/settings.html` 修改。保存会先写库，随后约 2 秒自动重启进程——重启本身就是生效机制，进行中的请求会先跑完再退出。`model_multimodal_fallback` 是唯一热重载的设置——只保存该映射时原子替换内存快照、无需重启：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -1076,6 +1092,7 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 | `model_catalog_sync_interval_hours` | `6` | 每 6 小时从 models.dev 同步模型目录；`0` 禁用网络同步。启动时使用最近一次成功的缓存，失败时回退内嵌目录；渠道 `cost_multiplier` 仍然适用。 |
 | `auto_update_interval_hours` | `12` | 非容器部署的版本检查间隔（小时，0=禁用，启用时最低 1 小时）；容器中不可用 |
 | `auto_update_channel` | `stable` | 非容器部署的发布渠道：`stable` 只接收稳定版；`preview` 同时接收稳定版和测试版，并选择语义版本最高者；容器中不可用 |
+| `model_multimodal_fallback` | `{}` | JSON 映射 `{"非视觉模型":"回退模型"}`（最多 64 条 / 8 KB）；唯一保存后立即生效、无需重启的设置 |
 | `model_fuzzy_match` | `false` | 模型名精确匹配未命中时，回退到子串匹配 + 版本排序 |
 | `responses_ws_max_connections` | `128` | 下游 Responses WebSocket 全局最大并发连接数；`0` 使用内建默认值 |
 | `responses_ws_max_connections_per_token` | `64` | 单个认证 Token 的下游 Responses WebSocket 最大并发连接数；`0` 使用内建默认值 |
@@ -1084,12 +1101,18 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 | `responses_ws_max_transcript_bytes` | `268435456` | 整个进程保留的 transcript 有效载荷总预算（256 MiB）；`0` 使用内建默认值 |
 | `debug_log_enabled` | `false` | 记录上游请求/响应调试日志 |
 | `debug_log_retention_minutes` | `2` | 调试日志保留时长（分钟） |
+| `CODEX_BASE_URL` | 空 | Codex OAuth 渠道的全局上游地址（完整 Responses URL；官方默认 `https://chatgpt.com/backend-api/codex/responses`） |
+| `ANTHROPIC_BASE_URL` | 空 | Anthropic OAuth 渠道的全局 API 根地址（官方默认 `https://api.anthropic.com`） |
+| `XAI_BASE_URL` | 空 | xAI OAuth 渠道的全局 API 根地址（通常以 `/v1` 结尾；官方默认 `https://cli-chat-proxy.grok.com/v1`） |
+| `ANTIGRAVITY_URL` | 空 | Antigravity OAuth 渠道的全局上游地址（官方默认 `https://daily-cloudcode-pa.googleapis.com`，备用 `https://cloudcode-pa.googleapis.com`） |
 
 分协议超时按“实际转发到的上游协议”生效：协议转换后转发到 OpenAI，就读取 `openai_*_timeout`；对应值为 `0` 时回退全局超时。
 
+四个 OAuth 全局上游地址默认为空，表示使用各提供商官方地址。设置后，对应 OAuth 渠道的数据请求、模型发现、渠道测试和额度查询只使用该全局地址并忽略渠道 URL；OAuth 授权和 Token 交换/刷新仍走提供商官方地址，API Key 渠道不受影响。
+
 #### 自动更新
 
-非容器部署由单一更新管理器负责版本检查、前端版本提示和可选的进程内自动更新。默认启动时检查一次，此后每 12 小时检查一次。`auto_update_channel=stable` 只接收稳定版；`preview` 同时考虑稳定版和测试版，按 SemVer 选择最高有效版本，不会把当前版本或待重启版本降级。两个设置都可以在 Web 管理后台修改；将 `auto_update_interval_hours` 设为 `0` 可关闭全部版本检查。
+非容器部署由单一更新管理器负责版本检查、前端版本提示和可选的进程内自动更新。默认启动时检查一次，此后每 12 小时检查一次。`auto_update_channel=stable` 只接收稳定版；`preview` 同时考虑稳定版和测试版，按 SemVer 选择最高有效版本，不会把当前版本或待重启版本降级。两个设置都可以在 Web 管理后台修改；将 `auto_update_interval_hours` 设为 `0` 只关闭定时版本检查——设置旁的 **检测更新** 按钮（`POST /admin/update/check`）在间隔为 `0` 时仍可手动执行完整的检查/校验/替换流程。
 
 稳定版元数据通过配置的发布源解析。测试版发现读取 GitHub Releases Atom feed，其中包含稳定版和测试版，无需使用受速率限制的 REST API。解析出精确 Tag 后，ccLoad 会从配置的下载源获取应用和校验文件；默认顺序是 `gh.monlor.com`、`fastgit.cc`、`ghfast.top` 和 GitHub，SHA256 校验通过后才替换应用可执行文件。Cursor SDK Bridge 独立管理，始终使用官方锁定版本。
 
@@ -1178,7 +1201,7 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 - **可用标签**：
   - `latest` - 最新稳定版本
   - `beta` - 最新 Beta 版本
-  - `v2.44.1` - 精确稳定版本，和 GitHub Release Tag 保持一致
+  - `v4.7.0` - 精确稳定版本，和 GitHub Release Tag 保持一致
   - `vX.Y.Z-beta.N` - 精确 Beta 版本，和 GitHub Prerelease Tag 保持一致
 
 官方 GHCR 镜像基于 Debian/glibc，并保持不可变；上游 Cursor SDK Bridge standalone 是 glibc 动态链接程序，不能放进 Alpine/musl 运行。镜像构建会直接从 Cursor 官方发布页拉取并校验锁定版本的 Bridge；GitHub Release 只发布 ccLoad 二进制。容器不做进程内更新；拉取精确版本 Tag 或滚动别名后重建容器即可。
@@ -1190,7 +1213,7 @@ export CCLOAD_ENABLE_SQLITE_REPLICA=1
 docker pull ghcr.io/caidaoli/ccload:latest
 
 # 拉取指定版本
-docker pull ghcr.io/caidaoli/ccload:v2.44.1
+docker pull ghcr.io/caidaoli/ccload:v4.7.0
 
 # 拉取最新 Beta；要锁定版本时将 beta 替换为已发布的 vX.Y.Z-beta.N Tag
 docker pull ghcr.io/caidaoli/ccload:beta
@@ -1242,7 +1265,7 @@ storage/
 
 **核心表结构**（SQLite / MySQL / PostgreSQL 共用）:
 - `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含上游协议、定时检测配置、RPM/并发限制配置）
-- `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略）
+- `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略与 `allowed_models` 模型白名单）
 - `channel_model_cooldowns` - 模型级运行时冷却，主键为渠道和实际上游模型
 - `logs` - 请求日志（含base_url上游URL追踪）
 - `debug_logs` - 调试日志（上游请求/响应原始数据，独立清理策略）
@@ -1271,6 +1294,7 @@ storage/
 - ✅ **渠道定时检测**：后台定时探测渠道可用性，支持指定检测模型
 - ✅ **渠道RPM限制**：每渠道滚动60秒请求数上限，`0` 表示无限制，超限自动跳过该渠道
 - ✅ **渠道并发限制**：每渠道同时在飞请求数上限，`0` 表示无限制，超限自动跳过该渠道
+- ✅ **Key 模型白名单**：`api_keys.allowed_models` 限定每个 Key 可服务的渠道模型，空表示不限制；渠道内所有 Key 都不服务该模型时跳过该渠道
 
 **向后兼容迁移**:
 - 自动检测并修复重复渠道名称

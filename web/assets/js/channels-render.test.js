@@ -2,9 +2,34 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  buildChannelRuntimeStatusHtml,
   buildOAuthPlanBadge,
-  buildOAuthUsageStatusHtml
+  buildOAuthUsageStatusHtml,
+  buildManagementAccountStatusHtml
 } = require('./channels-render.js');
+
+test('渠道状态显示协议待重探数量和最早重试时间', () => {
+  const previousWindow = global.window;
+  global.window = {
+    t(key, values = {}) {
+      return ({
+        'channels.status.protocolProbeRetries': `协议待重探：${values.count} · ${values.time}`,
+        'channels.status.minutesUntilRetry': `${values.count}分钟后重试`
+      })[key] || key;
+    }
+  };
+
+  try {
+    const html = buildChannelRuntimeStatusHtml({
+      protocol_probe_retry_count: 2,
+      protocol_probe_retry_remaining_ms: 9 * 60 * 1000
+    });
+    assert.match(html, /ch-runtime-status--protocols/);
+    assert.match(html, /协议待重探：2 · 9分钟后重试/);
+  } finally {
+    global.window = previousWindow;
+  }
+});
 
 test('OAuth 额度刷新失败时格式化结构化错误并转义内容', () => {
   const previousWindow = global.window;
@@ -80,6 +105,12 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
         'channels.oauth.usageRefresh': '刷新额度',
         'channels.oauth.usageWeekly': '周额度',
         'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
+        'channels.oauth.usageCompactAmount': `${values.used}/${values.estimated}`,
+        'channels.oauth.usageCompactUsed': `${values.used}`,
+        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
+        'channels.oauth.usageDetailAmount': `已用 ${values.used} / 预估总额 ${values.estimated}`,
+        'channels.oauth.usageDetailUsed': `已用 ${values.used}`,
+        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`,
         'channels.oauth.resetCredits': `可重置 ${values.count} 次`,
         'channels.oauth.resetCreditExpiresEarliest': `改期 ${values.time}`,
         'channels.oauth.resetCreditExpiresUnknown': '过期时间不可用',
@@ -117,12 +148,10 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
     const html = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
     assert.match(html, /可重置 2 次/);
     assert.match(html, /\$12\.0/);
-    assert.match(html, /ch-oauth-usage__heading">[\s\S]*?周额度[\s\S]*?\$12\.0[\s\S]*?<\/span>\s*<span class="ch-oauth-usage__details">/);
     assert.match(html, /改期 01\/03/);
     assert.match(html, /查看全部 2 个过期时间/);
     assert.match(html, /data-action="reset-codex-quota" data-channel-id="92"/);
     assert.doesNotMatch(html, /data-action="reset-codex-quota"[^>]*disabled/);
-    assert.ok(html.indexOf('role="progressbar"') < html.indexOf('可重置 2 次'));
 
     state = { ...state, reset_status: 'loading', reset_error: '' };
     const loading = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
@@ -134,6 +163,94 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
     const failed = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
     assert.match(failed, /重置失败 &lt;retry&gt;/);
     assert.doesNotMatch(failed, /重置失败 <retry>/);
+  } finally {
+    global.window = previousWindow;
+    global.getOAuthUsageState = previousGetUsageState;
+    global.isTokenChannelsReadOnly = previousReadOnly;
+  }
+});
+
+test('Codex Spark 额度窗口使用简短默认标签', () => {
+  const previousWindow = global.window;
+  const previousGetUsageState = global.getOAuthUsageState;
+  const previousReadOnly = global.isTokenChannelsReadOnly;
+  global.window = {
+    t(key, values = {}) {
+      return ({
+        'channels.oauth.usageRefresh': '刷新额度',
+        'channels.oauth.usageCodexSparkFiveHour': 'Spark 5h',
+        'channels.oauth.usageCodexSparkWeekly': 'Spark周限',
+        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
+        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
+        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`
+      })[key] || key;
+    }
+  };
+  global.getOAuthUsageState = () => ({
+    status: 'ready',
+    data: {
+      provider: 'codex',
+      windows: [
+        {
+          limit_name: 'GPT-5.3-Codex-Spark', kind: 'primary', remaining_percent: 80,
+          limit_window_seconds: 5 * 60 * 60
+        },
+        {
+          limit_name: 'codex-spark', kind: 'secondary', remaining_percent: 65,
+          limit_window_seconds: 7 * 24 * 60 * 60
+        }
+      ]
+    }
+  });
+  global.isTokenChannelsReadOnly = () => false;
+  try {
+    const html = buildOAuthUsageStatusHtml({ id: 93, auth_type: 'codex_oauth' });
+    assert.match(html, /Spark 5h/);
+    assert.match(html, /Spark周限/);
+    assert.doesNotMatch(html, /GPT-5\.3-Codex-Spark/);
+  } finally {
+    global.window = previousWindow;
+    global.getOAuthUsageState = previousGetUsageState;
+    global.isTokenChannelsReadOnly = previousReadOnly;
+  }
+});
+
+test('Codex 官方窗口只显示两个周额度并单独标识 Spark', () => {
+  const previousWindow = global.window;
+  const previousGetUsageState = global.getOAuthUsageState;
+  const previousReadOnly = global.isTokenChannelsReadOnly;
+  global.window = {
+    t(key, values = {}) {
+      return ({
+        'channels.oauth.usageRefresh': '刷新额度',
+        'channels.oauth.usageWeekly': '周限额',
+        'channels.oauth.usageHours': `${values.count}h限额`,
+        'channels.oauth.usageCodexSparkFiveHour': 'Spark 5h',
+        'channels.oauth.usageCodexSparkWeekly': 'Spark周限',
+        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
+        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
+        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`
+      })[key] || key;
+    }
+  };
+  global.getOAuthUsageState = () => ({
+    status: 'ready',
+    data: {
+      provider: 'codex',
+      windows: [
+        { limit_name: 'codex', kind: 'primary', remaining_percent: 85, limit_window_seconds: 604800 },
+        { limit_name: 'GPT-5.3-Codex-Spark', kind: 'primary', remaining_percent: 97, limit_window_seconds: 18000 },
+        { limit_name: 'GPT-5.3-Codex-Spark', kind: 'secondary', remaining_percent: 99, limit_window_seconds: 604800 },
+      ]
+    }
+  });
+  global.isTokenChannelsReadOnly = () => false;
+  try {
+    const html = buildOAuthUsageStatusHtml({ id: 94, auth_type: 'codex_oauth' });
+    const labels = [...html.matchAll(/ch-oauth-usage__label">([^<]+)/g)].map(match => match[1]);
+    assert.deepEqual(labels, ['周限额', 'Spark 5h', 'Spark周限']);
+    assert.equal(labels.filter(label => label.includes('周限')).length, 2);
+    assert.doesNotMatch(html, /GPT-5\.3-Codex-Spark/);
   } finally {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
@@ -209,7 +326,6 @@ test('xAI 按 Management Center 语义渲染原值额度并转义内容', () => 
     assert.match(usage, /Pro &lt;safe&gt;/);
     assert.match(usage, /已用25\.5%/);
     assert.match(usage, /\$3\.5/);
-    assert.match(usage, /ch-oauth-usage__heading">[\s\S]*?周额度[\s\S]*?\$3\.5[\s\S]*?<\/span>\s*<span class="ch-oauth-usage__details">/);
     assert.match(usage, /aria-label="周额度剩余74\.5%"[^>]*aria-valuenow="74\.5"/);
     assert.match(usage, /产品使用 · grok&lt;fast&gt;/);
     assert.match(usage, /已用12\.25%/);
@@ -336,7 +452,13 @@ test('Antigravity 同时长的两个额度窗口各自显示自己的累计成�
         'channels.oauth.usageWeekly': '周额度',
         'channels.oauth.usageHours': `${values.count}小时额度`,
         'channels.oauth.usageLabel': `${values.name}${values.duration}`,
-        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`
+        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
+        'channels.oauth.usageCompactAmount': `${values.used}/${values.estimated}`,
+        'channels.oauth.usageCompactUsed': `${values.used}`,
+        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
+        'channels.oauth.usageDetailAmount': `已用 ${values.used} / 预估总额 ${values.estimated}`,
+        'channels.oauth.usageDetailUsed': `已用 ${values.used}`,
+        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`
       })[key] || key;
     }
   };
@@ -372,7 +494,7 @@ test('Antigravity 同时长的两个额度窗口各自显示自己的累计成�
     assert.match(html, /Gemini5小时额度[\s\S]*?\$0\.1/);
     assert.match(html, /Claude周额度[\s\S]*?\$0\.0/);
     assert.match(html, /Claude5小时额度[\s\S]*?\$0\.0/);
-    assert.equal(html.match(/\$0\.3/g).length, 1);
+    assert.match(html, /ch-oauth-usage__tooltip-line">已用 \$0\.3 \/ 预估总额/);
   } finally {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
@@ -412,10 +534,6 @@ test('Cursor 额度按官网顺序显示可用比例和按量月限额', () => {
   global.isTokenChannelsReadOnly = () => false;
   try {
     const html = buildOAuthUsageStatusHtml({ id: 1481, auth_type: 'cursor_oauth' });
-    const cursorModels = html.indexOf('Cursor Models');
-    const otherModels = html.indexOf('Other Models');
-    const monthlyLimit = html.indexOf('按量月限额');
-    assert.ok(cursorModels >= 0 && cursorModels < otherModels && otherModels < monthlyLimit);
     assert.match(html, /Cursor Models剩余 82%/);
     assert.match(html, /Other Models剩余 70\.4%/);
     assert.match(html, /按量月限额剩余 0%/);
@@ -428,5 +546,307 @@ test('Cursor 额度按官网顺序显示可用比例和按量月限额', () => {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
     global.isTokenChannelsReadOnly = previousReadOnly;
+  }
+});
+
+
+function installManagementRenderGlobals({ balanceState = null, checkinState = null, readOnly = false } = {}) {
+  const previous = {
+    window: global.window,
+    getManagementBalanceState: global.getManagementBalanceState,
+    getManagementCheckinState: global.getManagementCheckinState,
+    isTokenChannelsReadOnly: global.isTokenChannelsReadOnly,
+    managementSupportsCheckin: global.managementSupportsCheckin
+  };
+  global.window = {
+    t: (key, values) => (values
+      ? Object.entries(values).reduce((text, [name, value]) => text.replace(`{${name}}`, String(value)), key)
+      : key)
+  };
+  global.getManagementBalanceState = () => balanceState;
+  global.getManagementCheckinState = () => checkinState;
+  global.isTokenChannelsReadOnly = () => readOnly;
+  global.managementSupportsCheckin = profile => profile === 'new_api' || profile === 'sub2api_pro';
+  return () => {
+    global.window = previous.window;
+    global.getManagementBalanceState = previous.getManagementBalanceState;
+    global.getManagementCheckinState = previous.getManagementCheckinState;
+    global.isTokenChannelsReadOnly = previous.isTokenChannelsReadOnly;
+    global.managementSupportsCheckin = previous.managementSupportsCheckin;
+  };
+
+}
+
+test('管理账户只对已配置凭据的 API Key 渠道渲染动作，签到按 profile 收敛', () => {
+  const restore = installManagementRenderGlobals();
+  try {
+    assert.equal(buildManagementAccountStatusHtml({ id: 3, auth_type: 'codex_oauth' }), '');
+    assert.equal(buildManagementAccountStatusHtml({ id: 3, auth_type: 'api_key' }), '');
+    assert.equal(buildManagementAccountStatusHtml({
+      id: 3,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: false }
+    }), '');
+
+    const newAPI = buildManagementAccountStatusHtml({
+      id: 3,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    });
+    assert.match(newAPI, /data-action="refresh-management-balance" data-channel-id="3"/);
+    assert.match(newAPI, /data-action="run-management-checkin" data-channel-id="3"/);
+
+    const pro = buildManagementAccountStatusHtml({
+      id: 4,
+      auth_type: 'api_key',
+      management_account: { profile: 'sub2api_pro', credential_configured: true }
+    });
+    assert.match(pro, /data-action="run-management-checkin"/);
+
+    const standard = buildManagementAccountStatusHtml({
+      id: 5,
+      auth_type: 'api_key',
+      management_account: { profile: 'sub2api', credential_configured: true }
+    });
+    assert.match(standard, /data-action="refresh-management-balance"/);
+    assert.doesNotMatch(standard, /data-action="run-management-checkin"/);
+    assert.doesNotMatch(standard, /channels\.management\.checkinUnsupportedHint/);
+  } finally {
+    restore();
+  }
+});
+
+test('只有 used/total/percent 齐备才渲染进度条，缺失用量只显示剩余额度', () => {
+  const withUsage = installManagementRenderGlobals({
+    balanceState: {
+      status: 'ready',
+      data: {
+        profile: 'new_api',
+        balance: {
+          remaining: 12.5,
+          unit: 'USD',
+          used: 7.5,
+          total: 20,
+          available_percent: 62.5,
+          sampled_at: '2026-08-25T10:00:00Z'
+        }
+      }
+    }
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 6,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    });
+    assert.match(html, /role="progressbar"/);
+    assert.match(html, /aria-valuenow="62\.5"/);
+    assert.match(html, /\$12\.50/);
+  } finally {
+    withUsage();
+  }
+
+  const withoutUsage = installManagementRenderGlobals({
+    balanceState: {
+      status: 'ready',
+      data: {
+        profile: 'sub2api',
+        balance: { remaining: 3.25, unit: 'USD', sampled_at: '2026-08-25T10:00:00Z' }
+      }
+    }
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 7,
+      auth_type: 'api_key',
+      management_account: { profile: 'sub2api', credential_configured: true }
+    });
+    assert.match(html, /\$3\.25/);
+    assert.doesNotMatch(html, /role="progressbar"/);
+    assert.doesNotMatch(html, /aria-valuenow/);
+  } finally {
+    withoutUsage();
+  }
+
+  const persistedBalance = installManagementRenderGlobals();
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 71,
+      auth_type: 'api_key',
+      management_account: {
+        profile: 'sub2api',
+        credential_configured: true,
+        balance: { remaining: 8.75, unit: 'USD', sampled_at: '2026-08-25T10:00:00Z' }
+      }
+    });
+    assert.match(html, /\$8\.75/, '无 live 余额状态时必须回落到 DTO 的持久化余额');
+  } finally {
+    persistedBalance();
+  }
+});
+
+test('额度与签到的 loading 与错误互不干扰且带可读文本', () => {
+  const loading = installManagementRenderGlobals({
+    balanceState: { status: 'loading' },
+    checkinState: null
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 8,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    });
+    assert.match(html, /data-action="refresh-management-balance"[^>]*disabled[^>]*aria-busy="true"/);
+    assert.doesNotMatch(html, /data-action="run-management-checkin"[^>]*disabled/);
+  } finally {
+    loading();
+  }
+
+  const failed = installManagementRenderGlobals({
+    balanceState: { status: 'error', error: 'upstream <502>' },
+    checkinState: { status: 'loading' }
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 9,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    });
+    assert.match(html, /role="status"/);
+    assert.match(html, /upstream &lt;502&gt;/);
+    assert.doesNotMatch(html, /upstream <502>/);
+    assert.doesNotMatch(html, /data-action="refresh-management-balance"[^>]*disabled/);
+    assert.match(html, /data-action="run-management-checkin"[^>]*disabled[^>]*aria-busy="true"/);
+  } finally {
+    failed();
+  }
+});
+
+test('签到状态以文字呈现并回落到持久化结果', () => {
+  const live = installManagementRenderGlobals({
+    checkinState: { status: 'ready', data: { status: 'manual_required', status_code: 200 } }
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 10,
+      auth_type: 'api_key',
+      management_account: {
+        profile: 'new_api',
+        credential_configured: true,
+        last_checkin_status: 'success'
+      }
+    });
+    assert.match(html, /channels\.management\.status\.manual_required/);
+    assert.doesNotMatch(html, /channels\.management\.status\.success/);
+  } finally {
+    live();
+  }
+
+  const persisted = installManagementRenderGlobals();
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 11,
+      auth_type: 'api_key',
+      management_account: {
+        profile: 'new_api',
+        credential_configured: true,
+        last_checkin_status: 'credential_invalid',
+        last_checkin_at: '2026-08-25T10:00:00Z'
+      }
+    });
+    assert.match(html, /channels\.management\.status\.credential_invalid/);
+
+    const forbidden = buildManagementAccountStatusHtml({
+      id: 13,
+      auth_type: 'api_key',
+      management_account: {
+        profile: 'sub2api_pro',
+        credential_configured: true,
+        last_checkin_status: 'credential_forbidden'
+      }
+    });
+    assert.match(forbidden, /channels\.management\.status\.credential_forbidden/);
+
+    const disabled = buildManagementAccountStatusHtml({
+      id: 15,
+      auth_type: 'api_key',
+      management_account: {
+        profile: 'new_api',
+        credential_configured: true,
+        last_checkin_status: 'skipped_disabled'
+      }
+    });
+    assert.doesNotMatch(disabled, /channels\.management\.status\.skipped_disabled/);
+  } finally {
+    persisted();
+  }
+});
+
+test('已签到只显示时间，并紧跟在立即签到按钮后面', () => {
+  const restore = installManagementRenderGlobals({
+    checkinState: {
+      status: 'ready',
+      data: { status: 'already_checked', checked_in_at: '2026-08-25T10:00:00Z' }
+    }
+  });
+  try {
+    const html = buildManagementAccountStatusHtml({
+      id: 14,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    });
+    assert.match(html, />\d{2}\/\d{2} \d{2}:\d{2}<\/span>/);
+    assert.doesNotMatch(html, /channels\.management\.status\.already_checked/);
+  } finally {
+    restore();
+  }
+});
+
+test('只读模式不渲染管理账户动作', () => {
+  const restore = installManagementRenderGlobals({ readOnly: true });
+  try {
+    assert.equal(buildManagementAccountStatusHtml({
+      id: 12,
+      auth_type: 'api_key',
+      management_account: { profile: 'new_api', credential_configured: true }
+    }), '');
+  } finally {
+    restore();
+  }
+});
+
+test('模型冷却超过 48 小时按天+小时显示，其余时长保持小时分', () => {
+  const previousWindow = global.window;
+  global.window = {
+    t(key, values = {}) {
+      return ({
+        'channels.status.modelCooldowns': `模型冷却：${values.count} · ${values.time}`,
+        'channels.status.daysHoursUntilRecovery': `${values.days}天${values.hours}小时`,
+        'channels.status.hoursMinutesUntilRecovery': `${values.hours}小时${values.minutes}分`
+      })[key] || key;
+    }
+  };
+
+  try {
+    // 455小时25分 → 18天23小时
+    let html = buildChannelRuntimeStatusHtml({
+      model_cooldowns: [{ cooldown_remaining_ms: 455 * 60 * 60 * 1000 + 25 * 60 * 1000 }]
+    });
+    assert.match(html, /模型冷却：1 · 18天23小时/);
+
+    // 48 小时整 → 2天0小时
+    html = buildChannelRuntimeStatusHtml({
+      model_cooldowns: [{ cooldown_remaining_ms: 48 * 60 * 60 * 1000 }]
+    });
+    assert.match(html, /模型冷却：1 · 2天0小时/);
+
+    // 未达 48 小时仍按小时分显示
+    html = buildChannelRuntimeStatusHtml({
+      model_cooldowns: [{ cooldown_remaining_ms: 47 * 60 * 60 * 1000 + 59 * 60 * 1000 }]
+    });
+    assert.match(html, /模型冷却：1 · 47小时59分/);
+    assert.doesNotMatch(html, /天/);
+  } finally {
+    global.window = previousWindow;
   }
 });

@@ -583,11 +583,99 @@ function normalizeModelTestPriorityValue(value, fallback) {
   return Math.max(MODEL_TEST_PRIORITY_MIN, Math.min(MODEL_TEST_PRIORITY_MAX, Math.trunc(num)));
 }
 
+function formatModelTestHealthScore(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '';
+  const formatted = num.toFixed(1);
+  return formatted.endsWith('.0') ? formatted.slice(0, -2) : formatted;
+}
+
+function isChannelDynamicPriorityVisible(ch) {
+  return ch && ch.effective_priority !== undefined && ch.effective_priority !== null;
+}
+
+// 按模型测试行在静态优先级下方叠加显示渠道动态优先级(P_eff = priority - 失败惩罚 - TTFB 惩罚)，
+// 与渠道页 ch-priority-stack 的健康度行同一语义：健康度模式关闭(无 effective_priority)或与静态优先级
+// 一致(无惩罚)时不显示，避免叠加一个相同的数字造成噪音。
+function getModelTestDynamicPriorityInfo(ch, basePriority) {
+  if (!isChannelDynamicPriorityVisible(ch)) return null;
+  const eff = Number(ch.effective_priority);
+  const base = Number.isFinite(Number(basePriority)) ? Number(basePriority) : 0;
+  // 与渠道页一致：动态优先级与静态值一致（无惩罚）时不显示，避免叠加一个相同的数字
+  if (!Number.isFinite(eff) || Math.abs(eff - base) < 0.1) return null;
+  const value = formatModelTestHealthScore(eff);
+  if (!value) return null;
+
+  const label = i18nText('modelTest.dynamicPriority', '动态优先级');
+  const priorityLabel = i18nText('channels.table.priority', '优先级');
+  const operationKey = eff < base ? 'bad' : 'good';
+  const title = `${priorityLabel}: ${base} | ${label}: ${value}`;
+  return { operationKey, title, value };
+}
+
+function buildModelTestDynamicPriorityHtml(ch, basePriority) {
+  const info = getModelTestDynamicPriorityInfo(ch, basePriority);
+  if (!info) return '';
+  return `<div class="ch-priority-row ch-priority-health model-test-dyn-priority" title="${info.title}"><span class="ch-priority-value ch-priority-health-${info.operationKey}">${info.value}</span></div>`;
+}
+
+function refreshModelTestDynamicPriorityTitles() {
+  if (!tbody) return;
+  tbody.querySelectorAll('.model-test-dyn-priority').forEach((element) => {
+    const row = element.closest('tr');
+    if (!row) return;
+    const channelId = Number(row?.dataset.channelId);
+    const channel = channelsList.find(ch => Number(ch.id) === channelId);
+    if (!channel) return;
+
+    const input = row.querySelector('.ch-priority-input');
+    const basePriority = input?.value || input?.dataset.originalPriority || 0;
+    const info = getModelTestDynamicPriorityInfo(channel, basePriority);
+    if (info) element.title = info.title;
+  });
+}
+
 function updateLocalModelTestChannelPriority(channelId, priority) {
   if (!Array.isArray(channelsList)) return;
   channelsList.forEach((ch) => {
-    if (Number(ch.id) === channelId) ch.priority = priority;
+    if (Number(ch.id) !== channelId) return;
+    if (ch.effective_priority !== undefined && ch.effective_priority !== null) {
+      const oldPriority = normalizeModelTestPriorityValue(ch.priority, 0);
+      const offset = Number(ch.effective_priority) - oldPriority;
+      // 动态优先级随静态优先级平移，与 channels-render.js 的 updateLocalChannelPriority 同一语义
+      if (Number.isFinite(offset)) ch.effective_priority = priority + offset;
+    }
+    ch.priority = priority;
   });
+}
+
+function syncModelTestRowDynamicPriority(input) {
+  if (!input) return;
+  const row = input.closest('tr');
+  if (!row) return;
+  const channelId = Number(input.dataset.channelId);
+  const ch = channelsList.find(c => Number(c.id) === channelId);
+  const nextPriority = normalizeModelTestPriorityValue(input.value, 0);
+  const html = ch ? buildModelTestDynamicPriorityHtml(ch, nextPriority) : '';
+  const container = row.querySelector('.model-test-col-priority');
+  if (!container) return;
+  let el = container.querySelector('.model-test-dyn-priority');
+  if (!html) {
+    if (el) el.remove();
+    return;
+  }
+  // 动态显示在行内编辑后同步：已显示则原地替换，否则插到输入框之后（与模板结构一致）
+  if (el) container.replaceChild(buildModelTestDynamicPriorityNode(html), el);
+  else {
+    const inputWrap = container.querySelector('.ch-priority-editor-wrap');
+    if (inputWrap) inputWrap.insertAdjacentHTML('afterend', html);
+  }
+}
+
+function buildModelTestDynamicPriorityNode(html) {
+  const tpl = document.createElement('td');
+  tpl.innerHTML = html;
+  return tpl.firstElementChild;
 }
 
 async function saveModelTestInlinePriority(input) {
@@ -614,6 +702,7 @@ async function saveModelTestInlinePriority(input) {
     });
     input.classList.remove('is-dirty');
     updateLocalModelTestChannelPriority(channelId, nextPriority);
+    syncModelTestRowDynamicPriority(input);
   } catch (error) {
     console.error('Update channel priority failed:', error);
     input.dataset.originalPriority = String(originalPriority);
@@ -744,6 +833,15 @@ function buildModelTestCostDisplay(standardCost, multiplier) {
   const cost = Number(standardCost);
   if (!Number.isFinite(cost) || cost <= 0) return null;
 
+  // 模型模式下可能无法知道后端自动挑选的具体 Key；此时只显示标准成本，
+  // 不能用 API Key 渠道固定为 1 的渠道倍率伪造 effective cost。
+  if (multiplier === null || multiplier === undefined) {
+    return {
+      html: formatCost(cost),
+      effectiveCost: cost
+    };
+  }
+
   const effectiveCost = cost * normalizeModelTestCostMultiplier(multiplier);
   if (typeof buildCostStackHtml === 'function') {
     return {
@@ -759,14 +857,38 @@ function buildModelTestCostDisplay(standardCost, multiplier) {
   };
 }
 
-function getRowCostMultiplier(row) {
-  const rowMultiplier = row?.dataset?.costMultiplier;
-  if (rowMultiplier !== undefined && rowMultiplier !== '') {
-    return normalizeModelTestCostMultiplier(rowMultiplier);
+function getRowCostMultiplier(row, result) {
+  // 单渠道模式提交带 key_index，倍率取选中 Key 的 cost_multiplier。
+  if (testMode !== TEST_MODE_MODEL && Number.isInteger(selectedKeyIndex)) {
+    const key = channelKeys.find(k => normalizeModelTestKeyIndex(k?.key_index) === selectedKeyIndex);
+    if (key) return normalizeModelTestCostMultiplier(key.cost_multiplier);
   }
 
   const channelId = String(row?.dataset?.channelId || '');
   const channel = channelsList.find(ch => String(ch.id) === channelId);
+
+  if (testMode === TEST_MODE_MODEL) {
+    const testedKeyIndex = normalizeModelTestKeyIndex(result?.tested_key_index);
+    const cachedKeys = channelKeysById.get(Number(channelId));
+    if (testedKeyIndex !== null && Array.isArray(cachedKeys)) {
+      const testedKey = cachedKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === testedKeyIndex);
+      if (testedKey) return normalizeModelTestCostMultiplier(testedKey.cost_multiplier);
+    }
+
+    // 渠道列表提供倍率区间；只有区间退化为单值时才能确定 effective cost。
+    const multiplierMin = channel?.cost_multiplier_min == null ? NaN : Number(channel.cost_multiplier_min);
+    const multiplierMax = channel?.cost_multiplier_max == null ? NaN : Number(channel.cost_multiplier_max);
+    if (Number.isFinite(multiplierMin) && Number.isFinite(multiplierMax)) {
+      if (Math.abs(multiplierMin - multiplierMax) < 1e-9) {
+        return normalizeModelTestCostMultiplier(multiplierMin);
+      }
+      return null;
+    }
+
+    // OAuth 渠道的渠道级倍率仍然是准确值；API Key 渠道缺少区间时保持未知。
+    if (String(channel?.auth_type || '').toLowerCase() === 'api_key') return null;
+  }
+
   return normalizeModelTestCostMultiplier(channel?.cost_multiplier);
 }
 
@@ -1654,6 +1776,7 @@ function renderModelModeRows() {
       channelBaseName: baseName,
       channelEnabled: String(channelEnabled),
       channelPriority: String(priorityValue),
+      dynamicPriorityHtml: buildModelTestDynamicPriorityHtml(ch, priorityValue),
       modelEnabled: String(modelEnabled),
       toggleSwitchClass: modelEnabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
       toggleTitle: modelEnabled ? i18nText('modelTest.toggleDisable', '禁用模型') : i18nText('modelTest.toggleEnable', '启用模型'),
@@ -1798,8 +1921,7 @@ function getSelectedTargets() {
           row,
           model: row.dataset.model || selectedModelName,
           channelId: channel.id,
-          clientProtocol: selectedProtocol,
-          keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(channel.id))?.key_index)
+          clientProtocol: selectedProtocol
         };
       }
 
@@ -1813,20 +1935,6 @@ function getSelectedTargets() {
       };
     })
     .filter(Boolean);
-}
-
-async function attachModelModeKeySelection(targets) {
-  if (testMode !== TEST_MODE_MODEL || !Array.isArray(targets) || targets.length === 0) {
-    return targets;
-  }
-
-  const channelIDs = [...new Set(targets.map(target => target.channelId).filter(Number.isFinite))];
-  await Promise.all(channelIDs.map(channelId => getModelTestChannelKeys(channelId)));
-
-  return targets.map(target => ({
-    ...target,
-    keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(target.channelId))?.key_index)
-  }));
 }
 
 function resetRowStatus(row) {
@@ -1865,7 +1973,7 @@ function applyTestResultToRow(row, data) {
     row.querySelector('.cache-read').textContent = usage.cache_read_input_tokens || usage.cached_tokens || '-';
     row.querySelector('.cache-create').textContent = usage.cache_creation_input_tokens || '-';
     const costCell = row.querySelector('.cost');
-    const costDisplay = buildModelTestCostDisplay(data.cost_usd, getRowCostMultiplier(row));
+    const costDisplay = buildModelTestCostDisplay(data.cost_usd, getRowCostMultiplier(row, data));
     if (costDisplay) {
       costCell.innerHTML = costDisplay.html;
       if (costCell.dataset) costCell.dataset.sortValue = String(costDisplay.effectiveCost);
@@ -2091,7 +2199,7 @@ async function runModelTests() {
     return;
   }
 
-  let targets = getSelectedTargets();
+  const targets = getSelectedTargets();
   if (targets.length === 0) {
     showError(i18nText('modelTest.selectAtLeastOne', '请至少选择一条记录'));
     return;
@@ -2101,7 +2209,6 @@ async function runModelTests() {
   clearProgress();
   setRunTestButtonDisabled(true);
   try {
-    targets = await attachModelModeKeySelection(targets);
     await runBatchTests(targets);
   } catch (error) {
     console.error('runModelTests failed:', error);
@@ -3034,6 +3141,7 @@ function bindEvents() {
   window.addEventListener('localechange', () => {
     syncClientProtocolCombobox();
     syncChatClientProtocolCombobox();
+    refreshModelTestDynamicPriorityTitles();
   });
   const streamEnabled = document.getElementById('streamEnabled');
   if (streamEnabled) {

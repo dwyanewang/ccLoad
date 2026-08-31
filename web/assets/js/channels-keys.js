@@ -12,28 +12,106 @@ function parseKeys(input) {
 
 function isChannelKeyEditorReadOnly() {
   return typeof editingChannelAuthType !== 'undefined' &&
-    ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth'].includes(editingChannelAuthType);
+    ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType);
+}
+
+function canFetchInlineKeyRate() {
+  if (isChannelKeyEditorReadOnly() || typeof window === 'undefined' ||
+    typeof window.getManagementAccountRateConfig !== 'function') {
+    return false;
+  }
+  const config = window.getManagementAccountRateConfig();
+  return Boolean(config && ['new_api', 'sub2api', 'sub2api_pro'].includes(config.profile));
+}
+
+function normalizeKeyAllowedModels(models) {
+  const seen = new Set();
+  const normalized = [];
+  for (const value of Array.isArray(models) ? models : []) {
+    const modelName = String(value || '').trim();
+    const key = modelName.toLowerCase();
+    if (!modelName || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(modelName);
+  }
+  return normalized;
+}
+
+function routingKeyModelName(value) {
+  const modelName = String(value || '').trim();
+  const match = modelName.match(/^(.*?)\(([^()]*)\)$/);
+  if (!match) return modelName;
+  const suffix = match[2].trim().toLowerCase();
+  const knownLevel = ['none', 'auto', '-1', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(suffix);
+  if (!knownLevel && !/^\d+$/.test(suffix)) return modelName;
+  return match[1].trim() || modelName;
+}
+
+function normalizeKeyCostMultiplier(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 1;
+  return parsed;
 }
 
 function normalizeInlineKeyRow(row) {
   if (row && typeof row === 'object') {
-    return {
+    const normalized = {
       api_key: String(row.api_key || '').trim(),
-      note: String(row.note || '').trim()
+      note: String(row.note || '').trim(),
+      allowed_models: normalizeKeyAllowedModels(row.allowed_models),
+      cost_multiplier: normalizeKeyCostMultiplier(row.cost_multiplier)
     };
+    if (row.model_scope_empty === true) normalized.model_scope_empty = true;
+    return normalized;
   }
   return {
     api_key: String(row || '').trim(),
-    note: ''
+    note: '',
+    allowed_models: [],
+    cost_multiplier: 1
   };
 }
 
-function makeInlineKeyRow(apiKey = '', note = '') {
-  return normalizeInlineKeyRow({ api_key: apiKey, note });
+function pruneKeyAllowedModels(rows, configuredModels) {
+  const configured = new Set(
+    (Array.isArray(configuredModels) ? configuredModels : [])
+      .map(entry => routingKeyModelName(typeof entry === 'string' ? entry : entry?.model).toLowerCase())
+      .filter(Boolean)
+  );
+  const unrestrictedCatalog = configured.has('*');
+
+  return (Array.isArray(rows) ? rows : []).map(row => {
+    const normalized = normalizeInlineKeyRow(row);
+    if (unrestrictedCatalog) {
+      return normalized;
+    }
+    if (normalized.allowed_models.length === 0) return normalized;
+    normalized.allowed_models = normalized.allowed_models.filter(model => configured.has(model.toLowerCase()));
+    if (normalized.allowed_models.length === 0) normalized.model_scope_empty = true;
+    return normalized;
+  });
+}
+
+function makeInlineKeyRow(apiKey = '', note = '', allowedModels = []) {
+  return normalizeInlineKeyRow({ api_key: apiKey, note, allowed_models: allowedModels });
 }
 
 function normalizeInlineKeyTableData() {
   inlineKeyTableData = inlineKeyTableData.map(normalizeInlineKeyRow);
+}
+
+function syncInlineKeyModelScopesWithConfiguredModels() {
+  const nextRows = pruneKeyAllowedModels(inlineKeyTableData, redirectTableData);
+  const changed = nextRows.some((row, index) => {
+    const current = normalizeInlineKeyRow(inlineKeyTableData[index]);
+    return row.allowed_models.length !== current.allowed_models.length ||
+      row.allowed_models.some((model, modelIndex) => model !== current.allowed_models[modelIndex]) ||
+      Boolean(row.model_scope_empty) !== Boolean(current.model_scope_empty);
+  });
+  if (!changed) return false;
+  inlineKeyTableData = nextRows;
+  renderInlineKeyTable();
+  return true;
 }
 
 function getInlineKeyValue(index) {
@@ -54,44 +132,78 @@ function getValidInlineKeyRows() {
 }
 
 function selectAvailableInlineKeys(rows, states) {
-  const unavailableIndices = new Set(
-    (Array.isArray(states) ? states : [])
-      .filter(state => state && (state.disabled || Number(state.cooldown_remaining_ms || 0) > 0))
-      .map(state => Number(state.key_index))
-  );
-
-  const keys = [];
-  for (const [index, row] of (Array.isArray(rows) ? rows : []).entries()) {
-    const apiKey = normalizeInlineKeyRow(row).api_key;
-    if (apiKey && !unavailableIndices.has(index)) keys.push(apiKey);
-  }
-  return [...new Set(keys)];
+  return [...new Set(selectModelFetchKeyEntries(rows, states, false).map(entry => entry.apiKey))];
 }
 
-function selectModelFetchKeys(rows, states) {
-  const availableKeys = selectAvailableInlineKeys(rows, states);
-  if (availableKeys.length > 0) return availableKeys;
-
+function selectModelFetchKeyEntries(rows, states, allowCooldownFallback = true, allowScopeEmpty = false) {
   const statesByIndex = new Map(
     (Array.isArray(states) ? states : [])
       .filter(Boolean)
       .map(state => [Number(state.key_index), state])
   );
+  const available = [];
+  const scopeEmpty = [];
   let fallback = null;
   for (const [index, row] of (Array.isArray(rows) ? rows : []).entries()) {
-    const apiKey = normalizeInlineKeyRow(row).api_key;
+    const normalizedRow = normalizeInlineKeyRow(row);
+    const apiKey = normalizedRow.api_key;
     const state = statesByIndex.get(index);
     const cooldownRemaining = Number(state?.cooldown_remaining_ms || 0);
-    if (!apiKey || state?.disabled || cooldownRemaining <= 0) continue;
-    if (!fallback || cooldownRemaining < fallback.cooldownRemaining) {
-      fallback = { apiKey, cooldownRemaining };
+    const scopeAutoDisabled = Boolean(normalizedRow.model_scope_empty);
+    if (!apiKey) continue;
+    // 手动禁用的 Key 不参与探测；作用域被裁剪空而自动禁用的 Key 凭据仍有效，
+    // 仅当调用方显式允许（allowScopeEmpty）时降级参与只读模型探测。
+    if (state?.disabled && (!allowScopeEmpty || !scopeAutoDisabled)) continue;
+    if (cooldownRemaining > 0) {
+      if (!scopeAutoDisabled && allowCooldownFallback &&
+          (!fallback || cooldownRemaining < fallback.cooldownRemaining)) {
+        fallback = { keyIndex: index, apiKey, cooldownRemaining };
+      }
+      continue;
     }
+    if (scopeAutoDisabled) {
+      if (!allowScopeEmpty) continue;
+      scopeEmpty.push({ keyIndex: index, apiKey });
+      continue;
+    }
+    available.push({ keyIndex: index, apiKey });
   }
-  return fallback ? [fallback.apiKey] : [];
+  if (available.length > 0) {
+    return available.concat(scopeEmpty);
+  }
+  const entries = [];
+  if (allowCooldownFallback && fallback) {
+    entries.push({ keyIndex: fallback.keyIndex, apiKey: fallback.apiKey });
+  }
+  return entries.concat(scopeEmpty);
+}
+
+function countConfiguredInlineKeys(rows) {
+  let count = 0;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const apiKey = normalizeInlineKeyRow(row).api_key;
+    if (apiKey) count++;
+  }
+  return count;
 }
 
 function selectFirstEnabledInlineKey(rows, states) {
   return selectAvailableInlineKeys(rows, states)[0] || '';
+}
+
+function selectModelsForInlineKeyTest(row, modelRows) {
+  const keyRow = normalizeInlineKeyRow(row);
+  const allowedModels = new Set(keyRow.allowed_models.map(name => name.toLowerCase()));
+  const configuredModels = (Array.isArray(modelRows) ? modelRows : [])
+    .filter(modelRow => modelRow && !modelRow.disabled)
+    .map(modelRow => routingKeyModelName(modelRow.model))
+    .filter(Boolean);
+  if (allowedModels.size > 0 && configuredModels.includes('*')) {
+    return [...keyRow.allowed_models];
+  }
+  return configuredModels.filter(modelName =>
+    allowedModels.size === 0 || allowedModels.has(modelName.toLowerCase())
+  );
 }
 
 function updateInlineKeyHiddenInput() {
@@ -104,13 +216,340 @@ function updateInlineKeyHiddenInput() {
 function setInlineKeyTableDataFromAPI(apiKeys) {
   inlineKeyTableData = (apiKeys || []).map(item => {
     if (item && typeof item === 'object') {
-      return makeInlineKeyRow(item.api_key || '', item.note || '');
+      return normalizeInlineKeyRow({
+        api_key: item.api_key || '',
+        note: item.note || '',
+        allowed_models: item.allowed_models || [],
+        model_scope_empty: item.model_scope_empty === true,
+        cost_multiplier: item.cost_multiplier
+      });
     }
     return makeInlineKeyRow(item || '', '');
   });
   if (inlineKeyTableData.length === 0) {
     inlineKeyTableData = [makeInlineKeyRow()];
   }
+}
+
+let keyModelScopeEditingIndex = -1;
+let keyModelScopeTrigger = null;
+let keyModelScopeDetectionGeneration = 0;
+let keyModelScopeExtraModels = [];
+
+function configuredKeyModelScopeOptions() {
+  const options = [];
+  const seen = new Set();
+  const rows = typeof redirectTableData !== 'undefined' && Array.isArray(redirectTableData)
+    ? redirectTableData
+    : [];
+  for (const row of rows) {
+    const modelName = routingKeyModelName(row?.model);
+    const key = modelName.toLowerCase();
+    if (!modelName || modelName === '*' || seen.has(key)) continue;
+    seen.add(key);
+    options.push({
+      model: modelName,
+      upstreamModel: routingKeyModelName(row?.redirect_model || modelName),
+      disabled: Boolean(row?.disabled)
+    });
+  }
+  for (const modelName of normalizeKeyAllowedModels(keyModelScopeExtraModels)) {
+    const key = modelName.toLowerCase();
+    if (modelName === '*' || seen.has(key)) continue;
+    seen.add(key);
+    options.push({ model: modelName, upstreamModel: modelName, disabled: false });
+  }
+  return options;
+}
+
+function channelUsesWildcardModel() {
+  return typeof redirectTableData !== 'undefined' && Array.isArray(redirectTableData) &&
+    redirectTableData.some(row => String(row?.model || '').trim() === '*');
+}
+
+function setKeyModelScopeStatus(message = '', isError = false) {
+  const status = document.getElementById('keyModelScopeStatus');
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle('key-model-scope-status--error', Boolean(message && isError));
+}
+
+function getKeyModelScopeCheckboxes() {
+  return Array.from(document.querySelectorAll('#keyModelScopeList input[name="keyAllowedModel"]'));
+}
+
+function getVisibleKeyModelScopeCheckboxes() {
+  return getKeyModelScopeCheckboxes().filter(checkbox => !checkbox.closest?.('.key-model-scope-option')?.hidden);
+}
+
+function syncKeyModelScopeToggleAll() {
+  const toggle = document.getElementById('keyModelScopeToggleAll');
+  if (!toggle) return;
+  const visible = getVisibleKeyModelScopeCheckboxes();
+  const selected = visible.filter(checkbox => checkbox.checked).length;
+  const allowAll = document.getElementById('keyModelScopeAll')?.checked !== false;
+  toggle.checked = visible.length > 0 && selected === visible.length;
+  toggle.indeterminate = selected > 0 && selected < visible.length;
+  toggle.disabled = allowAll || visible.length === 0;
+}
+
+function updateKeyModelScopeSelectionCount() {
+  const count = document.getElementById('keyModelScopeSelectionCount');
+  const checkboxes = getKeyModelScopeCheckboxes();
+  if (count) {
+    const selected = checkboxes.filter(checkbox => checkbox.checked).length;
+    count.textContent = window.t('channels.keyModelsSelectionCount', { selected, total: checkboxes.length });
+  }
+  syncKeyModelScopeToggleAll();
+}
+
+function setVisibleKeyModelScopeChecked(checked) {
+  const visible = getVisibleKeyModelScopeCheckboxes();
+  if (visible.length === 0) return false;
+  for (const checkbox of visible) {
+    checkbox.checked = Boolean(checked);
+  }
+  updateKeyModelScopeSelectionCount();
+  setKeyModelScopeStatus();
+  return true;
+}
+
+function syncKeyModelScopeControls() {
+  const allowAll = document.getElementById('keyModelScopeAll')?.checked !== false;
+  const list = document.getElementById('keyModelScopeList');
+  getKeyModelScopeCheckboxes().forEach(checkbox => {
+    checkbox.disabled = allowAll;
+  });
+  list?.setAttribute('aria-disabled', String(allowAll));
+  updateKeyModelScopeSelectionCount();
+}
+
+function renderKeyModelScopeOptions(allowedModels, selectNone = false) {
+  const list = document.getElementById('keyModelScopeList');
+  if (!list) return;
+  list.replaceChildren();
+
+  const allowed = new Set(normalizeKeyAllowedModels(allowedModels).map(name => name.toLowerCase()));
+  const unrestricted = allowed.size === 0;
+  for (const option of configuredKeyModelScopeOptions()) {
+    const label = document.createElement('label');
+    label.className = 'key-model-scope-option';
+    label.dataset.searchText = `${option.model} ${option.upstreamModel}`.toLowerCase();
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.name = 'keyAllowedModel';
+    checkbox.value = option.model;
+    checkbox.dataset.upstreamModel = option.upstreamModel;
+    checkbox.checked = !selectNone && (unrestricted || allowed.has(option.model.toLowerCase()));
+
+    const name = document.createElement('span');
+    name.className = 'key-model-scope-option__name';
+    name.textContent = option.model;
+    label.append(checkbox, name);
+    if (option.disabled) {
+      const state = document.createElement('span');
+      state.className = 'key-model-scope-option__state';
+      state.textContent = window.t('channels.keyModelDisabled');
+      label.append(state);
+    }
+    list.appendChild(label);
+  }
+  updateKeyModelScopeSelectionCount();
+}
+
+function openKeyModelScopeModal(index, trigger) {
+  if (isChannelKeyEditorReadOnly()) return false;
+  const modal = document.getElementById('keyModelScopeModal');
+  const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+  if (!modal || !row) return false;
+
+  keyModelScopeEditingIndex = index;
+  keyModelScopeDetectionGeneration++;
+  keyModelScopeExtraModels = normalizeKeyAllowedModels(row.allowed_models);
+  keyModelScopeTrigger = trigger || document.activeElement;
+  const scopeWasEmptied = row.model_scope_empty === true;
+  renderKeyModelScopeOptions(row.allowed_models, scopeWasEmptied);
+  const allowAll = document.getElementById('keyModelScopeAll');
+  if (allowAll) allowAll.checked = !scopeWasEmptied && row.allowed_models.length === 0;
+  const search = document.getElementById('keyModelScopeSearch');
+  if (search) search.value = '';
+  const title = document.getElementById('keyModelScopeModalTitle');
+  if (title) title.textContent = window.t('channels.keyModelsDialogTitle', { index: index + 1 });
+  setKeyModelScopeStatus();
+  syncKeyModelScopeControls();
+  const detectButton = document.getElementById('detectKeyModelScopeBtn');
+  if (detectButton) {
+    detectButton.disabled = false;
+    detectButton.removeAttribute('aria-busy');
+  }
+
+  document.getElementById('channelModal')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  allowAll?.focus();
+  return true;
+}
+
+function closeKeyModelScopeModal(restoreFocus = true) {
+  const modal = document.getElementById('keyModelScopeModal');
+  if (!modal) return;
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.getElementById('channelModal')?.removeAttribute('inert');
+  if (restoreFocus && keyModelScopeTrigger && typeof keyModelScopeTrigger.focus === 'function') {
+    keyModelScopeTrigger.focus();
+  }
+  keyModelScopeEditingIndex = -1;
+  keyModelScopeDetectionGeneration++;
+  keyModelScopeExtraModels = [];
+  keyModelScopeTrigger = null;
+}
+
+function confirmKeyModelScope() {
+  if (keyModelScopeEditingIndex < 0) return false;
+  const allowAll = document.getElementById('keyModelScopeAll')?.checked !== false;
+  const allowedModels = allowAll
+    ? []
+    : getKeyModelScopeCheckboxes().filter(checkbox => checkbox.checked).map(checkbox => checkbox.value);
+  if (!allowAll && allowedModels.length === 0) {
+    setKeyModelScopeStatus(window.t('channels.keyModelsSelectAtLeastOne'), true);
+    getKeyModelScopeCheckboxes()[0]?.focus();
+    return false;
+  }
+
+  const index = keyModelScopeEditingIndex;
+  const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+  row.allowed_models = normalizeKeyAllowedModels(allowedModels);
+  delete row.model_scope_empty;
+  inlineKeyTableData[index] = row;
+  markChannelFormDirty();
+  closeKeyModelScopeModal(false);
+  renderInlineKeyTable();
+  requestAnimationFrame(() => {
+    document.querySelector(`.key-model-scope-btn[data-index="${index}"]`)?.focus();
+  });
+  return true;
+}
+
+function filterKeyModelScopeOptions(query) {
+  const normalized = String(query || '').trim().toLowerCase();
+  document.querySelectorAll('#keyModelScopeList .key-model-scope-option').forEach(option => {
+    option.hidden = Boolean(normalized && !String(option.dataset.searchText || '').includes(normalized));
+  });
+  updateKeyModelScopeSelectionCount();
+}
+
+async function detectKeyModelScope() {
+  if (keyModelScopeEditingIndex < 0) return;
+  const detectionIndex = keyModelScopeEditingIndex;
+  const detectionGeneration = ++keyModelScopeDetectionGeneration;
+  const isCurrentDetection = () => keyModelScopeEditingIndex === detectionIndex &&
+    keyModelScopeDetectionGeneration === detectionGeneration;
+  const row = normalizeInlineKeyRow(inlineKeyTableData[detectionIndex]);
+  const urls = getValidInlineURLConfigs();
+  if (!row.api_key || urls.length === 0) {
+    setKeyModelScopeStatus(window.t('channels.keyModelsDetectNeedsConfig'), true);
+    return;
+  }
+
+  const button = document.getElementById('detectKeyModelScopeBtn');
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
+  setKeyModelScopeStatus(window.t('channels.keyModelsDetecting'));
+  try {
+    const response = await fetchAPIWithAuth('/admin/channels/models/fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls, api_keys: [row.api_key], per_key: true })
+    });
+    if (!isCurrentDetection()) return;
+    if (!response.success) throw new Error(response.error || window.t('channels.fetchModelsFailed', { error: '' }));
+    const data = response.data || {};
+    const keyResult = Array.isArray(data.key_models) ? data.key_models[0] : null;
+    if (keyResult?.error) throw new Error(keyResult.error);
+    const fetchedEntries = Array.isArray(keyResult?.models) ? keyResult.models : data.models || [];
+    const fetched = new Set(fetchedEntries
+      .flatMap(entry => [entry?.model, entry?.redirect_model])
+      .map(name => String(name || '').trim().toLowerCase())
+      .filter(Boolean));
+
+    let matched = 0;
+    if (channelUsesWildcardModel()) {
+      const detectedModels = normalizeKeyAllowedModels(fetchedEntries.map(entry => entry?.model || entry?.redirect_model));
+      if (detectedModels.length === 0) throw new Error(window.t('channels.keyModelsDetectNoMatch'));
+      keyModelScopeExtraModels = normalizeKeyAllowedModels([...keyModelScopeExtraModels, ...detectedModels]);
+      renderKeyModelScopeOptions(detectedModels);
+      matched = detectedModels.length;
+    } else {
+      for (const checkbox of getKeyModelScopeCheckboxes()) {
+        const logical = checkbox.value.toLowerCase();
+        const upstream = String(checkbox.dataset.upstreamModel || '').toLowerCase();
+        checkbox.checked = fetched.has(logical) || fetched.has(upstream);
+        if (checkbox.checked) matched++;
+      }
+    }
+    if (matched === 0) throw new Error(window.t('channels.keyModelsDetectNoMatch'));
+    const allowAll = document.getElementById('keyModelScopeAll');
+    if (allowAll) allowAll.checked = false;
+    syncKeyModelScopeControls();
+    setKeyModelScopeStatus(window.t('channels.keyModelsDetected', { count: matched }));
+  } catch (error) {
+    if (isCurrentDetection()) {
+      setKeyModelScopeStatus(window.t('channels.keyModelsDetectFailed', { error: error.message }), true);
+    }
+  } finally {
+    if (button && isCurrentDetection()) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
+function initKeyModelScopeModalEvents() {
+  const modal = document.getElementById('keyModelScopeModal');
+  if (!modal || modal.dataset.bound) return;
+  modal.querySelectorAll('[data-action="close-key-model-scope"]').forEach(button => {
+    button.addEventListener('click', () => closeKeyModelScopeModal());
+  });
+  modal.querySelector('[data-action="confirm-key-model-scope"]')?.addEventListener('click', confirmKeyModelScope);
+  document.getElementById('detectKeyModelScopeBtn')?.addEventListener('click', detectKeyModelScope);
+  document.getElementById('keyModelScopeAll')?.addEventListener('change', syncKeyModelScopeControls);
+  document.getElementById('keyModelScopeToggleAll')?.addEventListener('change', event => {
+    setVisibleKeyModelScopeChecked(event.target.checked);
+  });
+  document.getElementById('keyModelScopeList')?.addEventListener('change', updateKeyModelScopeSelectionCount);
+  document.getElementById('keyModelScopeSearch')?.addEventListener('input', event => {
+    filterKeyModelScopeOptions(event.target.value);
+  });
+  modal.addEventListener('click', event => {
+    if (event.target === modal) closeKeyModelScopeModal();
+  });
+  document.addEventListener('keydown', event => {
+    if (!modal.classList.contains('show')) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeKeyModelScopeModal();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), input:not([disabled])'))
+      .filter(element => !element.closest('[hidden]'));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }, true);
+  modal.dataset.bound = '1';
 }
 
 function getKeyTableContainer() {
@@ -332,6 +771,7 @@ function createKeyRow(index) {
   const keyRow = normalizeInlineKeyRow(inlineKeyTableData[index]);
   inlineKeyTableData[index] = keyRow;
   const isSelected = selectedKeyIndices.has(index);
+  const scopeWasEmptied = keyRow.model_scope_empty === true;
 
   // 准备模板数据
   const rowData = {
@@ -339,6 +779,16 @@ function createKeyRow(index) {
     displayIndex: index + 1,
     key: keyRow.api_key || '',
     note: keyRow.note || '',
+    modelScopeLabel: scopeWasEmptied
+      ? window.t('channels.keyModelsNoneShort')
+      : keyRow.allowed_models.length === 0
+      ? window.t('channels.keyModelsAllShort')
+      : window.t('channels.keyModelsCountShort', { count: keyRow.allowed_models.length }),
+    modelScopeTitle: scopeWasEmptied
+      ? window.t('channels.keyModelsNoneTitle')
+      : keyRow.allowed_models.length === 0
+      ? window.t('channels.keyModelsAllTitle')
+      : window.t('channels.keyModelsRestrictedTitle', { count: keyRow.allowed_models.length }),
     inputType: inlineKeyVisible ? 'text' : 'password',
     cooldownHtml: buildCooldownHtml(index),
     actionsHtml: buildActionsHtml(index),
@@ -346,12 +796,19 @@ function createKeyRow(index) {
     mobileLabelNote: window.t('channels.modal.keyNote'),
     mobileLabelStatus: window.t('common.status'),
     mobileLabelActions: window.t('common.actions'),
+    mobileLabelMultiplier: window.t('channels.costMultiplier'),
+    costMultiplier: keyRow.cost_multiplier,
+    fetchRateTitle: window.t('channels.fetchRateTitle'),
+    fetchRateLabel: window.t('channels.fetchRate'),
     notePlaceholder: window.t('channels.keyNotePlaceholder')
   };
 
   // 使用模板引擎渲染
   const row = TemplateEngine.render('tpl-key-row', rowData);
   if (!row) return null;
+
+  const fetchRateButton = row.querySelector('[data-action="fetch-rate"]');
+  if (fetchRateButton) fetchRateButton.hidden = !canFetchInlineKeyRate();
 
   // 禁用状态：输入框只读（不设整行半透明，与 URL 表保持一致，状态通过徽章/开关颜色表达）
   const keyCooldown = currentChannelKeyCooldowns.find(kc => kc.key_index === index);
@@ -368,7 +825,7 @@ function createKeyRow(index) {
     if (keyInput) keyInput.readOnly = true;
     if (noteInput) noteInput.readOnly = true;
     if (checkbox) checkbox.disabled = true;
-    row.querySelectorAll('[data-action="delete"], [data-action="toggle-disabled"]').forEach(button => {
+    row.querySelectorAll('[data-action="delete"], [data-action="toggle-disabled"], [data-action="models"]').forEach(button => {
       button.hidden = false;
       button.disabled = true;
     });
@@ -554,6 +1011,8 @@ function initKeyTableEventDelegation() {
       else if (action === 'copy') copyKeyToClipboard(index);
       else if (action === 'delete') deleteInlineKey(index);
       else if (action === 'toggle-disabled') toggleKeyDisabled(index);
+      else if (action === 'models') openKeyModelScopeModal(index, actionBtn);
+      else if (action === 'fetch-rate') fetchKeyRate(index, actionBtn);
       return;
     }
 
@@ -567,6 +1026,12 @@ function initKeyTableEventDelegation() {
 
   // 处理输入框变更
   tbody.addEventListener('change', (e) => {
+    const multiplierInput = e.target.closest('.inline-key-multiplier-input');
+    if (multiplierInput) {
+      const index = parseInt(multiplierInput.dataset.index);
+      updateInlineKeyCostMultiplier(index, multiplierInput.value);
+      return;
+    }
     if (isChannelKeyEditorReadOnly()) return;
     const input = e.target.closest('.inline-key-input');
     if (input) {
@@ -578,12 +1043,13 @@ function initKeyTableEventDelegation() {
     if (noteInput) {
       const index = parseInt(noteInput.dataset.index);
       updateInlineKeyNote(index, noteInput.value);
+      return;
     }
   });
 
   // 处理输入框焦点样式
   tbody.addEventListener('focusin', (e) => {
-    const input = e.target.closest('.inline-key-input, .inline-key-note-input');
+    const input = e.target.closest('.inline-key-input, .inline-key-note-input, .inline-key-multiplier-input');
     if (input) {
       input.style.borderColor = 'var(--primary-500)';
       input.style.boxShadow = '0 0 0 3px rgba(59,130,246,0.1)';
@@ -593,7 +1059,7 @@ function initKeyTableEventDelegation() {
   });
 
   tbody.addEventListener('focusout', (e) => {
-    const input = e.target.closest('.inline-key-input, .inline-key-note-input');
+    const input = e.target.closest('.inline-key-input, .inline-key-note-input, .inline-key-multiplier-input');
     if (input) {
       input.style.borderColor = 'var(--neutral-300)';
       input.style.boxShadow = 'none';
@@ -645,6 +1111,7 @@ function renderInlineKeyTable() {
 
   // 初始化事件委托
   initKeyTableEventDelegation();
+  initKeyModelScopeModalEvents();
 
   if (inlineKeyTableData.length === 0) {
     const emptyRow = TemplateEngine.render('tpl-key-empty', {
@@ -777,6 +1244,16 @@ function updateInlineKeyNote(index, value) {
   markChannelFormDirty();
 }
 
+function updateInlineKeyCostMultiplier(index, value) {
+  const nextValue = normalizeKeyCostMultiplier(value);
+  const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+  if (row.cost_multiplier === nextValue) return;
+
+  row.cost_multiplier = nextValue;
+  inlineKeyTableData[index] = row;
+  markChannelFormDirty();
+}
+
 async function testSingleKey(keyIndex, testButton) {
   if (!editingChannelId) {
     alert(window.t('channels.cannotGetChannelId'));
@@ -784,10 +1261,7 @@ async function testSingleKey(keyIndex, testButton) {
   }
 
   // 从 redirectTableData 获取模型列表（定义在 channels-state.js）
-  const models = redirectTableData
-    .filter(r => r && !r.disabled)
-    .map(r => r.model)
-    .filter(m => m && m.trim());
+  const models = selectModelsForInlineKeyTest(inlineKeyTableData[keyIndex], redirectTableData);
   if (models.length === 0) {
     alert(window.t('channels.configModelsFirst'));
     return;
@@ -1264,6 +1738,15 @@ async function toggleKeyDisabled(index) {
       body: JSON.stringify({ key_index: index })
     });
 
+    const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
+    if (row.model_scope_empty) {
+      // The backend treats an explicit toggle as taking ownership of the
+      // disabled state. Keep the editor aligned so a later save does not
+      // re-submit the stale automatic empty-scope marker.
+      delete row.model_scope_empty;
+      inlineKeyTableData[index] = row;
+    }
+
     await refreshKeyCooldownStatus();
 
     const action = isCurrentlyDisabled ? window.t('common.enabled') : window.t('common.disabled');
@@ -1275,5 +1758,22 @@ async function toggleKeyDisabled(index) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { selectAvailableInlineKeys, selectModelFetchKeys, selectFirstEnabledInlineKey };
+  module.exports = {
+    normalizeInlineKeyRow,
+    normalizeKeyAllowedModels,
+    pruneKeyAllowedModels,
+    selectAvailableInlineKeys,
+    selectModelFetchKeyEntries,
+    countConfiguredInlineKeys,
+    selectFirstEnabledInlineKey,
+    selectModelsForInlineKeyTest,
+    openKeyModelScopeModal,
+    closeKeyModelScopeModal,
+    detectKeyModelScope,
+    initKeyModelScopeModalEvents,
+    setVisibleKeyModelScopeChecked,
+    updateKeyModelScopeSelectionCount,
+    canFetchInlineKeyRate,
+    toggleKeyDisabled
+  };
 }

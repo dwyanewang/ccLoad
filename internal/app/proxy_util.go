@@ -18,6 +18,7 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
 )
 
 const anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
@@ -133,6 +134,8 @@ type fwResult struct {
 
 	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
 	ThinkingEffort string
+	// ResponseModel 是上游响应声明的模型；只用于日志，不参与路由、冷却或计费。
+	ResponseModel string
 
 	// Debug日志数据（debug开启时填充，传递到日志写入管道）
 	DebugData *model.DebugLogEntry
@@ -143,16 +146,17 @@ type fwResult struct {
 
 // ForwardObserver 封装转发过程中的观测回调（遵循SRP，避免函数签名膨胀）
 type ForwardObserver struct {
-	OnBytesRead         func(int64) // 字节读取回调（可选）
-	OnFirstByteRead     func()      // 首字节读取回调（可选）
-	OnUpstreamWebsocket func(bool)  // 实际上游传输变化回调（可选）
+	OnBytesRead         func(int64)         // 字节读取回调（可选）
+	OnFirstByteRead     func(time.Duration) // 客户端首字节耗时回调（可选）
+	OnUpstreamWebsocket func(bool)          // 实际上游传输变化回调（可选）
 	OnDebugCapture      func(*debugCapture)
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
-	originalModel              string
-	requestedModel             string
+	clientModel                string // 客户端请求的原始模型基名；仅用于日志，避免被回退/重定向覆盖
+	originalModel              string // 当前用于选路的模型基名，可能已被多模态回退替换
+	requestedModel             string // 当前用于选路的字面模型名，可能带思考后缀
 	clientProtocol             protocol.Protocol
 	codexClient                bool
 	upstreamProtocol           protocol.Protocol
@@ -172,6 +176,7 @@ type proxyRequestContext struct {
 	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
 	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
+	attemptCostMultiplier      float64              // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	skipProxyLog               bool                 // 管理测试等外层会统一持久化日志的调用路径
 	thinkingEffort             string
@@ -181,6 +186,16 @@ type proxyRequestContext struct {
 	quotaOverdraftTranscript   []byte
 	codexMultiAgentV2Optimized bool
 	codexMultiAgentV2Conflict  bool
+}
+
+func (r *proxyRequestContext) requestLogModel() string {
+	if r == nil {
+		return ""
+	}
+	if r.clientModel != "" {
+		return r.clientModel
+	}
+	return r.originalModel
 }
 
 // proxyResult 代理请求结果
@@ -638,34 +653,35 @@ func buildCodexResponsesPath() string {
 	return "/v1/responses"
 }
 
-// prepareRequestBody 准备请求体（处理模型重定向和模糊匹配）
-// 遵循SRP原则：单一职责 - 负责模型名解析和请求体准备
-//
-// 模型名解析优先级：
-// 1. 精确匹配的重定向（redirect_model 配置）
-// 2. 模糊匹配（启用 model_fuzzy_match 时）
-// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
+// resolveChannelRoutingModel returns the logical model configured on the channel,
+// before redirecting it to an upstream model. API Key scopes use this identity.
+func (s *Server) resolveChannelRoutingModel(cfg *model.Config, originalModel string) string {
+	routedModel := model.RoutingModelName(originalModel)
+	if !cfg.SupportsModel(routedModel) && s.modelFuzzyMatch {
+		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
+			return model.RoutingModelName(matched)
+		}
+	}
+	return routedModel
+}
+
+// resolveActualModel preserves the historical redirect/fuzzy-match order used for upstream requests.
 func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) string {
 	routedModel := model.RoutingModelName(originalModel)
 	actualModel := routedModel
-	// 1. 检查模型重定向（精确匹配优先）
+	// 1. 精确匹配的重定向优先。
 	if redirectModel, ok := cfg.GetRedirectModel(routedModel); ok && redirectModel != "" {
 		actualModel = redirectModel
 	}
 
-	// 2. 模糊匹配回退（仅当未触发重定向时）
-	if actualModel == routedModel && s.modelFuzzyMatch {
-		// 先检查精确匹配，避免不必要的模糊匹配
-		if !cfg.SupportsModel(routedModel) {
-			if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
-				actualModel = matched
-			}
+	// 2. 仅在未触发精确重定向时做模糊匹配。
+	if actualModel == routedModel && s.modelFuzzyMatch && !cfg.SupportsModel(routedModel) {
+		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
+			actualModel = matched
 		}
 	}
 
-	// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
-	// 场景：请求 gemini-3-flash → 模糊匹配 gemini-3-flash-preview → 重定向 gemini-3-flash-preview-0719
-	// 仅当模型已变更且变更后的模型有重定向配置时触发
+	// 3. 历史行为只对上一步得到的模型再解析一次重定向。
 	if actualModel != routedModel {
 		if redirectModel, ok := cfg.GetRedirectModel(actualModel); ok && redirectModel != "" {
 			actualModel = redirectModel
@@ -937,7 +953,8 @@ func stringMapValue(values map[string]any, key string) string {
 // logEntryParams 日志条目构建参数（避免多个 string 参数顺序混淆）
 type logEntryParams struct {
 	RequestModel     string // 客户端请求的原始模型名称
-	ActualModel      string // 实际转发到上游的模型名称（可能经过重定向）
+	ActualModel      string // 实际发给上游的模型名称（可能经过重定向）
+	ResponseModel    string // 成功响应声明的模型；只用于日志展示
 	RequestPath      string // 客户端请求路径（用于识别按次计费的特殊端点）
 	ChannelID        int64
 	StatusCode       int
@@ -1007,6 +1024,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 	if p.ActualModel != "" && p.ActualModel != p.RequestModel {
 		entry.ActualModel = p.ActualModel
 	}
+	entry.ResponseModel = p.ResponseModel
 
 	if p.ErrMsg != "" {
 		// [FIX] 2026-02: 错误场景下也保留诊断信息（特别是499客户端取消）
@@ -1072,7 +1090,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
 			// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
 			// alpha/search 固定按 search_call 计费。
-			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
+			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res)
 		}
 	} else {
 		entry.Message = "unknown"
@@ -1102,7 +1120,7 @@ func appendRetryStrategyToMessage(message, strategy string) string {
 	return truncateErr(fmt.Sprintf("%s [%s]", message, strategy))
 }
 
-// computeRequestCost 集中两处计费分支（buildLogEntry / logFailedAttempt 旁路）。
+// computeRequestCost 是请求总成本的唯一口径：标准 token 成本加 Responses 工具成本。
 // fast 模式专用模型走 CalculateFastModeCost（已含 fast 倍率）。
 // OpenAI service_tier 是价格倍率，不改变按 token 数选择的长上下文分档；
 // 非 OpenAI 白名单模型即使响应携带 service_tier 也不加倍率。
@@ -1118,7 +1136,82 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 		res.CacheReadInputTokens,
 		res.Cache5mInputTokens,
 		res.Cache1hInputTokens,
-	).Total
+	).Total + res.ToolCostUSD
+}
+
+func requestedServiceTier(reqCtx *proxyRequestContext) string {
+	if reqCtx == nil {
+		return ""
+	}
+	body := reqCtx.translatedBody
+	if len(body) == 0 {
+		body = reqCtx.body
+	}
+	if len(body) == 0 {
+		return ""
+	}
+	if reqCtx.upstreamProtocol == protocol.Anthropic {
+		return normalizeBillingServiceTier(gjson.GetBytes(body, "speed").String())
+	}
+	return normalizeBillingServiceTier(gjson.GetBytes(body, "service_tier").String())
+}
+
+func normalizeObservedServiceTier(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeBillingServiceTier(value string) string {
+	switch normalizeObservedServiceTier(value) {
+	case "ultrafast", "auto", "priority", "fast", "flex", "default", "standard":
+		return normalizeObservedServiceTier(value)
+	default:
+		return ""
+	}
+}
+
+func serviceTierCostRank(value string) (int, bool) {
+	switch normalizeBillingServiceTier(value) {
+	case "flex":
+		return 0, true
+	case "default", "standard":
+		return 1, true
+	case "auto", "priority", "fast":
+		return 2, true
+	case "ultrafast":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// resolveBillingServiceTier merges the requested tier with the upstream tier.
+// A response can lower the bill when it explicitly reports a cheaper tier. The
+// explicit auto/ultrafast response tiers are retained because they carry
+// priority/Fast (2.5x for GPT-5.6) or ultrafast (10x) charges.
+func resolveBillingServiceTier(requested, observed string) string {
+	requested = normalizeBillingServiceTier(requested)
+	observed = normalizeBillingServiceTier(observed)
+	// auto and ultrafast are explicit upstream processing tiers. They must win
+	// even when the request asked for a cheaper tier; otherwise the actual
+	// upstream charge is lost.
+	if observed == "auto" || observed == "ultrafast" {
+		return observed
+	}
+	if requested == "" {
+		if rank, ok := serviceTierCostRank(observed); ok && rank <= 1 {
+			return observed
+		}
+		return ""
+	}
+	if observed == "" {
+		return requested
+	}
+	requestedRank, requestedOK := serviceTierCostRank(requested)
+	observedRank, observedOK := serviceTierCostRank(observed)
+	if !requestedOK || !observedOK || observedRank > requestedRank {
+		return requested
+	}
+	return observed
 }
 
 // truncateErr 截断错误信息到512字符（防止日志过长）

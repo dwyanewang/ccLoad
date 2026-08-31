@@ -21,6 +21,7 @@ const (
 	AuthTypeAnthropicOAuth   = "anthropic_oauth"
 	AuthTypeZAIOAuth         = "zai_oauth"
 	AuthTypeCursorOAuth      = "cursor_oauth"
+	AuthTypeZedOAuth         = "zed_oauth"
 
 	// ProtocolTransformModeAuto tries the client protocol first, then falls back through
 	// Anthropic, OpenAI, Codex, Gemini while skipping the native protocol already attempted.
@@ -51,6 +52,8 @@ func NormalizeAuthType(value string) string {
 		return AuthTypeZAIOAuth
 	case AuthTypeCursorOAuth:
 		return AuthTypeCursorOAuth
+	case AuthTypeZedOAuth:
+		return AuthTypeZedOAuth
 	default:
 		return ""
 	}
@@ -468,6 +471,15 @@ func (r *CooldownDetectionRules) Clone() *CooldownDetectionRules {
 	return out
 }
 
+// ChannelInfo 渠道基础信息的批量查询投影（统计与渠道列表角标用）。
+// 成本倍率为区间：api_key 渠道取启用 Key 的 min/max，OAuth 渠道取渠道级倍率（min=max）。
+type ChannelInfo struct {
+	Name              string
+	Priority          int
+	CostMultiplierMin float64
+	CostMultiplierMax float64
+}
+
 // Config 渠道配置
 type Config struct {
 	ID                    int64       `json:"id"`
@@ -493,7 +505,8 @@ type Config struct {
 	// 每日成本限额
 	DailyCostLimit float64 `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
 
-	// 成本倍率：标准成本×倍率=实际计费成本，默认1
+	// 成本倍率：标准成本×倍率=实际计费成本，默认1。
+	// 仅 OAuth 渠道生效（凭证 1:1）；api_key 渠道的权威倍率在 api_keys.cost_multiplier。
 	CostMultiplier float64 `json:"cost_multiplier"`
 
 	// 自定义请求规则（nil 表示无改写）
@@ -627,6 +640,11 @@ func (c *Config) UsesZAIOAuth() bool {
 // UsesCursorOAuth reports whether this channel is backed by a Cursor credential.
 func (c *Config) UsesCursorOAuth() bool {
 	return c != nil && c.GetAuthType() == AuthTypeCursorOAuth
+}
+
+// UsesZedOAuth reports whether this channel is backed by a Zed credential.
+func (c *Config) UsesZedOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeZedOAuth
 }
 
 // UsesOAuth reports whether API keys are replaced by a private OAuth credential.
@@ -805,14 +823,20 @@ func IsValidKeyStrategy(s string) bool {
 
 // APIKey 表示渠道的 API 密钥配置
 type APIKey struct {
-	ID        int64  `json:"id"`
-	ChannelID int64  `json:"channel_id"`
-	KeyIndex  int    `json:"key_index"`
-	APIKey    string `json:"api_key"`
-	Note      string `json:"note"`
+	ID              int64    `json:"id"`
+	ChannelID       int64    `json:"channel_id"`
+	KeyIndex        int      `json:"key_index"`
+	APIKey          string   `json:"api_key"`
+	Note            string   `json:"note"`
+	AllowedModels   []string `json:"allowed_models,omitempty"`    // 空表示该 Key 不限制模型
+	ModelScopeEmpty bool     `json:"model_scope_empty,omitempty"` // true 表示该 Key 当前不允许任何模型
 
 	KeyStrategy string `json:"key_strategy"` // "sequential" | "round_robin"
 	Disabled    bool   `json:"disabled"`
+
+	// 成本倍率：api_key 渠道的权威倍率存在每条 Key 上（OAuth 渠道仍用 Config.CostMultiplier）。
+	// 标准成本×倍率=实际计费成本，默认1，0=免费。
+	CostMultiplier float64 `json:"cost_multiplier"`
 
 	// Key级冷却（从key_cooldowns表迁移）
 	CooldownUntil      int64 `json:"cooldown_until"`
@@ -822,9 +846,34 @@ type APIKey struct {
 	UpdatedAt JSONTime `json:"updated_at"`
 }
 
+// APIKeyModelScope is the persisted model authorization state for one API key.
+type APIKeyModelScope struct {
+	AllowedModels   []string
+	ModelScopeEmpty bool
+	Disabled        bool
+}
+
 // IsCoolingDown 检查密钥是否处于冷却状态
 func (k *APIKey) IsCoolingDown(now time.Time) bool {
 	return k.CooldownUntil > now.Unix()
+}
+
+// AllowsModel reports whether this key may serve a logical channel model.
+// An empty allowlist preserves the legacy unrestricted behavior.
+func (k *APIKey) AllowsModel(modelName string) bool {
+	if k.ModelScopeEmpty {
+		return false
+	}
+	modelName = RoutingModelName(modelName)
+	if len(k.AllowedModels) == 0 || modelName == "" || modelName == "*" {
+		return true
+	}
+	for _, allowed := range k.AllowedModels {
+		if strings.EqualFold(RoutingModelName(allowed), modelName) {
+			return true
+		}
+	}
+	return false
 }
 
 // ChannelWithKeys 渠道和API Keys的完整数据
@@ -832,6 +881,10 @@ func (k *APIKey) IsCoolingDown(now time.Time) bool {
 type ChannelWithKeys struct {
 	Config  *Config  `json:"config"`
 	APIKeys []APIKey `json:"api_keys"` // 不使用指针避免额外分配
+	// CSV 导入暂存字段；管理账号封套仍通过 oauth_credential 列迁移。
+	ChannelManagementCheckinSet     bool   `json:"-"`
+	ChannelManagementCheckinEnabled bool   `json:"-"`
+	ChannelManagementCheckinTime    string `json:"-"`
 }
 
 // FuzzyMatchModel 模糊匹配模型名称

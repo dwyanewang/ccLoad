@@ -52,7 +52,8 @@ func (s *Server) persistCodexPassiveUsage(ctx context.Context, cfg *model.Config
 }
 
 func (s *Server) enqueueCodexPassiveUsage(channelID int64, update codexPassiveUsageUpdate) {
-	if s == nil || s.codexPassiveUsageCh == nil || channelID <= 0 || len(update.Windows) == 0 || s.isShuttingDown.Load() {
+	if s == nil || s.codexPassiveUsageCh == nil || channelID <= 0 ||
+		(len(update.Windows) == 0 && len(update.ReplaceScopes) == 0) || s.isShuttingDown.Load() {
 		return
 	}
 	select {
@@ -79,7 +80,7 @@ func (s *Server) codexPassiveUsageWorker() {
 }
 
 func (s *Server) persistCodexPassiveUsageUpdate(ctx context.Context, cfg *model.Config, update codexPassiveUsageUpdate) {
-	if len(update.Windows) == 0 {
+	if len(update.Windows) == 0 && len(update.ReplaceScopes) == 0 {
 		return
 	}
 	if ctx == nil {
@@ -182,8 +183,15 @@ func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time) (codexPas
 		return codexPassiveUsageUpdate{}, false
 	}
 	update := codexPassiveUsageUpdate{
-		Windows:   make([]codexauth.PassiveUsageWindow, 0, 4),
-		SampledAt: sampledAt.UTC().Format(time.RFC3339Nano),
+		Windows:       make([]codexauth.PassiveUsageWindow, 0, 4),
+		SampledAt:     sampledAt.UTC().Format(time.RFC3339Nano),
+		ReplaceScopes: make([]string, 0, 2+len(event.AdditionalRateLimits)),
+	}
+	if event.RateLimits != nil {
+		update.ReplaceScopes = append(update.ReplaceScopes, "codex")
+	}
+	if event.CodeReviewRateLimits != nil {
+		update.ReplaceScopes = append(update.ReplaceScopes, "code_review")
 	}
 	update.Windows = appendCodexPassiveEventRateLimit(update.Windows, event.RateLimits, "codex", "codex", sampledAt)
 	update.Windows = appendCodexPassiveEventRateLimit(update.Windows, event.CodeReviewRateLimits, "code_review", "code_review", sampledAt)
@@ -197,11 +205,12 @@ func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time) (codexPas
 		if limitName == "" {
 			continue
 		}
+		update.ReplaceScopes = append(update.ReplaceScopes, limitName)
 		update.Windows = appendCodexPassiveEventRateLimit(
 			update.Windows, event.AdditionalRateLimits[name], limitName, limitName, sampledAt,
 		)
 	}
-	if len(update.Windows) == 0 {
+	if len(update.Windows) == 0 && len(update.ReplaceScopes) == 0 {
 		return codexPassiveUsageUpdate{}, false
 	}
 	return update, true
@@ -234,7 +243,7 @@ func appendCodexPassiveEventWindow(
 	scope, limitName, kind string,
 	sampledAt time.Time,
 ) []codexauth.PassiveUsageWindow {
-	if window == nil || window.UsedPercent == nil {
+	if window == nil || window.UsedPercent == nil || !validOAuthUsedPercent(*window.UsedPercent) {
 		return windows
 	}
 	windowSeconds := window.WindowMinutes * 60
@@ -255,7 +264,7 @@ func appendCodexPassiveEventWindow(
 		Scope:              strings.ToLower(strings.TrimSpace(scope)),
 		LimitName:          strings.TrimSpace(limitName),
 		Kind:               kind,
-		UsedPercent:        min(max(*window.UsedPercent, 0), 100),
+		UsedPercent:        *window.UsedPercent,
 		LimitWindowSeconds: windowSeconds,
 		ResetAt:            max(resetAt, 0),
 		SampledAt:          sampledAt.UTC().Format(time.RFC3339Nano),
@@ -267,22 +276,62 @@ func sampleCodexPassiveUsage(headers http.Header, sampledAt time.Time) (codexPas
 		Windows:   make([]codexauth.PassiveUsageWindow, 0, 4),
 		SampledAt: sampledAt.UTC().Format(time.RFC3339Nano),
 	}
-	update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "primary", sampledAt)
-	update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "secondary", sampledAt)
+	// When Active-Limit points at an additional group, the generic x-codex
+	// fields are aliases for that group. Keep the explicitly named group as the
+	// canonical record instead of renaming and storing the alias a second time.
+	activeGroup := codexActiveHeaderGroup(headers)
+	if activeGroup != "" {
+		// The generic x-codex-* fields are aliases for the active additional
+		// group in this shape.  They are not a complete snapshot of the main
+		// Codex scope, so never mark "codex" for replacement here.  Doing so
+		// deletes the weekly Codex window when a Spark-only response arrives.
+		update.ReplaceScopes = []string{activeGroup}
+	} else {
+		genericWindowCount := len(update.Windows)
+		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "primary", sampledAt)
+		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "secondary", sampledAt)
+		// Active-Limit values outside codex_<group> identify the main Codex
+		// scope. The generic header set is a complete snapshot of that scope:
+		// when a window (for example Pro secondary) is absent, remove the stale
+		// persisted window instead of keeping it in passive usage and cost state.
+		if len(update.Windows) > genericWindowCount {
+			update.ReplaceScopes = append(update.ReplaceScopes, "codex")
+		}
+	}
 
 	for _, group := range codexAdditionalQuotaGroups(headers) {
 		base := codexQuotaHeaderPrefix + group
-		limitName := strings.TrimSpace(headers.Get(base + "-limit-name"))
-		if limitName == "" {
-			limitName = group
-		}
+		limitName := codexHeaderLimitName(headers, group)
 		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, base, group, limitName, "primary", sampledAt)
 		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, base, group, limitName, "secondary", sampledAt)
 	}
-	if len(update.Windows) == 0 {
+	if len(update.Windows) == 0 && len(update.ReplaceScopes) == 0 {
 		return codexPassiveUsageUpdate{}, false
 	}
 	return update, true
+}
+
+func codexActiveHeaderGroup(headers http.Header) string {
+	active := strings.ToLower(strings.TrimSpace(headers.Get("X-Codex-Active-Limit")))
+	const prefix = "codex_"
+	if !strings.HasPrefix(active, prefix) {
+		return ""
+	}
+	group := strings.TrimPrefix(active, prefix)
+	for _, candidate := range codexAdditionalQuotaGroups(headers) {
+		if candidate == group {
+			return group
+		}
+	}
+	return ""
+}
+
+func codexHeaderLimitName(headers http.Header, group string) string {
+	limitName := strings.TrimSpace(headers.Get(codexQuotaHeaderPrefix + group + "-limit-name"))
+	if limitName == "" {
+		limitName = group
+	}
+	return limitName
 }
 
 func codexAdditionalQuotaGroups(headers http.Header) []string {
@@ -324,7 +373,7 @@ func appendCodexPassiveHeaderWindow(
 ) []codexauth.PassiveUsageWindow {
 	prefix := base + "-" + kind + "-"
 	usedPercent, ok := parseCodexHeaderFloat(headers.Get(prefix + "used-percent"))
-	if !ok {
+	if !ok || !validOAuthUsedPercent(usedPercent) {
 		return windows
 	}
 	windowMinutes, _ := parseCodexHeaderInt(headers.Get(prefix + "window-minutes"))
@@ -344,7 +393,7 @@ func appendCodexPassiveHeaderWindow(
 		Scope:              strings.ToLower(strings.TrimSpace(scope)),
 		LimitName:          strings.TrimSpace(limitName),
 		Kind:               kind,
-		UsedPercent:        min(max(usedPercent, 0), 100),
+		UsedPercent:        usedPercent,
 		LimitWindowSeconds: windowMinutes * 60,
 		ResetAt:            max(resetAt, 0),
 		SampledAt:          sampledAt.UTC().Format(time.RFC3339Nano),
@@ -388,7 +437,11 @@ func codexPassiveUsageSummary(credential *codexauth.Credential) *oauthUsageSumma
 		Windows:  make([]oauthUsageWindow, 0, len(credential.PassiveUsage.Windows)),
 	}
 	for _, window := range credential.PassiveUsage.Windows {
-		usedPercent := min(max(window.UsedPercent, 0), 100)
+		if !validOAuthUsedPercent(window.UsedPercent) {
+			continue
+		}
+		sampledAt, _ := time.Parse(time.RFC3339Nano, strings.TrimSpace(window.SampledAt))
+		usedPercent := window.UsedPercent
 		summary.Windows = append(summary.Windows, oauthUsageWindow{
 			LimitName:          window.LimitName,
 			Kind:               window.Kind,
@@ -396,7 +449,11 @@ func codexPassiveUsageSummary(credential *codexauth.Credential) *oauthUsageSumma
 			RemainingPercent:   100 - usedPercent,
 			LimitWindowSeconds: window.LimitWindowSeconds,
 			ResetAt:            window.ResetAt,
+			SampledAt:          sampledAt,
 		})
+	}
+	if len(summary.Windows) == 0 {
+		return nil
 	}
 	return summary
 }

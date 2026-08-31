@@ -145,11 +145,11 @@ func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, f
 	}
 
 	if len(channelIDsToFetch) > 0 {
-		channelInfos, err := s.fetchChannelInfoBatch(ctx, channelIDsToFetch)
+		channelInfos, err := s.FetchChannelInfoBatch(ctx, channelIDsToFetch)
 		if err != nil {
 			// 降级处理:查询失败不影响统计返回,仅记录错误
 			log.Printf("[WARN]  批量查询渠道信息失败: %v", err)
-			channelInfos = make(map[int64]ChannelInfo)
+			channelInfos = make(map[int64]model.ChannelInfo)
 		}
 
 		// 填充渠道名称、优先级和类型
@@ -158,9 +158,11 @@ func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, f
 				if info, ok := channelInfos[int64(*stats[i].ChannelID)]; ok {
 					stats[i].ChannelName = info.Name
 					stats[i].ChannelPriority = &info.Priority
-					if info.CostMultiplier != 1 {
-						costMultiplier := info.CostMultiplier
-						stats[i].CostMultiplier = &costMultiplier
+					if info.CostMultiplierMin != 1 || info.CostMultiplierMax != 1 {
+						min := info.CostMultiplierMin
+						max := info.CostMultiplierMax
+						stats[i].CostMultiplierMin = &min
+						stats[i].CostMultiplierMax = &max
 					}
 				} else {
 					// 如果查询不到渠道信息,使用默认值
@@ -649,6 +651,69 @@ func (s *SQLStore) GetClientProtocolStats(ctx context.Context, startTime, endTim
 		var entry model.ClientProtocolStats
 		if err := rows.Scan(
 			&entry.ClientProtocol,
+			&entry.SuccessRequests,
+			&entry.ErrorRequests,
+			&entry.TotalInputTokens,
+			&entry.TotalOutputTokens,
+			&entry.TotalCacheReadTokens,
+			&entry.TotalCacheCreationTokens,
+			&entry.TotalCost,
+			&entry.EffectiveCost,
+		); err != nil {
+			return nil, err
+		}
+		entry.TotalRequests = entry.SuccessRequests + entry.ErrorRequests
+		stats = append(stats, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+// GetAuthTypeStats 按渠道认证类型聚合首页统计。
+func (s *SQLStore) GetAuthTypeStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.AuthTypeStats, error) {
+	baseQuery := `
+		SELECT
+			COALESCE(channels.auth_type, '') AS auth_type,
+			SUM(CASE WHEN logs.status_code >= 200 AND logs.status_code < 300 THEN 1 ELSE 0 END) AS success,
+			SUM(CASE WHEN (logs.status_code < 200 OR logs.status_code >= 300) AND logs.status_code != 499 THEN 1 ELSE 0 END) AS error,
+			SUM(COALESCE(logs.input_tokens, 0)) AS total_input_tokens,
+			SUM(COALESCE(logs.output_tokens, 0)) AS total_output_tokens,
+			SUM(COALESCE(logs.cache_read_input_tokens, 0)) AS total_cache_read_tokens,
+			SUM(COALESCE(logs.cache_creation_input_tokens, 0)) AS total_cache_creation_tokens,
+			SUM(COALESCE(logs.cost, 0.0)) AS total_cost,
+			SUM(COALESCE(logs.cost, 0.0) * COALESCE(logs.cost_multiplier, 1)) AS effective_cost
+		FROM logs
+		INNER JOIN channels ON channels.id = logs.channel_id`
+
+	qb := NewQueryBuilder(baseQuery).
+		Where("logs.time >= ?", startTime.UnixMilli()).
+		Where("logs.time <= ?", endTime.UnixMilli()).
+		Where("logs.channel_id > 0")
+	qb.Where("channels.auth_type <> ?", "")
+
+	isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
+	if err != nil {
+		return nil, err
+	}
+	if isEmpty {
+		return []model.AuthTypeStats{}, nil
+	}
+	qb.ApplyFilter(filter)
+
+	query, args := qb.BuildWithSuffix("GROUP BY channels.auth_type ORDER BY channels.auth_type ASC")
+	rows, err := s.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	stats := make([]model.AuthTypeStats, 0)
+	for rows.Next() {
+		var entry model.AuthTypeStats
+		if err := rows.Scan(
+			&entry.AuthType,
 			&entry.SuccessRequests,
 			&entry.ErrorRequests,
 			&entry.TotalInputTokens,

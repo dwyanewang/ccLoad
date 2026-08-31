@@ -644,7 +644,7 @@ func TestRegistry_TranslateRequest_OpenAIToAnthropic(t *testing.T) {
 	}
 }
 
-func TestRegistry_TranslateRequestToAnthropicDoesNotFabricateSharedIdentity(t *testing.T) {
+func TestRegistry_TranslateRequestToAnthropicDerivesDeterministicIdentity(t *testing.T) {
 	tests := []struct {
 		name string
 		from protocol.Protocol
@@ -693,9 +693,16 @@ func TestRegistry_TranslateRequestToAnthropicDoesNotFabricateSharedIdentity(t *t
 			for err := range errors {
 				t.Fatalf("TranslateRequest failed: %v", err)
 			}
+			var wantID string
 			for out := range results {
-				if gjson.GetBytes(out, "metadata.user_id").Exists() {
-					t.Fatalf("translator fabricated process-global identity: %s", out)
+				gotID := gjson.GetBytes(out, "metadata.user_id").String()
+				if gotID == "" || gotID == "unknown" {
+					t.Fatalf("translator did not derive a stable identity: %s", out)
+				}
+				if wantID == "" {
+					wantID = gotID
+				} else if gotID != wantID {
+					t.Fatalf("concurrent translations derived different identities: got %q, want %q", gotID, wantID)
 				}
 			}
 		})
@@ -1245,6 +1252,29 @@ func TestRegistry_TranslateRequest_CodexBareMessageToAnthropic(t *testing.T) {
 	}
 }
 
+func TestRegistry_TranslateRequest_CodexToAnthropic_StringInput(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{"model":"claude-3-5-sonnet","input":"hello","stream":false}`)
+	got, err := reg.TranslateRequest(protocol.Codex, protocol.Anthropic, "claude-3-5-sonnet", raw, false)
+	if err != nil {
+		t.Fatalf("TranslateRequest failed: %v", err)
+	}
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(got, &req); err != nil {
+		t.Fatalf("unmarshal translated request: %v", err)
+	}
+	if len(req.Messages) != 1 || req.Messages[0].Role != "user" || protocolTestContentText(req.Messages[0].Content) != "hello" {
+		t.Fatalf("unexpected translated request: %s", got)
+	}
+}
+
 func TestRegistry_TranslateResponseNonStream_AnthropicToCodex(t *testing.T) {
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
@@ -1575,6 +1605,29 @@ func TestRegistry_TranslateRequest_CodexToOpenAI(t *testing.T) {
 	}
 	if !strings.Contains(string(got), `"type":"file"`) || !strings.Contains(string(got), `"role":"tool"`) {
 		t.Fatalf("unexpected translated openai request: %s", got)
+	}
+}
+
+func TestRegistry_TranslateRequest_CodexToOpenAI_StringInput(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{"model":"grok-4.6","input":"hello","stream":false}`)
+	got, err := reg.TranslateRequest(protocol.Codex, protocol.OpenAI, "grok-4.6", raw, false)
+	if err != nil {
+		t.Fatalf("TranslateRequest failed: %v", err)
+	}
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(got, &req); err != nil {
+		t.Fatalf("unmarshal translated request: %v", err)
+	}
+	if len(req.Messages) != 1 || req.Messages[0].Role != "user" || protocolTestContentText(req.Messages[0].Content) != "hello" {
+		t.Fatalf("unexpected translated request: %s", got)
 	}
 }
 

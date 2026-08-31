@@ -502,6 +502,28 @@ func TestBuildLogEntry_CopiesReasoningTokens(t *testing.T) {
 	}
 }
 
+func TestBuildLogEntry_ResponseModelDoesNotChangeBillingModel(t *testing.T) {
+	t.Parallel()
+
+	result := &fwResult{InputTokens: 1_000_000}
+	entry := buildLogEntry(logEntryParams{
+		RequestModel:  "client-model-alias",
+		ActualModel:   "gpt-5.4",
+		ResponseModel: "provider-reported-variant",
+		StatusCode:    http.StatusOK,
+		Result:        result,
+	})
+
+	wantCost := computeRequestCost("gpt-5.4", "", result)
+	if !floatEquals(entry.Cost, wantCost) {
+		t.Fatalf("cost=%.6f, want billing model cost %.6f", entry.Cost, wantCost)
+	}
+	if entry.ActualModel != "gpt-5.4" || entry.ResponseModel != "provider-reported-variant" {
+		t.Fatalf("actual_model=%q response_model=%q, want gpt-5.4 / provider-reported-variant",
+			entry.ActualModel, entry.ResponseModel)
+	}
+}
+
 func TestComputeRequestCost_ServiceTierAppliesOnlyAsOpenAIPriceMultiplier(t *testing.T) {
 	t.Parallel()
 
@@ -517,6 +539,36 @@ func TestComputeRequestCost_ServiceTierAppliesOnlyAsOpenAIPriceMultiplier(t *tes
 	want = util.CalculateCostDetailed("qwen3.5-plus", 300_000, 1_000_000, 0, 0, 0)
 	if !floatEquals(got, want) {
 		t.Fatalf("qwen priority cost=%.6f, want service_tier ignored cost %.6f", got, want)
+	}
+}
+
+func TestResolveBillingServiceTier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		requested string
+		observed  string
+		want      string
+	}{
+		{name: "upstream downgrade", requested: "priority", observed: "default", want: "default"},
+		{name: "anthropic downgrade", requested: "fast", observed: "standard", want: "standard"},
+		{name: "codex auto is explicit fast tier", requested: "priority", observed: "auto", want: "auto"},
+		{name: "codex auto is retained without request tier", requested: "", observed: "auto", want: "auto"},
+		{name: "ultrafast is retained when served", requested: "ultrafast", observed: "ultrafast", want: "ultrafast"},
+		{name: "ultrafast downgrade", requested: "ultrafast", observed: "priority", want: "priority"},
+		{name: "ultrafast response is billed at actual tier", requested: "priority", observed: "ultrafast", want: "ultrafast"},
+		{name: "ultrafast response is billed without request tier", requested: "", observed: "ultrafast", want: "ultrafast"},
+		{name: "missing response uses request", requested: "priority", observed: "", want: "priority"},
+		{name: "case and whitespace normalize", requested: " Priority ", observed: " DEFAULT ", want: "default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveBillingServiceTier(tt.requested, tt.observed); got != tt.want {
+				t.Fatalf("resolveBillingServiceTier(%q, %q)=%q, want %q", tt.requested, tt.observed, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1008,6 +1060,32 @@ func TestPrepareRequestBody_FuzzyMatch(t *testing.T) {
 				t.Errorf("body model = %q, want %q", gotModel, tt.wantBodyModel)
 			}
 		})
+	}
+}
+
+func TestAPIKeyModelScopeUsesLogicalModelBeforeRedirect(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{modelFuzzyMatch: true}
+	cfg := &model.Config{ModelEntries: []model.ModelEntry{
+		{Model: "gemini-3-flash-preview", RedirectModel: "alias"},
+		{Model: "alias", RedirectModel: "upstream"},
+	}}
+	keys := []*model.APIKey{
+		{APIKey: "sk-logical", AllowedModels: []string{"gemini-3-flash-preview"}},
+		{APIKey: "sk-upstream", AllowedModels: []string{"alias"}},
+	}
+
+	logicalModel := s.resolveChannelRoutingModel(cfg, "gemini-3-flash")
+	if logicalModel != "gemini-3-flash-preview" {
+		t.Fatalf("logical model=%q, want gemini-3-flash-preview", logicalModel)
+	}
+	if actualModel := s.resolveActualModel(cfg, "gemini-3-flash"); actualModel != "alias" {
+		t.Fatalf("actual model=%q, want historical single redirect to alias", actualModel)
+	}
+	filtered, scoped := filterAPIKeysForModel(keys, logicalModel)
+	if !scoped || len(filtered) != 1 || filtered[0].APIKey != "sk-logical" {
+		t.Fatalf("filtered keys=%v scoped=%v, want only logical-model key", filtered, scoped)
 	}
 }
 

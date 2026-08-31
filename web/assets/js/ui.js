@@ -1333,13 +1333,18 @@ window.WebAuth = window.WebAuth || {
   /**
    * 格式化成本（美元）
    * @param {number} cost - 成本值
+   * @param {number} [decimalPlaces=3] - 小数位数
    * @returns {string} 格式化后的字符串
    */
-  function formatCost(cost) {
+  function formatCost(cost, decimalPlaces) {
     const value = Number(cost);
     if (!Number.isFinite(value)) return '';
-    if (value === 0) return '$0';
-    return '$' + value.toFixed(3);
+    const hasExplicitDecimalPlaces = Number.isInteger(decimalPlaces);
+    const places = hasExplicitDecimalPlaces
+      ? Math.max(0, Math.min(6, decimalPlaces))
+      : 3;
+    if (value === 0) return hasExplicitDecimalPlaces && places > 0 ? '$0.' + '0'.repeat(places) : '$0';
+    return '$' + value.toFixed(places);
   }
 
   /**
@@ -1364,7 +1369,13 @@ window.WebAuth = window.WebAuth || {
   function formatCostMultiplier(multiplier) {
     const value = Number(multiplier);
     if (!Number.isFinite(value) || value < 0 || Math.abs(value - 1) < 1e-9) return '';
-    // 0 倍率（免费渠道）显示为 "0x"
+    return formatCostMultiplierValue(value);
+  }
+
+  // 区间端点必须显式显示 1x；单值倍率为 1 时才由上层整体隐藏。
+  function formatCostMultiplierValue(multiplier) {
+    const value = Number(multiplier);
+    if (!Number.isFinite(value) || value < 0) return '';
     return `${Number(value.toFixed(2)).toString()}x`;
   }
 
@@ -1405,7 +1416,7 @@ window.WebAuth = window.WebAuth || {
    * 构建两行成本显示HTML
    * @param {number} standard - 标准成本
    * @param {number|null|undefined} effective - 倍率后成本
-   * @param {{tone?: 'warning'|'success'}} options - 样式配置
+   * @param {{tone?: 'warning'|'success', decimalPlaces?: number}} options - 样式配置
    * @returns {string}
    */
   function buildCostStackHtml(standard, effective, options = {}) {
@@ -1422,24 +1433,35 @@ window.WebAuth = window.WebAuth || {
       classes.push('cost-stack--inline');
     }
 
+    const format = cost => formatCost(cost, options.decimalPlaces);
+
     if (!info.hasMultiplier) {
-      return `<span class="${classes.join(' ')}"><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+      return `<span class="${classes.join(' ')}"><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
     }
 
     if (inline) {
-      return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${formatCost(info.standardCost)}</span><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+      return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${format(info.standardCost)}</span><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
     }
 
-    return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${formatCost(info.standardCost)}</span><span class="cost-stack-effective">${formatCost(info.effectiveCost)}</span></span>`;
+    return `<span class="${classes.join(' ')}"><span class="cost-stack-standard">${format(info.standardCost)}</span><span class="cost-stack-effective">${format(info.effectiveCost)}</span></span>`;
   }
 
   /**
    * 构建单元格右上角倍率角标
-   * @param {number} multiplier - 倍率
+   * @param {number} multiplierMin - 倍率区间下限
+   * @param {number} multiplierMax - 倍率区间上限（缺省或等于下限时按单值显示）
    * @returns {string}
    */
-  function buildCornerMultiplierBadge(multiplier) {
-    const text = formatCostMultiplier(multiplier);
+  function buildCornerMultiplierBadge(multiplierMin, multiplierMax) {
+    const lo = Number(multiplierMin);
+    if (!Number.isFinite(lo)) return '';
+    const hi = Number(multiplierMax);
+    let text;
+    if (Number.isFinite(hi) && Math.abs(hi - lo) >= 1e-9) {
+      text = `${formatCostMultiplierValue(lo)}–${formatCostMultiplierValue(hi)}`;
+    } else {
+      text = formatCostMultiplier(lo);
+    }
     if (!text) return '';
     return `<sup class="cell-multiplier-badge">${text}</sup>`;
   }
@@ -1807,14 +1829,20 @@ window.WebAuth = window.WebAuth || {
       if (onSelect) onSelect(value, label);
     }
 
+    function commitOption(option) {
+      if (!option || option.disabled === true) return false;
+      commitValue(option.value, option.label);
+      return true;
+    }
+
     function commitFirstMatchedOrCancel() {
       const keyword = input.value.trim();
       if (!keyword) {
         if (commitEmptyAsFirst) {
           // 空输入回车/失焦时提交第一项（约定为“全部”），无论之前是否有选中值。
-          const opts = getOptions();
-          if (opts.length > 0) {
-            commitValue(opts[0].value, opts[0].label);
+          const option = getOptions().find(opt => opt.disabled !== true);
+          if (option) {
+            commitOption(option);
             return;
           }
         }
@@ -1836,20 +1864,22 @@ window.WebAuth = window.WebAuth || {
       if (allowCustomInput) {
         const normalizedKeyword = keyword.toLowerCase();
         const exactOption = getOptions().find((opt) => {
+          if (opt.disabled === true) return false;
           const label = String(opt.label || '').trim().toLowerCase();
           const value = String(opt.value || '').trim().toLowerCase();
           return label === normalizedKeyword || value === normalizedKeyword;
         });
         if (exactOption) {
-          commitValue(exactOption.value, exactOption.label);
+          commitOption(exactOption);
           return;
         }
         commitValue(keyword, keyword);
         return;
       }
       const items = getDropdownItems();
-      if (items.length > 0) {
-        commitValue(items[0].value, items[0].label);
+      const option = items.find(item => item.disabled !== true);
+      if (option) {
+        commitOption(option);
         return;
       }
       cancelPick();
@@ -1888,6 +1918,10 @@ window.WebAuth = window.WebAuth || {
         if (item.className) {
           row.classList.add(...String(item.className).split(/\s+/).filter(Boolean));
         }
+        if (item.disabled === true) {
+          row.classList.add('filter-dropdown-item--disabled');
+          row.setAttribute('aria-disabled', 'true');
+        }
 
         const selected = item.value === currentValue;
         row.setAttribute('aria-selected', selected ? 'true' : 'false');
@@ -1897,7 +1931,7 @@ window.WebAuth = window.WebAuth || {
         row.addEventListener('mousedown', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          commitValue(item.value, item.label);
+          commitOption(item);
         });
 
         dropdown.appendChild(row);
@@ -1927,8 +1961,10 @@ window.WebAuth = window.WebAuth || {
     }
 
     function openDropdown() {
-      if (dropdownHome && dropdown.parentElement !== document.body) {
-        document.body.appendChild(dropdown);
+      const dialog = input.closest('dialog');
+      const portalRoot = dialog?.open ? dialog : document.body;
+      if (dropdownHome && dropdown.parentElement !== portalRoot) {
+        portalRoot.appendChild(dropdown);
       }
       dropdown.style.display = 'block';
       dropdown.dataset.open = '1';
@@ -1953,11 +1989,14 @@ window.WebAuth = window.WebAuth || {
     function moveActive(delta) {
       const items = getDropdownItems();
       if (items.length <= 0) return;
-      if (activeIndex === -1) {
-        activeIndex = 0;
-      } else {
-        activeIndex = Math.max(0, Math.min(items.length - 1, activeIndex + delta));
+      let nextIndex = activeIndex;
+      if (nextIndex === -1) nextIndex = delta < 0 ? items.length : -1;
+      while (true) {
+        nextIndex += delta;
+        if (nextIndex < 0 || nextIndex >= items.length) return;
+        if (items[nextIndex].disabled !== true) break;
       }
+      activeIndex = nextIndex;
       renderDropdown();
     }
 
@@ -2016,7 +2055,7 @@ window.WebAuth = window.WebAuth || {
         if (dropdown.dataset.open === '1') {
           const items = getDropdownItems();
           if (activeIndex >= 0 && activeIndex < items.length) {
-            commitValue(items[activeIndex].value, items[activeIndex].label);
+            commitOption(items[activeIndex]);
             return;
           }
           commitFirstMatchedOrCancel();

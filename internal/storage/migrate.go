@@ -202,6 +202,19 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureAPIKeysNote(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys note: %w", err)
 			}
+			if err := ensureAPIKeysAllowedModels(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys allowed_models: %w", err)
+			}
+			if err := ensureAPIKeysModelScopeEmpty(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys model_scope_empty: %w", err)
+			}
+			if err := ensureAPIKeysCostMultiplier(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys cost_multiplier: %w", err)
+			}
+			// 一次性回填：api_key 渠道的倍率从 channels.cost_multiplier 下沉到每条 Key
+			if err := backfillAPIKeysCostMultiplier(ctx, db, dialect); err != nil {
+				return fmt.Errorf("backfill api_keys cost_multiplier: %w", err)
+			}
 		}
 
 		// 增量迁移：确保auth_tokens表有缓存token字段（2025-12新增）
@@ -454,6 +467,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"cooldown_min_seconds", "10", "int", "指数退避冷却下限(秒,>=1且必须<=cooldown_max_seconds)", "10"},
 		{config.CodexMap429To503SettingKey, "false", "bool", "所有上游候选均失败时，将返回给官方 Codex 客户端的最终 429 映射为 503，使其按 5xx 重试", "false"},
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
+		{"model_multimodal_fallback", "{}", "json", "多模态请求(含图片/文件等非文本内容)自动改用回退模型，JSON对象格式 {\"文本模型\":\"回退模型\"}", "{}"},
 		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
 		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},

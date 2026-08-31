@@ -18,6 +18,7 @@ type Store interface {
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
 	CompareAndSwapOAuthCredential(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
+	CompareAndSwapChannelManagement(ctx context.Context, channelID int64, expectedEnvelope, nextEnvelope string) (bool, error)
 	ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error
 	DisableOAuthChannelIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string) (bool, error)
 	DisableConfigIfOAuthSnapshotMatches(ctx context.Context, expected *model.Config) (bool, error)
@@ -45,6 +46,8 @@ type Store interface {
 	CreateAPIKeysBatch(ctx context.Context, keys []*model.APIKey) error
 	UpdateAPIKeysStrategy(ctx context.Context, channelID int64, strategy string) error
 	UpdateAPIKeyNotes(ctx context.Context, channelID int64, notesByIndex map[int]string) error
+	UpdateAPIKeyCostMultipliers(ctx context.Context, channelID int64, multipliersByIndex map[int]float64) error
+	UpdateAPIKeyModelScopes(ctx context.Context, channelID int64, scopesByIndex map[int]model.APIKeyModelScope) error
 	SetAPIKeyDisabled(ctx context.Context, channelID int64, keyIndex int, disabled bool) error
 	DeleteAPIKey(ctx context.Context, channelID int64, keyIndex int) error
 	CompactKeyIndices(ctx context.Context, channelID int64, removedIndex int) error
@@ -54,6 +57,8 @@ type Store interface {
 	ConfigureCooldown(settings util.CooldownSettings)
 	// Channel-level cooldown
 	GetAllChannelCooldowns(ctx context.Context) (map[int64]time.Time, error)
+	// 渠道基础信息批量查询（名称+优先级+倍率区间，统计与渠道列表角标共用）
+	FetchChannelInfoBatch(ctx context.Context, channelIDs map[int64]bool) (map[int64]model.ChannelInfo, error)
 	BumpChannelCooldown(ctx context.Context, channelID int64, now time.Time, statusCode int) (time.Duration, error)
 	ResetChannelCooldown(ctx context.Context, channelID int64) error
 	ResetAllCooldowns(ctx context.Context, channelID int64) error
@@ -94,6 +99,7 @@ type Store interface {
 	GetStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) ([]model.StatsEntry, error)
 	GetStatsLite(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.StatsEntry, error) // 轻量版：跳过RPM计算和渠道名填充
 	GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error)
+	GetAuthTypeStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.AuthTypeStats, error)
 	GetRPMStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (*model.RPMStats, error)
 	GetChannelSuccessRates(ctx context.Context, since time.Time) (map[int64]model.ChannelHealthStats, error)
 	GetHealthTimeline(ctx context.Context, params model.HealthTimelineParams) ([]model.HealthTimelineRow, error)

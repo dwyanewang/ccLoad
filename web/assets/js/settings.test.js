@@ -10,6 +10,9 @@ function flushAsyncWork() {
 async function loadSettingsPage(t, settings, inputValues) {
   const clickListeners = [];
   const bodyListeners = new Map();
+  const multimodalModalListeners = new Map();
+  const multimodalModalClasses = new Set();
+  let multimodalRows = [];
   const saveButton = {
     dataset: {},
     addEventListener(type, listener) {
@@ -17,6 +20,23 @@ async function loadSettingsPage(t, settings, inputValues) {
     },
     click() {
       for (const listener of clickListeners) listener();
+    }
+  };
+  const updateButton = {
+    dataset: { action: 'check-for-updates' },
+    disabled: false,
+    attributes: new Map(),
+    closest(selector) {
+      return selector === '[data-action="check-for-updates"]' ? this : null;
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    },
+    getAttribute(name) {
+      return this.attributes.get(name) ?? null;
+    },
+    removeAttribute(name) {
+      this.attributes.delete(name);
     }
   };
   const settingsBody = {
@@ -27,12 +47,73 @@ async function loadSettingsPage(t, settings, inputValues) {
     },
     appendChild() {}
   };
+  const multimodalApplyButton = {
+    dataset: { action: 'apply-multimodal-fallback' },
+    disabled: false,
+    attributes: new Map(),
+    click() {
+      multimodalModalListeners.get('click')?.({ target: this });
+    },
+    closest(selector) {
+      return selector === '[data-action]' ? this : null;
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    },
+    getAttribute(name) {
+      return this.attributes.get(name) ?? null;
+    },
+    removeAttribute(name) {
+      this.attributes.delete(name);
+    }
+  };
+  const multimodalModal = {
+    dataset: {},
+    attributes: new Map(),
+    classList: {
+      add(name) {
+        multimodalModalClasses.add(name);
+      },
+      remove(name) {
+        multimodalModalClasses.delete(name);
+      },
+      contains(name) {
+        return multimodalModalClasses.has(name);
+      }
+    },
+    addEventListener(type, listener) {
+      multimodalModalListeners.set(type, listener);
+    },
+    querySelector(selector) {
+      if (selector === '[data-action="apply-multimodal-fallback"]') return multimodalApplyButton;
+      return null;
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    }
+  };
+  const multimodalRowsContainer = {
+    querySelectorAll(selector) {
+      if (selector !== '.multimodal-fallback-row') return [];
+      return multimodalRows.map(({ from, to }) => ({
+        querySelector(fieldSelector) {
+          if (fieldSelector === 'select[data-field="from"]') return { value: from };
+          if (fieldSelector === 'select[data-field="to"]') return { value: to };
+          return null;
+        }
+      }));
+    }
+  };
+  const multimodalError = { textContent: '', hidden: true };
   const inputs = {};
   const rows = {};
   const radioGroups = new Map();
   const elements = new Map([
     ['save-all-btn', saveButton],
-    ['settings-tbody', settingsBody]
+    ['settings-tbody', settingsBody],
+    ['multimodalFallbackModal', multimodalModal],
+    ['multimodalFallbackRows', multimodalRowsContainer],
+    ['multimodalFallbackError', multimodalError]
   ]);
   const definitions = new Map(settings.map((setting) => [setting.key, setting]));
   for (const [key, value] of Object.entries(inputValues)) {
@@ -89,6 +170,10 @@ async function loadSettingsPage(t, settings, inputValues) {
   const requests = [];
   const renderCalls = [];
   const errors = [];
+  const successes = [];
+  let nextSaveError = null;
+  let nextUpdateError = null;
+  let nextUpdateResult = { has_update: false, latest_version: 'v1.0.0' };
 
   global.window = {
     t(key, params = {}) {
@@ -127,7 +212,7 @@ async function loadSettingsPage(t, settings, inputValues) {
   };
   global.escapeHtml = (value) => String(value);
   global.showError = (error) => { errors.push(error); };
-  global.showSuccess = () => {};
+  global.showSuccess = (message) => { successes.push(message); };
   global.confirm = (message) => {
     prompts.push(message);
     return allowSave;
@@ -135,6 +220,19 @@ async function loadSettingsPage(t, settings, inputValues) {
   global.fetchDataWithAuth = async (url, options) => {
     requests.push({ url, options });
     if (!options) return settings;
+    if (url === '/admin/update/check') {
+      if (nextUpdateError) {
+        const error = nextUpdateError;
+        nextUpdateError = null;
+        throw error;
+      }
+      return nextUpdateResult;
+    }
+    if (nextSaveError) {
+      const error = nextSaveError;
+      nextSaveError = null;
+      throw error;
+    }
     return { message: 'saved' };
   };
 
@@ -163,11 +261,33 @@ async function loadSettingsPage(t, settings, inputValues) {
     inputs,
     radioGroups,
     errors,
+    successes,
     notifications,
     prompts,
     renderCalls,
     requests,
     saveButton,
+    updateButton,
+    clickUpdate() {
+      bodyListeners.get('click')?.({ target: updateButton });
+    },
+    setUpdateResult(result) {
+      nextUpdateResult = result;
+    },
+    failNextUpdate(message) {
+      nextUpdateError = new Error(message);
+    },
+    multimodalApplyButton,
+    multimodalError,
+    multimodalModal,
+    applyMultimodal(rows) {
+      multimodalRows = rows;
+      multimodalModal.classList.add('show');
+      multimodalApplyButton.click();
+    },
+    failNextSave(message) {
+      nextSaveError = new Error(message);
+    },
     clickReset(key) {
       const listener = bodyListeners.get('click');
       listener?.({
@@ -411,6 +531,150 @@ test('全局冷却规则通过设置批量保存接口持久化', async (t) => {
   assert.deepEqual(JSON.parse(requests[0].options.body), { [key]: rules });
 });
 
+test('多模态回退映射在对话框内直接保存，无需再点保存所有更改', async (t) => {
+  const key = 'model_multimodal_fallback';
+  const mappings = '{"gpt-5.6-luna":"gemini-3-pro"}';
+  const page = await loadSettingsPage(t, [{
+    key,
+    value: '{}',
+    value_type: 'json',
+    description: ''
+  }], {
+    [key]: '{}'
+  });
+
+  page.applyMultimodal([{ from: 'gpt-5.6-luna', to: 'gemini-3-pro' }]);
+  await flushAsyncWork();
+
+  const requests = saveRequests(page);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { [key]: mappings });
+  assert.equal(page.prompts.length, 0);
+  assert.equal(page.inputs[key].value, mappings);
+  assert.equal(page.multimodalModal.classList.contains('show'), false);
+  assert.equal(page.multimodalApplyButton.disabled, false);
+  assert.equal(page.multimodalApplyButton.getAttribute('aria-busy'), null);
+
+  page.saveButton.click();
+  await flushAsyncWork();
+  assert.equal(saveRequests(page).length, 1);
+});
+
+test('多模态回退映射保存失败时保留对话框和原持久化值', async (t) => {
+  const key = 'model_multimodal_fallback';
+  const page = await loadSettingsPage(t, [{
+    key,
+    value: '{}',
+    value_type: 'json',
+    description: ''
+  }], {
+    [key]: '{}'
+  });
+  page.failNextSave('连接中断');
+
+  page.applyMultimodal([{ from: 'gpt-5.6-luna', to: 'gemini-3-pro' }]);
+  await flushAsyncWork();
+
+  assert.equal(saveRequests(page).length, 1);
+  assert.equal(page.inputs[key].value, '{}');
+  assert.equal(page.multimodalModal.classList.contains('show'), true);
+  assert.equal(page.multimodalError.hidden, false);
+  assert.match(page.multimodalError.textContent, /连接中断/);
+  assert.equal(page.multimodalApplyButton.disabled, false);
+  assert.equal(page.multimodalApplyButton.getAttribute('aria-busy'), null);
+});
+
+test('非容器更新渠道显示手动检测按钮并触发完整更新流程', async (t) => {
+  const page = await loadSettingsPage(t, [{
+    key: 'auto_update_channel',
+    value: 'stable',
+    value_type: 'string',
+    description: ''
+  }], {
+    auto_update_channel: 'stable'
+  });
+
+  const settingRow = page.renderCalls.find(({ template, data }) => (
+    template === 'tpl-setting-row' && data.key === 'auto_update_channel'
+  ));
+  assert.ok(settingRow);
+  assert.match(settingRow.data.inputHtml, /data-action="check-for-updates"/);
+
+  page.setUpdateResult({
+    has_update: true,
+    latest_version: 'v2.0.0',
+    pending_restart: true,
+    pending_version: 'v2.0.0'
+  });
+  page.clickUpdate();
+  assert.equal(page.updateButton.disabled, true);
+  assert.equal(page.updateButton.getAttribute('aria-busy'), 'true');
+
+  await flushAsyncWork();
+
+  const requests = page.requests.filter(({ url }) => url === '/admin/update/check');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, 'POST');
+  assert.equal(page.successes.length, 1);
+  assert.equal(page.successes[0], 'settings.updateCheck.pendingRestart');
+  assert.equal(page.updateButton.disabled, false);
+  assert.equal(page.updateButton.getAttribute('aria-busy'), null);
+});
+
+test('仅发现更新时不提示已开始下载', async (t) => {
+  const page = await loadSettingsPage(t, [{
+    key: 'auto_update_channel',
+    value: 'stable',
+    value_type: 'string',
+    description: ''
+  }], {
+    auto_update_channel: 'stable'
+  });
+
+  page.setUpdateResult({
+    has_update: true,
+    latest_version: 'v2.0.0',
+    pending_restart: false
+  });
+  page.clickUpdate();
+  await flushAsyncWork();
+
+  assert.equal(page.successes.length, 1);
+  assert.equal(page.successes[0], 'settings.updateCheck.found');
+
+  page.setUpdateResult({
+    has_update: false,
+    latest_version: 'v2.0.0',
+    pending_restart: false
+  });
+  page.clickUpdate();
+  await flushAsyncWork();
+
+  assert.equal(page.successes.length, 2);
+  assert.equal(page.successes[1], 'settings.updateCheck.upToDate');
+});
+
+test('手动检测更新失败时恢复按钮并显示错误', async (t) => {
+  const page = await loadSettingsPage(t, [{
+    key: 'auto_update_channel',
+    value: 'stable',
+    value_type: 'string',
+    description: ''
+  }], {
+    auto_update_channel: 'stable'
+  });
+  page.failNextUpdate('连接中断');
+
+  page.clickUpdate();
+  await flushAsyncWork();
+
+  assert.equal(page.requests.filter(({ url }) => url === '/admin/update/check').length, 1);
+  assert.equal(page.errors.length, 1);
+  assert.match(page.errors[0], /连接中断/);
+  assert.equal(page.updateButton.disabled, false);
+  assert.equal(page.updateButton.getAttribute('aria-busy'), null);
+});
+
 test('容器内禁用更新设置并显示镜像切换说明', async (t) => {
   const page = await loadSettingsPage(t, [
     {
@@ -443,4 +707,7 @@ test('容器内禁用更新设置并显示镜像切换说明', async (t) => {
     assert.match(data.inputHtml, /\bdisabled\b/);
     assert.equal(data.resetDisabledAttributes, 'disabled');
   }
+  const channelRow = settingRows.find(({ data }) => data.key === 'auto_update_channel');
+  assert.ok(channelRow);
+  assert.doesNotMatch(channelRow.data.inputHtml, /data-action="check-for-updates"/);
 });

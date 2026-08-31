@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -46,6 +48,7 @@ var (
 	errOAuthUsageUnsupported         = errors.New("usage: channel does not use a supported OAuth provider")
 	errZAIUsageManagerUnavailable    = errors.New("usage: Z.ai credential manager is unavailable")
 	errCursorUsageManagerUnavailable = errors.New("usage: Cursor credential manager is unavailable")
+	errZedUsageManagerUnavailable    = errors.New("usage: Zed credential manager is unavailable")
 	errCodexUsageManagerUnavailable  = errors.New("usage: Codex credential manager is unavailable")
 	errAnthropicManagerUnavailable   = errors.New("usage: Anthropic credential manager is unavailable")
 	errAntigravityManagerUnavailable = errors.New("usage: Antigravity credential manager is unavailable")
@@ -60,10 +63,12 @@ type oauthUsageBatchRequest struct {
 }
 
 type oauthUsageBatchResult struct {
-	ChannelID int64              `json:"channel_id"`
-	Status    string             `json:"status"`
-	Usage     *oauthUsageSummary `json:"usage,omitempty"`
-	Error     string             `json:"error,omitempty"`
+	ChannelID  int64                  `json:"channel_id"`
+	Status     string                 `json:"status"`
+	Usage      *oauthUsageSummary     `json:"usage,omitempty"`
+	Kind       string                 `json:"kind,omitempty"`
+	Management *channelManagementView `json:"management,omitempty"`
+	Error      string                 `json:"error,omitempty"`
 }
 
 type oauthUsageBatchEvent struct {
@@ -177,12 +182,13 @@ type antigravityUsagePayload struct {
 }
 
 type oauthUsageWindow struct {
-	LimitName          string  `json:"limit_name"`
-	Kind               string  `json:"kind"`
-	UsedPercent        float64 `json:"used_percent"`
-	RemainingPercent   float64 `json:"remaining_percent"`
-	LimitWindowSeconds int64   `json:"limit_window_seconds"`
-	ResetAt            int64   `json:"reset_at"`
+	LimitName          string    `json:"limit_name"`
+	Kind               string    `json:"kind"`
+	UsedPercent        float64   `json:"used_percent"`
+	RemainingPercent   float64   `json:"remaining_percent"`
+	LimitWindowSeconds int64     `json:"limit_window_seconds"`
+	ResetAt            int64     `json:"reset_at"`
+	SampledAt          time.Time `json:"-"`
 	// StandardCostMicroUSD 是该窗口自身的累计标准成本，仅在响应中内联，不入持久化快照。
 	StandardCostMicroUSD *int64 `json:"standard_cost_microusd,omitempty"`
 }
@@ -403,11 +409,15 @@ func (e *oauthUsageHTTPStatusError) Error() string {
 	return fmt.Sprintf("usage: %s request returned HTTP %d", e.provider, e.statusCode)
 }
 
+func validOAuthUsedPercent(usedPercent float64) bool {
+	return !math.IsNaN(usedPercent) && !math.IsInf(usedPercent, 0) && usedPercent >= 0 && usedPercent <= 100
+}
+
 func appendCodexUsageWindow(windows []oauthUsageWindow, limitName, kind string, raw *codexUsageRawWindow) []oauthUsageWindow {
-	if raw == nil || raw.UsedPercent == nil {
+	if raw == nil || raw.UsedPercent == nil || !validOAuthUsedPercent(*raw.UsedPercent) {
 		return windows
 	}
-	usedPercent := min(max(*raw.UsedPercent, 0), 100)
+	usedPercent := *raw.UsedPercent
 	return append(windows, oauthUsageWindow{
 		LimitName:          limitName,
 		Kind:               kind,
@@ -470,7 +480,10 @@ func appendAnthropicUsageWindow(
 	if raw == nil || raw.Utilization == nil {
 		return windows
 	}
-	usedPercent := min(max(*raw.Utilization, 0), 100)
+	usedPercent := *raw.Utilization
+	if !validOAuthUsedPercent(usedPercent) {
+		return windows
+	}
 	resetAt := int64(0)
 	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(raw.ResetsAt)); err == nil {
 		resetAt = parsed.Unix()
@@ -607,11 +620,15 @@ func normalizeAntigravityUsage(payload *antigravityUsagePayload) (*oauthUsageSum
 			if bucket.RemainingFraction == nil {
 				continue
 			}
-			remainingPercent := min(max(*bucket.RemainingFraction*100, 0), 100)
+			remainingPercent := *bucket.RemainingFraction * 100
+			usedPercent := 100 - remainingPercent
+			if !validOAuthUsedPercent(usedPercent) {
+				continue
+			}
 			summary.Windows = append(summary.Windows, oauthUsageWindow{
 				LimitName:          limitName,
 				Kind:               antigravityUsageBucketKind(bucket),
-				UsedPercent:        100 - remainingPercent,
+				UsedPercent:        usedPercent,
 				RemainingPercent:   remainingPercent,
 				LimitWindowSeconds: antigravityUsageWindowSeconds(bucket.Window),
 				ResetAt:            antigravityUsageResetAt(bucket.ResetTime),
@@ -671,6 +688,10 @@ func requestCodexUsage(ctx context.Context, client *http.Client, credential *cod
 	summary, err := normalizeCodexUsage(&payload, credential.PlanType)
 	if err != nil {
 		return nil, err
+	}
+	usageSampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		summary.Windows[i].SampledAt = usageSampledAt
 	}
 	resetCredits, resetErr := requestCodexResetCredits(ctx, client, credential, time.Now())
 	if resetErr != nil {
@@ -744,6 +765,10 @@ func requestAnthropicUsage(
 	summary, err := normalizeAnthropicUsage(&usagePayload)
 	if err != nil {
 		return nil, anthropicCredentialMetadata{}, err
+	}
+	usageSampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		summary.Windows[i].SampledAt = usageSampledAt
 	}
 	summary.PlanType = strings.TrimSpace(credential.PlanType)
 
@@ -1015,7 +1040,10 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		return oauthUsageWindow{}, false
 	}
 	if config.CreditUsagePercent != nil {
-		used := min(max(*config.CreditUsagePercent, 0), 100)
+		used := *config.CreditUsagePercent
+		if !validOAuthUsedPercent(used) {
+			return oauthUsageWindow{}, false
+		}
 		periodType := ""
 		periodStart, periodEnd := "", ""
 		if config.MonthlyLimit == nil && config.Used == nil {
@@ -1050,7 +1078,10 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		if !ok {
 			return oauthUsageWindow{}, false
 		}
-		used := min(max(*config.OnDemandUsed.Val*100 / *config.OnDemandCap.Val, 0), 100)
+		used, ok := usagePercentOf(*config.OnDemandUsed.Val, *config.OnDemandCap.Val)
+		if !ok {
+			return oauthUsageWindow{}, false
+		}
 		return oauthUsageWindow{
 			LimitName: label, Kind: normalizedXAIUsagePeriodKind(periodType, label),
 			UsedPercent: used, RemainingPercent: 100 - used,
@@ -1062,13 +1093,24 @@ func xaiUsageWindowFromConfig(config *xaiUsageConfig, label string) (oauthUsageW
 		if !ok {
 			return oauthUsageWindow{}, false
 		}
-		used := min(max(*config.Used.Val*100 / *config.MonthlyLimit.Val, 0), 100)
+		used, ok := usagePercentOf(*config.Used.Val, *config.MonthlyLimit.Val)
+		if !ok {
+			return oauthUsageWindow{}, false
+		}
 		return oauthUsageWindow{
 			LimitName: label, Kind: "monthly", UsedPercent: used, RemainingPercent: 100 - used,
 			LimitWindowSeconds: windowSeconds, ResetAt: resetAt,
 		}, true
 	}
 	return oauthUsageWindow{}, false
+}
+
+func usagePercentOf(used, limit float64) (float64, bool) {
+	if math.IsNaN(used) || math.IsInf(used, 0) || math.IsNaN(limit) || math.IsInf(limit, 0) ||
+		used < 0 || limit <= 0 {
+		return 0, false
+	}
+	return min(used*100/limit, 100), true
 }
 
 func xaiBillingSummaryFromConfig(config *xaiUsageConfig) *xaiBillingSummary {
@@ -1293,6 +1335,121 @@ func (s *Server) HandleOAuthUsageBatchStream(c *gin.Context) {
 	})
 }
 
+// HandleActiveChannelUsageBatchStream refreshes eligible channels from the
+// currently displayed list page. The server still verifies today's activity
+// and channel type instead of trusting the browser's selection.
+func (s *Server) HandleActiveChannelUsageBatchStream(c *gin.Context) {
+	var request oauthUsageBatchRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	requestedIDs := normalizeBatchChannelIDs(request.ChannelIDs)
+	if len(requestedIDs) == 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "channel_ids must not be empty")
+		return
+	}
+	if len(requestedIDs) > maxOAuthUsageBatchChannels {
+		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("channel_ids must contain at most %d channels", maxOAuthUsageBatchChannels))
+		return
+	}
+
+	channelIDs, err := s.activeChannelUsageIDs(c.Request.Context(), requestedIDs)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	s.streamChannelUsageBatch(c, channelIDs)
+}
+
+func (s *Server) streamChannelUsageBatch(c *gin.Context, channelIDs []int64) {
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Header("X-Content-Type-Options", "nosniff")
+	disableResponseWriteTimeout(c.Writer, "channel usage batch stream")
+	c.Status(http.StatusOK)
+	total := len(channelIDs)
+	if err := writeSSEEvent(c, "start", oauthUsageBatchEvent{Event: "start", Total: total}); err != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	processed, succeeded, failed := 0, 0, 0
+	for result := range s.runChannelUsageBatch(ctx, channelIDs) {
+		processed++
+		if result.Status == "succeeded" {
+			succeeded++
+		} else {
+			failed++
+		}
+		if err := writeSSEEvent(c, "progress", oauthUsageBatchEvent{
+			Event: "progress", Processed: processed, Total: total,
+			Succeeded: succeeded, Failed: failed, Result: &result,
+		}); err != nil {
+			return
+		}
+	}
+	if ctx.Err() == nil {
+		_ = writeSSEEvent(c, "complete", oauthUsageBatchEvent{
+			Event: "complete", Processed: processed, Total: total,
+			Succeeded: succeeded, Failed: failed,
+		})
+	}
+}
+
+func (s *Server) activeChannelUsageIDs(ctx context.Context, requestedIDs []int64) ([]int64, error) {
+	requested := make(map[int64]struct{}, len(requestedIDs))
+	for _, channelID := range requestedIDs {
+		requested[channelID] = struct{}{}
+	}
+	startTime, endTime := (&PaginationParams{Range: "today"}).GetTimeRange()
+	stats, err := s.statsCache.GetStatsLite(ctx, startTime, endTime, &model.LogFilter{LogSource: model.LogSourceProxy})
+	if err != nil {
+		return nil, err
+	}
+	active := make(map[int64]struct{}, len(stats))
+	for _, entry := range stats {
+		if entry.ChannelID == nil {
+			continue
+		}
+		channelID := int64(*entry.ChannelID)
+		if _, ok := requested[channelID]; ok {
+			active[channelID] = struct{}{}
+		}
+	}
+	configs, err := s.store.ListConfigs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int64, 0, min(len(active), len(requested)))
+	for _, cfg := range configs {
+		if cfg == nil {
+			continue
+		}
+		if _, ok := requested[cfg.ID]; !ok {
+			continue
+		}
+		if _, ok := active[cfg.ID]; !ok {
+			continue
+		}
+		if cfg.GetAuthType() == model.AuthTypeAPIKey {
+			view := s.managementAccountView(cfg)
+			if view != nil && view.CredentialConfigured {
+				channelIDs = append(channelIDs, cfg.ID)
+			}
+			continue
+		}
+		if cfg.UsesAntigravityOAuth() || cfg.UsesZAIOAuth() ||
+			cfg.UsesCursorOAuth() || cfg.UsesZedOAuth() {
+			channelIDs = append(channelIDs, cfg.ID)
+		}
+	}
+	sort.Slice(channelIDs, func(i, j int) bool { return channelIDs[i] < channelIDs[j] })
+	return channelIDs, nil
+}
+
 func (s *Server) refreshOAuthUsage(ctx context.Context, id int64) (*oauthUsageSummary, error) {
 	cfg, err := s.store.GetConfig(ctx, id)
 	if err != nil {
@@ -1306,6 +1463,11 @@ func (s *Server) refreshOAuthUsage(ctx context.Context, id int64) (*oauthUsageSu
 		return nil, err
 	}
 	sampledAt := time.Now().UTC()
+	for i := range summary.Windows {
+		if summary.Windows[i].SampledAt.IsZero() {
+			summary.Windows[i].SampledAt = sampledAt
+		}
+	}
 	summary, err = s.persistOAuthUsage(ctx, cfg, summary, requestedAt, sampledAt)
 	if err != nil {
 		return nil, errOAuthUsagePersistFailed
@@ -1324,7 +1486,8 @@ func oauthUsageHTTPStatus(err error) int {
 		errors.Is(err, errAntigravityManagerUnavailable),
 		errors.Is(err, errXAIUsageManagerUnavailable),
 		errors.Is(err, errZAIUsageManagerUnavailable),
-		errors.Is(err, errCursorUsageManagerUnavailable):
+		errors.Is(err, errCursorUsageManagerUnavailable),
+		errors.Is(err, errZedUsageManagerUnavailable):
 		return http.StatusServiceUnavailable
 	case errors.Is(err, errOAuthUsagePersistFailed):
 		return http.StatusInternalServerError
@@ -1334,6 +1497,14 @@ func oauthUsageHTTPStatus(err error) int {
 }
 
 func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-chan oauthUsageBatchResult {
+	return s.runUsageBatch(ctx, channelIDs, false)
+}
+
+func (s *Server) runChannelUsageBatch(ctx context.Context, channelIDs []int64) <-chan oauthUsageBatchResult {
+	return s.runUsageBatch(ctx, channelIDs, true)
+}
+
+func (s *Server) runUsageBatch(ctx context.Context, channelIDs []int64, includeAPIManagement bool) <-chan oauthUsageBatchResult {
 	results := make(chan oauthUsageBatchResult)
 	go func() {
 		defer close(results)
@@ -1345,11 +1516,17 @@ func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-c
 			go func() {
 				defer workers.Done()
 				for channelID := range jobs {
-					usage, err := s.refreshOAuthUsage(ctx, channelID)
-					result := oauthUsageBatchResult{ChannelID: channelID, Status: "succeeded", Usage: usage}
+					result := oauthUsageBatchResult{ChannelID: channelID, Status: "succeeded"}
+					var err error
+					if includeAPIManagement {
+						result.Kind, result.Usage, result.Management, err = s.refreshChannelUsage(ctx, channelID)
+					} else {
+						result.Usage, err = s.refreshOAuthUsage(ctx, channelID)
+					}
 					if err != nil {
 						result.Status = "failed"
 						result.Usage = nil
+						result.Management = nil
 						result.Error = err.Error()
 					}
 					select {
@@ -1374,6 +1551,22 @@ func (s *Server) runOAuthUsageBatch(ctx context.Context, channelIDs []int64) <-c
 		workers.Wait()
 	}()
 	return results
+}
+
+func (s *Server) refreshChannelUsage(ctx context.Context, channelID int64) (string, *oauthUsageSummary, *channelManagementView, error) {
+	cfg, err := s.store.GetConfig(ctx, channelID)
+	if err != nil {
+		return "", nil, nil, errOAuthUsageChannelNotFound
+	}
+	if cfg.GetAuthType() == model.AuthTypeAPIKey {
+		if s.channelManagement == nil {
+			return "management", nil, nil, errChannelManagementProviderUnavailable
+		}
+		view, err := s.channelManagement.RefreshBalance(ctx, channelID)
+		return "management", nil, view, err
+	}
+	usage, err := s.refreshOAuthUsage(ctx, channelID)
+	return "oauth", usage, nil, err
 }
 
 func (s *Server) persistOAuthUsage(
@@ -1465,6 +1658,10 @@ func (s *Server) invalidateOAuthCredential(channelID int64, provider string) {
 		if s.cursorCredentials != nil {
 			s.cursorCredentials.invalidate(channelID)
 		}
+	case zedauth.ChannelType:
+		if s.zedCredentials != nil {
+			s.zedCredentials.invalidate(channelID)
+		}
 	}
 }
 
@@ -1501,11 +1698,58 @@ func latestOAuthUsage(
 	}
 	passiveTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(passiveSampledAt))
 	if err == nil && passiveTime.After(activeSampledAt) {
+		if strings.EqualFold(strings.TrimSpace(active.Provider), codexauth.ChannelType) {
+			return mergeLatestCodexOAuthUsage(active, passive)
+		}
 		merged := *passive
 		merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
 		return &merged
 	}
 	return active
+}
+
+// mergeLatestCodexOAuthUsage lets a newer passive sample refresh windows that
+// are already present in the official usage snapshot. The passive stream can
+// expose transient or stale quota groups (for example codex|secondary after
+// the official endpoint stopped returning it); allowing those groups to
+// replace the whole snapshot makes the admin page display phantom windows.
+// The official window identities therefore define the result set.
+func mergeLatestCodexOAuthUsage(active, passive *oauthUsageSummary) *oauthUsageSummary {
+	if active == nil {
+		return passive
+	}
+	if passive == nil {
+		return active
+	}
+	merged := *active
+	passiveByKey := make(map[string][]oauthUsageWindow, len(passive.Windows))
+	for _, window := range passive.Windows {
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		passiveByKey[key] = append(passiveByKey[key], window)
+	}
+	merged.Windows = make([]oauthUsageWindow, 0, len(active.Windows))
+	for _, window := range active.Windows {
+		key := oauthcost.Key(window.LimitName, window.Kind)
+		candidates := passiveByKey[key]
+		if len(candidates) > 0 {
+			passiveWindow := candidates[0]
+			// The official snapshot owns the window identity, duration, and
+			// reset boundary. The passive stream contributes only fresher usage.
+			window.UsedPercent = passiveWindow.UsedPercent
+			window.RemainingPercent = passiveWindow.RemainingPercent
+			window.SampledAt = passiveWindow.SampledAt
+			merged.Windows = append(merged.Windows, window)
+			if len(candidates) == 1 {
+				delete(passiveByKey, key)
+			} else {
+				passiveByKey[key] = candidates[1:]
+			}
+			continue
+		}
+		merged.Windows = append(merged.Windows, window)
+	}
+	merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
+	return &merged
 }
 
 func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oauthUsageSummary, error) {
@@ -1597,7 +1841,40 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 		if err != nil {
 			return nil, oauthUsageCredentialRefreshError(err, "usage: Cursor credential refresh failed")
 		}
-		return requestCursorUsage(ctx, s.cursorUsageService(cfg), credential.AccessToken)
+		service := s.cursorUsageService(cfg)
+		for attempt := 0; attempt < 2; attempt++ {
+			summary, usageErr := requestCursorUsage(ctx, service, credential.AccessToken)
+			if !errors.Is(usageErr, cursorauth.ErrSessionRejected) {
+				return summary, usageErr
+			}
+			if attempt == 1 {
+				return nil, usageErr
+			}
+			credential, err = s.cursorCredentials.credentialAfterUnauthorized(ctx, cfg, credential.AccessToken)
+			if err != nil {
+				return nil, oauthUsageCredentialRefreshError(err, "usage: Cursor credential refresh failed")
+			}
+		}
+		return nil, errors.New("usage: Cursor session token was rejected")
+	case cfg.UsesZedOAuth():
+		if s.zedCredentials == nil {
+			return nil, errZedUsageManagerUnavailable
+		}
+		credential, err := s.zedCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: Zed credential refresh failed")
+		}
+		service := zedauth.NewService(s.getClientForChannel(cfg))
+		if s.zedService != nil {
+			service.CurrentUserURL = s.zedService.CurrentUserURL
+			service.LLMTokensURL = s.zedService.LLMTokensURL
+			service.ModelsURL = s.zedService.ModelsURL
+		}
+		usage, err := service.FetchUsage(ctx, credential)
+		if err != nil {
+			return nil, fmt.Errorf("usage: Zed quota request failed: %w", err)
+		}
+		return normalizeZedUsage(usage), nil
 	default:
 		return nil, errOAuthUsageUnsupported
 	}
@@ -1689,4 +1966,46 @@ func normalizeCursorUsage(usage *cursorauth.PeriodUsage) (*oauthUsageSummary, er
 		})
 	}
 	return summary, nil
+}
+
+func normalizeZedUsage(usage *zedauth.Usage) *oauthUsageSummary {
+	summary := &oauthUsageSummary{
+		Provider: zedauth.ChannelType, PlanType: "unknown",
+		Windows: make([]oauthUsageWindow, 0, 1),
+	}
+	if usage == nil {
+		return summary
+	}
+	if planType := strings.TrimSpace(usage.PlanType); planType != "" {
+		summary.PlanType = planType
+	}
+	if usage.AccountTooYoung {
+		summary.EntitlementStatus = "restricted"
+	} else if usage.Limit != nil && *usage.Limit > 0 {
+		used := int64(0)
+		if usage.Used != nil && *usage.Used > 0 {
+			used = *usage.Used
+		}
+		usedPercent := min(float64(used)*100/float64(*usage.Limit), 100)
+		resetAt := int64(0)
+		if reset, err := time.Parse(time.RFC3339, usage.SubscriptionEnd); err == nil {
+			resetAt = reset.Unix()
+		}
+		summary.Windows = append(summary.Windows, oauthUsageWindow{
+			LimitName: "model_requests", Kind: "requests", UsedPercent: usedPercent,
+			RemainingPercent: 100 - usedPercent, ResetAt: resetAt,
+		})
+		if used >= *usage.Limit {
+			summary.EntitlementStatus = "exhausted"
+		}
+	} else {
+		summary.EntitlementStatus = "unmetered"
+	}
+	if usage.Overdue {
+		summary.Warnings = append(summary.Warnings, "Zed account has overdue invoices")
+	}
+	if usage.UsageBasedBilling {
+		summary.Warnings = append(summary.Warnings, "Zed usage-based billing is enabled")
+	}
+	return summary
 }

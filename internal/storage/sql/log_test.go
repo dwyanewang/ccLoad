@@ -30,6 +30,8 @@ func TestLog_AddAndList(t *testing.T) {
 	log := &model.LogEntry{
 		Time:           newJSONTime(now),
 		Model:          "gpt-4",
+		ActualModel:    "gpt-4-sent",
+		ResponseModel:  "gpt-4-served",
 		ChannelID:      channelID,
 		ClientProtocol: "openai",
 		StatusCode:     200,
@@ -56,6 +58,9 @@ func TestLog_AddAndList(t *testing.T) {
 	}
 	if len(logs) > 0 && logs[0].ClientProtocol != "openai" {
 		t.Errorf("client_protocol: got %q, want openai", logs[0].ClientProtocol)
+	}
+	if len(logs) > 0 && (logs[0].ActualModel != "gpt-4-sent" || logs[0].ResponseModel != "gpt-4-served") {
+		t.Errorf("stored model metadata: actual=%q response=%q", logs[0].ActualModel, logs[0].ResponseModel)
 	}
 	if err := store.AddLog(ctx, &model.LogEntry{
 		Time:           newJSONTime(now.Add(time.Millisecond)),
@@ -233,6 +238,14 @@ func TestLog_BatchAccumulatesOAuthQuotaStandardCostByPeriod(t *testing.T) {
 				weekly.StandardCostMicroUSD, monthly.StandardCostMicroUSD, want)
 		}
 		return got
+	}
+	assertCosts(20_000_000)
+	// GPT-5.3-Codex-Spark 使用独立额度，不能污染 Codex 主周/月窗口。
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: newJSONTime(now.Add(4 * time.Second)), Model: "gpt-5.3-codex-spark",
+		ChannelID: created.ID, StatusCode: http.StatusOK, Cost: 1.5,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	assertCosts(20_000_000)
 

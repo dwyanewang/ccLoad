@@ -93,7 +93,11 @@ func (h *testCursorHandler) ListModels(
 	h.request = request.Msg
 	return connect.NewResponse(&sdkv1.ListModelsResponse{Items: []*sdkv1.SdkModel{
 		{Id: "grok-4.6", Variants: []*sdkv1.ModelVariant{{DisplayName: "High"}}},
-		{Id: "composer-2.5"},
+		{Id: "composer-2.5", Variants: []*sdkv1.ModelVariant{
+			{Params: []*sdkv1.ModelParameterValue{{Id: "fast", Value: "true"}}, IsDefault: true},
+			{Params: []*sdkv1.ModelParameterValue{{Id: "fast", Value: "false"}}},
+		}},
+		{Id: "composer-2.5-fast"},
 		{Id: "grok-4.6"},
 		{Id: "  "},
 	}}), nil
@@ -244,7 +248,7 @@ func TestSDKRunnerCreateAgentLocalDeadlineNamesOperationAndProxyDiagnostic(t *te
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	_, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, "model-1", "hello")
+	_, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 	if err == nil || !strings.Contains(err.Error(), "CreateAgent exceeded its local deadline after") ||
 		!strings.Contains(err.Error(), "operation limit=30s") ||
 		!strings.Contains(err.Error(), "inherited HTTP_PROXY/HTTPS_PROXY/ALL_PROXY") ||
@@ -470,7 +474,7 @@ func TestSDKRunnerCloseUsesProcessExitAsShutdownResult(t *testing.T) {
 	}
 }
 
-func TestSDKRunnerListModelsUsesExactSDKIDsWithoutExpandingVariants(t *testing.T) {
+func TestSDKRunnerListModelsAddsFastSuffix(t *testing.T) {
 	handler := &testCursorHandler{}
 	_, httpHandler := sdkv1connect.NewSdkCursorServiceHandler(handler)
 	server := httptest.NewServer(httpHandler)
@@ -485,7 +489,7 @@ func TestSDKRunnerListModelsUsesExactSDKIDsWithoutExpandingVariants(t *testing.T
 	if err != nil {
 		t.Fatalf("ListModels() error = %v", err)
 	}
-	want := []string{"grok-4.6", "composer-2.5"}
+	want := []string{"grok-4.6", "composer-2.5", "composer-2.5-fast"}
 	if !reflect.DeepEqual(models, want) {
 		t.Fatalf("ListModels() = %#v, want %#v", models, want)
 	}
@@ -690,7 +694,7 @@ func TestSDKRunnerAssistantBlocksAreChunksAndDeletesAgent(t *testing.T) {
 		return stream.Send(runDone("agent-1", "run-1"))
 	}
 	runner := newTestSDKRunner(t, handler)
-	events, err := runner.Run(context.Background(), &Credential{APIKey: "key-1"}, "model-1", "hello")
+	events, err := runner.Run(context.Background(), &Credential{APIKey: "key-1"}, Request{Model: "model-1-fast", Prompt: "hello"})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -724,6 +728,11 @@ func TestSDKRunnerAssistantBlocksAreChunksAndDeletesAgent(t *testing.T) {
 
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
+	selection := handler.create.GetOptions().GetModel()
+	if selection.GetId() != "model-1" || len(selection.GetParams()) != 1 ||
+		selection.GetParams()[0].GetId() != "fast" || selection.GetParams()[0].GetValue() != "true" {
+		t.Fatalf("CreateAgent model = %+v", selection)
+	}
 	if handler.create.GetOptions().GetApiKey() != "key-1" || handler.create.GetOptions().GetTools() == nil ||
 		len(handler.create.GetOptions().GetTools().GetNames()) != 0 {
 		t.Fatalf("CreateAgent request = %+v", handler.create)
@@ -747,8 +756,7 @@ func TestSDKRunnerDoesNotReplaySendAfterStreamTransportFailure(t *testing.T) {
 	events, runErr := runner.Run(
 		context.Background(),
 		&Credential{APIKey: "key-1"},
-		"model-1",
-		"hello",
+		Request{Model: "model-1", Prompt: "hello"},
 	)
 	if runErr == nil {
 		var final Event
@@ -805,7 +813,7 @@ func TestSDKRunnerKeepsInterimAssistantAndLoadsMissingUsageFromSnapshot(t *testi
 
 	runner := newTestSDKRunner(t, handler)
 	ctx := WithRawResponseCapture(context.Background())
-	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, "model-1", "hello")
+	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -871,7 +879,7 @@ func TestSDKRunnerSendFailureReturnsBeforeAgentCleanup(t *testing.T) {
 
 	returned := make(chan error, 1)
 	go func() {
-		_, err := runner.Run(context.Background(), &Credential{APIKey: "key-1"}, "model-1", "hello")
+		_, err := runner.Run(context.Background(), &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 		returned <- err
 	}()
 	select {
@@ -901,7 +909,7 @@ func TestSDKRunnerCallerCancellationInterruptsUsageFallback(t *testing.T) {
 	}
 	runner := newTestSDKRunner(t, handler)
 	ctx, cancel := context.WithCancel(context.Background())
-	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, "model-1", "hello")
+	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -940,7 +948,7 @@ func TestSDKRunnerCallerCancellationStopsSendWithoutRunID(t *testing.T) {
 	}
 	runner := newTestSDKRunner(t, handler)
 	ctx, cancel := context.WithCancel(context.Background())
-	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, "model-1", "hello")
+	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -981,6 +989,40 @@ func TestSDKRunnerCallerCancellationStopsSendWithoutRunID(t *testing.T) {
 	}
 	if handler.deleted == nil || handler.deleted.GetAgentId() != "agent-1" {
 		t.Fatalf("DeleteAgent request = %+v", handler.deleted)
+	}
+}
+
+func TestSDKRunnerClassifiesTerminalAuthenticationFailure(t *testing.T) {
+	handler := &testAgentHandler{}
+	handler.sendFn = func(_ context.Context, stream *connect.ServerStream[sdkv1.RunStreamMessage]) error {
+		if err := stream.Send(sdkMessage(t, "status", map[string]any{
+			"agent_id": "agent-1", "run_id": "run-1",
+			"message": "Authentication error If you are logged in, try logging out and back in.",
+		})); err != nil {
+			return err
+		}
+		if err := stream.Send(runResult(
+			"agent-1", "run-1", sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_ERROR, "",
+		)); err != nil {
+			return err
+		}
+		return stream.Send(runDone("agent-1", "run-1"))
+	}
+	runner := newTestSDKRunner(t, handler)
+	events, err := runner.Run(
+		context.Background(), &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"},
+	)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var runErr error
+	for event := range events {
+		if event.Done {
+			runErr = event.Err
+		}
+	}
+	if !IsCredentialRejected(runErr) {
+		t.Fatalf("terminal error = %v, want rejected credential", runErr)
 	}
 }
 

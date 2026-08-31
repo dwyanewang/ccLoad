@@ -20,6 +20,7 @@
   <script defer src="/web/assets/js/highlight.min.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/web-auth.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/searchable-select.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/marked.min.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/purify.min.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/markdown-renderer.js?v=__VERSION__"></script>
@@ -39,6 +40,7 @@
   <script defer src="/web/assets/js/channels-modals.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-custom-rules.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-cooldown-detection.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/channels-management.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-test.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-sort.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/channels-init.js?v=__VERSION__"></script>
@@ -105,12 +107,12 @@
           <div class="oauth-dialog-body">
             <p id="oauthLoginDialogDescription" class="oauth-dialog-description"
               data-i18n="channels.oauth.loginDialogDescription">
-              选择凭证类型，然后生成授权链接。
+              选择认证类型，然后生成授权链接。
             </p>
 
             <form id="oauthLoginForm" class="oauth-dialog-section">
               <div class="oauth-field">
-                <label for="oauthProviderSelect" data-i18n="channels.oauth.credentialType">凭证类型</label>
+                <label for="oauthProviderSelect" data-i18n="channels.oauth.credentialType">认证类型</label>
                 <select id="oauthProviderSelect" name="oauth_provider" class="form-input">
                   <option value="codex" data-i18n="channels.oauth.providerCodex">Codex</option>
                   <option value="antigravity" data-i18n="channels.oauth.providerAntigravity">Antigravity</option>
@@ -118,6 +120,7 @@
                   <option value="anthropic" data-i18n="channels.oauth.providerAnthropic">Anthropic</option>
                   <option value="zai" data-i18n="channels.oauth.providerZAI">Z.ai</option>
                   <option value="cursor" data-i18n="channels.oauth.providerCursor">Cursor</option>
+                  <option value="zed" data-i18n="channels.oauth.providerZed">Zed</option>
                 </select>
               </div>
               <div id="codexOAuthControls">
@@ -227,6 +230,17 @@
                     data-i18n="channels.cursor.apiKeyHint">提交后输入会立即从页面清除。ccLoad 用它换取 CLI 会话令牌。</p>
                 </div>
               </div>
+              <div id="zedOAuthControls" hidden>
+                <div class="oauth-field">
+                  <label for="zedSystemID" data-i18n="channels.zed.systemIDLabel">Zed system ID（可选）</label>
+                  <input id="zedSystemID" name="zed_system_id" type="text"
+                    class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
+                    placeholder="9d4b8c17-12ae-4091-96bc-1a79ce2de601"
+                    aria-describedby="zedSystemIDHint oauthLoginDialogStatus">
+                  <p id="zedSystemIDHint" class="oauth-field-hint"
+                    data-i18n="channels.zed.systemIDHint">本机运行 ccLoad 时会自动读取 Zed；远程或容器部署需要填写本机 Zed 数据库中的 system_id。</p>
+                </div>
+              </div>
               <div id="oauthLoginActions" class="oauth-actions">
                 <button id="oauthAuthorizeButton" type="submit" class="btn btn-primary"
                   data-i18n="channels.oauth.startAuthorization">开始授权</button>
@@ -293,7 +307,7 @@
               系统会自动判断凭证类型；无法判断的文件将跳过。
             </p>
             <div class="oauth-field">
-              <label for="oauthImportProviderSelect" data-i18n="channels.oauth.credentialType">凭证类型</label>
+              <label for="oauthImportProviderSelect" data-i18n="channels.oauth.credentialType">认证类型</label>
               <select id="oauthImportProviderSelect" name="oauth_import_provider" class="form-input">
                 <option value="auto" data-i18n="channels.oauth.providerAuto">自动判断</option>
                 <option value="codex" data-i18n="channels.oauth.providerCodex">Codex</option>
@@ -373,6 +387,7 @@
                   <option value="anthropic_oauth">Anthropic</option>
                   <option value="zai_oauth">Z.ai</option>
                   <option value="cursor_oauth">Cursor</option>
+                  <option value="zed_oauth">Zed</option>
                 </select>
               </div>
               <div class="oauth-field">
@@ -619,7 +634,7 @@
                     <span id="batchPriorityError" class="channel-batch-advanced__error" role="alert" hidden></span>
                   </div>
                   <div class="channel-batch-advanced__field">
-                    <label for="batchCostMultiplier" data-i18n="channels.batchCostMultiplier">倍率</label>
+                    <label for="batchCostMultiplier" data-i18n="channels.batchCostMultiplier">Key 倍率</label>
                     <div class="channel-batch-advanced__control">
                       <input id="batchCostMultiplier" class="channel-batch-input" type="number" value="1" min="0"
                         step="0.01" inputmode="decimal"
@@ -627,7 +642,7 @@
                       <button id="batchApplyCostMultiplierBtn" type="button"
                         class="btn btn-sm channel-batch-action channel-batch-action--apply"
                         data-action="batch-set-cost-multiplier" disabled>
-                        <span data-i18n="channels.batchApplyCostMultiplier">设置倍率</span>
+                        <span data-i18n="channels.batchApplyCostMultiplier">设置全部 Key 倍率</span>
                       </button>
                     </div>
                     <span id="batchCostMultiplierHint" class="channel-batch-advanced__hint"
@@ -973,14 +988,14 @@
                   <th data-i18n="channels.tableApiKey">API Key</th>
                   <th style="width: 220px;" data-i18n="channels.tableApiKeyNote">备注</th>
                   <th style="width: 200px;">
-                    <select id="keyStatusFilter" class="modal-inline-select" data-change-action="filter-keys-by-status"
-                      style="width: 100%; padding: 4px 8px; border: 1px solid var(--surface-border-strong); border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; background: var(--field-bg); color: var(--neutral-900);">
+                    <select id="keyStatusFilter" class="modal-inline-select" data-change-action="filter-keys-by-status">
                       <option value="all" data-i18n="channels.keyStatusAll">全部</option>
                       <option value="normal" data-i18n="channels.keyStatusNormal">正常</option>
                       <option value="cooldown" data-i18n="channels.keyStatusCooldown">冷却中</option>
                       <option value="disabled" data-i18n="channels.keyStatusDisabled">已禁用</option>
                     </select>
                   </th>
+                  <th style="width: 190px;" data-i18n="channels.costMultiplier">倍率</th>
                   <th style="width: 80px;"></th>
                 </tr>
               </thead>
@@ -1140,20 +1155,6 @@
                     placeholder="0=无限制">
                 </div>
               </div>
-              <div class="channel-editor-inline-field channel-editor-inline-field--rate">
-                <label class="form-label channel-editor-inline-label" for="channelCostMultiplier"
-                  data-i18n="channels.costMultiplier">倍率</label>
-                <div class="channel-editor-inline-field-input channel-editor-rate-input">
-                  <input type="number" id="channelCostMultiplier" class="form-input" value="1" min="0" step="0.01"
-                    style="width: 84px; min-width: 84px;" data-i18n-placeholder="channels.costMultiplierPlaceholder"
-                    placeholder="默认1">
-                  <button type="button" id="fetchSub2APIRateBtn" class="btn btn-secondary btn-sm channel-editor-rate-fetch-btn"
-                    data-action="fetch-sub2api-rate" data-i18n-title="channels.fetchRateTitle"
-                    title="从 Sub2API 获取当前有效倍率">
-                    <span id="fetchSub2APIRateLabel" data-i18n="channels.fetchRate">获取倍率</span>
-                  </button>
-                </div>
-              </div>
             </div>
             <div class="channel-editor-footer-actions">
               <label id="channelEnabledWrapper" class="form-label channel-editor-checkbox-label channel-editor-footer-enabled">
@@ -1169,7 +1170,7 @@
               </button>
               <button type="submit" id="channelSaveBtn" class="btn btn-primary channel-editor-footer-btn">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M5 12L10 17L19 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span data-i18n="common.save">保存</span>
+                <span id="channelSaveLabel" data-i18n="common.save">保存</span>
               </button>
             </div>
           </div>
@@ -1267,6 +1268,55 @@
           data-i18n="common.cancel">取消</button>
         <button type="button" class="btn btn-primary" data-action="confirm-common-models"
           data-i18n="channels.addSelectedCommonModels">添加所选模型</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- API Key 模型范围 -->
+  <div id="keyModelScopeModal" class="modal" role="dialog" aria-modal="true"
+    aria-labelledby="keyModelScopeModalTitle" aria-describedby="keyModelScopeDescription" aria-hidden="true">
+    <div class="modal-content modal-content--sm key-model-scope-modal-content">
+      <div class="modal-header">
+        <h2 id="keyModelScopeModalTitle" class="modal-title">Key 模型范围</h2>
+        <button type="button" class="close-btn" data-action="close-key-model-scope"
+          data-i18n-aria-label="common.close" aria-label="关闭">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true" focusable="false">
+            <path d="M10.5 3.5L3.5 10.5M3.5 3.5L10.5 10.5" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+      </div>
+      <p id="keyModelScopeDescription" class="common-models-description"
+        data-i18n="channels.keyModelsDialogDescription">限制此 Key 只处理选中的渠道模型。默认不限制，现有行为保持不变。</p>
+      <label class="key-model-scope-all">
+        <input type="checkbox" id="keyModelScopeAll" checked>
+        <span data-i18n="channels.keyModelsAllowAll">允许全部渠道模型</span>
+      </label>
+      <div class="key-model-scope-toolbar">
+        <input type="search" id="keyModelScopeSearch" class="form-input"
+          data-i18n-placeholder="channels.keyModelsSearch" placeholder="搜索模型">
+        <button type="button" id="detectKeyModelScopeBtn" class="btn btn-secondary btn-sm">
+          <span data-i18n="channels.keyModelsDetect">探测此 Key</span>
+        </button>
+      </div>
+      <fieldset class="key-model-scope-fieldset">
+        <legend class="key-model-scope-legend">
+          <label class="key-model-scope-toggle-all">
+            <input type="checkbox" id="keyModelScopeToggleAll"
+              data-i18n-aria-label="channels.keyModelsToggleVisible"
+              aria-label="全选或取消选择当前显示的模型">
+            <span data-i18n="channels.keyModelsLegend">可用渠道模型</span>
+          </label>
+          <span id="keyModelScopeSelectionCount" class="key-model-scope-selection-count" aria-live="polite"></span>
+        </legend>
+        <div id="keyModelScopeList" class="key-model-scope-list" aria-disabled="true"></div>
+      </fieldset>
+      <p id="keyModelScopeStatus" class="key-model-scope-status" role="status" aria-live="polite"></p>
+      <div class="form-actions common-models-actions">
+        <button type="button" class="btn btn-secondary" data-action="close-key-model-scope"
+          data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="confirm-key-model-scope"
+          data-i18n="common.confirm">确认</button>
       </div>
     </div>
   </div>
@@ -1403,9 +1453,9 @@
           </div>
         </div>
         <div class="codex-credential-toolbar">
-          <p class="codex-credential-description" data-i18n="channels.oauthCredentialFullDescription">默认显示解码视图；如需备份或复制用于重新导入，请切换到原始视图。</p>
+          <p id="codexCredentialViewDescription" class="codex-credential-description" data-i18n="channels.oauthCredentialFullDescription">默认显示解码视图；如需备份或复制用于重新导入，请切换到原始视图。</p>
           <div class="codex-credential-toolbar-actions">
-            <div class="codex-credential-view-switch" role="group" data-i18n-aria-label="channels.codex.credentialViewLabel" aria-label="凭证视图">
+            <div id="codexCredentialViewSwitch" class="codex-credential-view-switch" role="group" data-i18n-aria-label="channels.codex.credentialViewLabel" aria-label="凭证视图">
               <button type="button" class="btn btn-secondary btn-sm active" data-codex-credential-view="decoded" aria-pressed="true"
                 data-i18n="channels.codex.credentialViewDecoded">解码</button>
               <button type="button" class="btn btn-secondary btn-sm" data-codex-credential-view="raw" aria-pressed="false"
@@ -1436,35 +1486,31 @@
         <div class="advanced-settings-other-fields">
           <label class="advanced-settings-proxy-field" for="channelProxyURL">
             <span class="form-label" data-i18n="channels.proxyURL">代理</span>
-            <span class="advanced-settings-proxy-content">
-              <input type="text" id="channelProxyURL" class="form-input" value=""
-                data-i18n-placeholder="channels.proxyURLPlaceholder"
-                placeholder="http://… | https://… | socks5://… | socks5h://…"
-                aria-describedby="channelProxyURLHelp">
-              <small id="channelProxyURLHelp" class="advanced-settings-field-help"
-                data-i18n="channels.proxyURLHelp">例如 http://127.0.0.1:8080、https://proxy.example:8443、socks5://127.0.0.1:1080。</small>
-            </span>
+            <input type="text" id="channelProxyURL" class="form-input" value=""
+              data-i18n-placeholder="channels.proxyURLPlaceholder"
+              placeholder="http://… | https://… | socks5://… | socks5h://…"
+              aria-describedby="channelProxyURLHelp">
+            <small id="channelProxyURLHelp" class="advanced-settings-field-help"
+              data-i18n="channels.proxyURLHelp">例如 http://127.0.0.1:8080、https://proxy.example:8443、socks5://127.0.0.1:1080。</small>
           </label>
           <div class="advanced-settings-availability-row">
             <span class="form-label" data-i18n="channels.availableTime">可用时段</span>
-            <div class="advanced-settings-availability-content">
-              <div class="advanced-settings-time-fields">
-                <label class="advanced-settings-time-field" for="channelAvailableTimeStart">
-                  <input type="text" id="channelAvailableTimeStart" class="form-input" value=""
-                    inputmode="numeric" autocomplete="off" maxlength="5" pattern="[0-9]{2}:[0-9]{2}"
-                    placeholder="HH:MM" aria-label="开始时间" data-i18n-aria-label="channels.availableTimeStart"
-                    aria-describedby="channelAvailableTimeHelp">
-                </label>
-                <span aria-hidden="true">–</span>
-                <label class="advanced-settings-time-field" for="channelAvailableTimeEnd">
-                  <input type="text" id="channelAvailableTimeEnd" class="form-input" value=""
-                    inputmode="numeric" autocomplete="off" maxlength="5" pattern="[0-9]{2}:[0-9]{2}"
-                    placeholder="HH:MM" aria-label="结束时间" data-i18n-aria-label="channels.availableTimeEnd"
-                    aria-describedby="channelAvailableTimeHelp">
-                </label>
-              </div>
-              <small id="channelAvailableTimeHelp" class="advanced-settings-field-help" data-i18n="channels.availableTimeHelp">格式 HH:MM；留空表示全天可用，支持跨午夜时段，例如 22:00–08:00。</small>
+            <div class="advanced-settings-time-fields">
+              <label class="advanced-settings-time-field" for="channelAvailableTimeStart">
+                <input type="text" id="channelAvailableTimeStart" class="form-input" value=""
+                  inputmode="numeric" autocomplete="off" maxlength="5" pattern="[0-9]{2}:[0-9]{2}"
+                  placeholder="HH:MM" aria-label="开始时间" data-i18n-aria-label="channels.availableTimeStart"
+                  aria-describedby="channelAvailableTimeHelp">
+              </label>
+              <span aria-hidden="true">–</span>
+              <label class="advanced-settings-time-field" for="channelAvailableTimeEnd">
+                <input type="text" id="channelAvailableTimeEnd" class="form-input" value=""
+                  inputmode="numeric" autocomplete="off" maxlength="5" pattern="[0-9]{2}:[0-9]{2}"
+                  placeholder="HH:MM" aria-label="结束时间" data-i18n-aria-label="channels.availableTimeEnd"
+                  aria-describedby="channelAvailableTimeHelp">
+              </label>
             </div>
+            <small id="channelAvailableTimeHelp" class="advanced-settings-field-help" data-i18n="channels.availableTimeHelp">格式 HH:MM；留空表示全天可用，支持跨午夜时段，例如 22:00–08:00。</small>
           </div>
           <label class="form-label channel-editor-checkbox-label advanced-settings-retry-label" for="channelRetryOtherKeysOnFailure"
             title="渠道级或模型级上游故障时，先冷却当前 Key 并尝试同渠道的其他 Key；适用于不同 Key 对应不同服务商的中转站。"
@@ -1487,6 +1533,114 @@
               </div>
             </div>
           </div>
+          <fieldset id="channelManagementGroup" class="advanced-settings-management" hidden>
+            <legend class="advanced-settings-management-legend" data-i18n="channels.management.legend">管理账户</legend>
+            <div class="advanced-settings-other-field">
+              <label class="form-label" for="channelManagementProfile" data-i18n="channels.management.profile">管理类型</label>
+              <select id="channelManagementProfile" class="form-input"
+                aria-describedby="channelManagementProfileHelp channelManagementNotice">
+                <option value="" data-i18n="channels.management.profileOff">不启用</option>
+                <option value="new_api" data-i18n="channels.management.profileNewAPI">New API</option>
+                <option value="sub2api" data-i18n="channels.management.profileSub2API">标准 Sub2API</option>
+                <option value="sub2api_pro" data-i18n="channels.management.profileSub2APIPro">Sub2API Pro</option>
+              </select>
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementProfileHelp" class="advanced-settings-field-help" data-i18n="channels.management.profileHelp">选择上游面板类型后可刷新额度，New API 与 Sub2API Pro 还支持签到。</small>
+              </div>
+            </div>
+            <p id="channelManagementNotice" class="advanced-settings-management-notice" role="status" hidden></p>
+            <div id="channelManagementBaseURLField" class="advanced-settings-other-field" hidden>
+              <label class="form-label" for="channelManagementBaseURL" data-i18n="channels.management.baseURL">面板地址</label>
+              <input type="url" id="channelManagementBaseURL" class="form-input" autocomplete="off" spellcheck="false"
+                aria-describedby="channelManagementBaseURLHelp channelManagementBaseURLError">
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementBaseURLHelp" class="advanced-settings-field-help" data-i18n="channels.management.baseURLHelp">面板根地址，例如 https://panel.example.com,不要包含路径或查询参数。</small>
+                <small id="channelManagementBaseURLError" class="advanced-settings-management-error" role="status" hidden></small>
+              </div>
+            </div>
+            <div id="channelManagementTokenField" class="advanced-settings-other-field" hidden>
+              <label class="form-label" for="channelManagementToken" data-i18n="channels.management.token">管理凭据</label>
+              <input type="text" id="channelManagementToken" class="form-input" autocomplete="off" spellcheck="false"
+                aria-describedby="channelManagementTokenHelp channelManagementTokenHint channelManagementTokenError">
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementTokenHelp" class="advanced-settings-field-help"></small>
+                <small id="channelManagementTokenHint" class="advanced-settings-field-help" data-i18n="channels.management.tokenKeepHint" hidden>已配置凭据,留空表示保留现有凭据。</small>
+                <small id="channelManagementTokenError" class="advanced-settings-management-error" role="status" hidden></small>
+              </div>
+            </div>
+            <div id="channelManagementLoginField" class="advanced-settings-management-login" hidden>
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementLoginHelp" class="advanced-settings-field-help"
+                  data-i18n="channels.management.loginHelp">填写邮箱和密码后点击“登录”获取 refresh token。点“确定”写入渠道草稿，保存渠道后才会落库。邮箱和密码保存在管理凭证中，TOTP 不会保存。</small>
+              </div>
+              <div id="channelManagementRefreshTokenField" class="advanced-settings-other-field" hidden>
+                <label class="form-label" for="channelManagementRefreshToken" data-i18n="channels.management.refreshToken">Refresh Token</label>
+                <input type="text" id="channelManagementRefreshToken" class="form-input" autocomplete="off" spellcheck="false"
+                  readonly aria-describedby="channelManagementLoginHelp channelManagementRefreshTokenError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementRefreshTokenError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementEmail" data-i18n="channels.management.email">登录邮箱</label>
+                <input type="email" id="channelManagementEmail" class="form-input" autocomplete="off" spellcheck="false"
+                  maxlength="320" aria-describedby="channelManagementLoginHelp channelManagementEmailError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementEmailError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementPassword" data-i18n="channels.management.password">登录密码</label>
+                <input type="text" id="channelManagementPassword" class="form-input" autocomplete="off" spellcheck="false"
+                  maxlength="4096" autocapitalize="off" autocorrect="off"
+                  aria-describedby="channelManagementLoginHelp channelManagementPasswordError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementPasswordError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementTOTP" data-i18n="channels.management.totp">TOTP(可选)</label>
+                <input type="text" id="channelManagementTOTP" class="form-input" inputmode="numeric" autocomplete="one-time-code"
+                  maxlength="6" pattern="[0-9]{6}" aria-describedby="channelManagementTOTPHelp channelManagementTOTPError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementTOTPHelp" class="advanced-settings-field-help"
+                    data-i18n="channels.management.totpHelp">Sub2API 账户启用两步验证时填写当前 6 位验证码。</small>
+                  <small id="channelManagementTOTPError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+              <div class="advanced-settings-management-login-action">
+                <button type="button" id="channelManagementLoginBtn" class="btn btn-primary btn-sm" data-action="login-channel-management">
+                  <span data-i18n="channels.management.login">登录</span>
+                </button>
+              </div>
+            </div>
+            <div id="channelManagementUserIDField" class="advanced-settings-other-field" hidden>
+              <label class="form-label" for="channelManagementUserID" data-i18n="channels.management.userID">用户 ID</label>
+              <input type="text" id="channelManagementUserID" class="form-input" inputmode="numeric" autocomplete="off"
+                aria-describedby="channelManagementUserIDHelp channelManagementUserIDHint channelManagementUserIDError">
+              <div class="advanced-settings-field-meta">
+                <small id="channelManagementUserIDHelp" class="advanced-settings-field-help" data-i18n="channels.management.userIDHelp">可选,仅 New API 使用,填写后作为 New-API-User 请求头。</small>
+                <small id="channelManagementUserIDHint" class="advanced-settings-field-help" data-i18n="channels.management.userIDConfiguredHint" hidden>已配置用户 ID；更改管理凭据或面板地址后必须重新输入。</small>
+                <small id="channelManagementUserIDError" class="advanced-settings-management-error" role="status" hidden></small>
+              </div>
+            </div>
+            <div id="channelManagementCheckinField" class="advanced-settings-management-checkin" hidden>
+              <label class="form-label channel-editor-checkbox-label" for="channelManagementDailyCheckinEnabled">
+                <input type="checkbox" id="channelManagementDailyCheckinEnabled">
+                <span data-i18n="channels.management.dailyCheckin">每日自动签到</span>
+              </label>
+              <div class="advanced-settings-other-field">
+                <label class="form-label" for="channelManagementDailyCheckinTime" data-i18n="channels.management.dailyCheckinTime">签到时间</label>
+                <input type="text" id="channelManagementDailyCheckinTime" class="form-input" inputmode="numeric" autocomplete="off"
+                  maxlength="5" pattern="[0-9]{2}:[0-9]{2}" placeholder="HH:MM"
+                  aria-describedby="channelManagementDailyCheckinHelp channelManagementDailyCheckinTimeError">
+                <div class="advanced-settings-field-meta">
+                  <small id="channelManagementDailyCheckinHelp" class="advanced-settings-field-help" data-i18n="channels.management.dailyCheckinHelp">24 小时制 HH:MM,服务器本地时区每日执行一次签到。</small>
+                  <small id="channelManagementDailyCheckinTimeError" class="advanced-settings-management-error" role="status" hidden></small>
+                </div>
+              </div>
+            </div>
+          </fieldset>
         </div>
       </section>
 
@@ -1866,18 +2020,39 @@
           style="width: 100%; padding: 4px 7px; border: 1px solid var(--neutral-300); border-radius: 6px; font-family: 'Monaco', 'Menlo', 'Courier New', monospace; font-size: 13px; transition: all 0.2s;">
       </td>
       <td class="inline-key-col-note" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelNote}}">
-        <input type="text" value="{{note}}" class="inline-key-note-input modal-inline-input" data-index="{{index}}"
-          placeholder="{{notePlaceholder}}"
-          style="width: 100%; padding: 4px 7px; border: 1px solid var(--neutral-300); border-radius: 6px; font-size: 13px; transition: all 0.2s;">
+        <div class="inline-key-note-scope">
+          <input type="text" value="{{note}}" class="inline-key-note-input modal-inline-input" data-index="{{index}}"
+            placeholder="{{notePlaceholder}}"
+            style="width: 100%; padding: 4px 7px; border: 1px solid var(--neutral-300); border-radius: 6px; font-size: 13px; transition: border-color 0.2s, box-shadow 0.2s;">
+          <button type="button" class="key-action-btn key-model-scope-btn" data-action="models" data-index="{{index}}"
+            title="{{modelScopeTitle}}" aria-label="{{modelScopeTitle}}">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false">
+              <path d="M2.5 4.5H13.5M2.5 8H13.5M2.5 11.5H9.5" stroke="currentColor" stroke-width="1.3"
+                stroke-linecap="round" />
+            </svg>
+            <span>{{modelScopeLabel}}</span>
+          </button>
+        </div>
       </td>
       <td class="inline-key-col-status" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelStatus}}">{{{cooldownHtml}}}</td>
+      <td class="inline-key-col-multiplier" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelMultiplier}}">
+        <div class="inline-key-multiplier-scope">
+          <input type="number" value="{{costMultiplier}}" class="inline-key-multiplier-input modal-inline-input"
+            data-index="{{index}}" min="0" step="0.01" inputmode="decimal"
+            style="width: 58px; padding: 4px 5px; border: 1px solid var(--neutral-300); border-radius: 6px; font-size: 13px; transition: border-color 0.2s, box-shadow 0.2s;">
+          <button type="button" class="key-action-btn key-fetch-rate-btn" data-action="fetch-rate"
+            data-index="{{index}}" title="{{fetchRateTitle}}" aria-label="{{fetchRateTitle}}">
+            <span style="font-size: 12px;">{{fetchRateLabel}}</span>
+          </button>
+        </div>
+      </td>
       <td class="inline-key-col-actions" style="padding: 4px 8px; text-align: center;" data-mobile-label="{{mobileLabelActions}}">{{{actionsHtml}}}</td>
     </tr>
   </template>
 
   <template id="tpl-key-empty">
     <tr>
-      <td colspan="5" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
+      <td colspan="6" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
         {{message}}
       </td>
     </tr>
@@ -2007,7 +2182,6 @@
       </td>
       <td class="ch-col-duration {{durationCellClass}}" data-mobile-label="{{mobileLabelDuration}}">{{{durationHtml}}}</td>
       <td class="ch-col-usage {{usageCellClass}}" data-mobile-label="{{mobileLabelUsage}}">{{{usageHtml}}}</td>
-      <td class="ch-col-cost {{costCellClass}}" data-mobile-label="{{mobileLabelCost}}">{{{costHtml}}}</td>
       <td class="ch-col-last-success {{lastSuccessCellClass}}" data-mobile-label="{{mobileLabelLastSuccess}}">{{{runtimeStatusHtml}}}</td>
       <td class="ch-col-enabled" data-mobile-label="{{mobileLabelEnabled}}">
         <button class="channel-enable-switch channel-action-btn {{toggleSwitchClass}}" data-action="toggle"

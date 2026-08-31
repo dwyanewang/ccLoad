@@ -37,8 +37,11 @@ func ConvertOpenAIResponsesRequestToClaudeWithCompat(modelName string, inputRawJ
 func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte, stream, preserveEmptyThinkingBlocks bool) []byte {
 	rawJSON := inputRawJSON
 
+	userID := common.DeriveClaudeUserID(rawJSON)
+
 	// Base Claude message payload
-	out := []byte(`{"model":"","max_tokens":32000,"messages":[]}`)
+	out := []byte(`{"model":"","max_tokens":32000,"messages":[],"metadata":{}}`)
+	out, _ = sjson.SetBytes(out, "metadata.user_id", userID)
 
 	root := gjson.ParseBytes(rawJSON)
 
@@ -187,7 +190,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			msg, _ = sjson.SetBytes(msg, "role", pendingRole)
 			if len(parts) == 1 {
 				part := gjson.ParseBytes(parts[0])
-				if part.Get("type").String() == "text" && !part.Get("cache_control").Exists() {
+				if part.Get("type").String() == "text" && !part.Get("cache_control").Exists() && !part.Get("citations").Exists() {
 					msg, _ = sjson.SetBytes(msg, "content", part.Get("text").String())
 				} else {
 					msg, _ = sjson.SetRawBytes(msg, "content", common.JoinRawArray(parts))
@@ -262,6 +265,7 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 								txt := t.String()
 								contentPart := []byte(`{"type":"text","text":""}`)
 								contentPart, _ = sjson.SetBytes(contentPart, "text", txt)
+								contentPart = attachClaudeCitations(contentPart, part.Get("annotations"))
 								contentPart = common.AttachCacheControl(contentPart, part)
 								partsJSON = append(partsJSON, contentPart)
 							}
@@ -270,6 +274,15 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 							} else {
 								role = "assistant"
 							}
+						case "refusal":
+							// Claude has no refusal block; text keeps the assistant turn intact.
+							if t := part.Get("refusal"); t.Exists() && t.String() != "" {
+								contentPart := []byte(`{"type":"text","text":""}`)
+								contentPart, _ = sjson.SetBytes(contentPart, "text", t.String())
+								contentPart = common.AttachCacheControl(contentPart, part)
+								partsJSON = append(partsJSON, contentPart)
+							}
+							role = "assistant"
 						case "input_image":
 							url := part.Get("image_url").String()
 							if url == "" {
@@ -357,6 +370,11 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 					appendParts(role, partsJSON...)
 				}
 
+			case "web_search_call":
+				if blocks := convertResponsesWebSearchCallToClaudeBlocks(item); len(blocks) > 0 {
+					appendParts("assistant", blocks...)
+				}
+
 			case "reasoning":
 				if thinkingPart := convertResponsesReasoningToClaudeThinking(item, preserveEmptyThinkingBlocks); len(thinkingPart) > 0 {
 					appendParts("assistant", thinkingPart)
@@ -418,8 +436,20 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			return true
 		})
+	} else if input := root.Get("input"); input.Type == gjson.String {
+		// The Responses API accepts a plain string as input. Upstream only
+		// converts array input and would silently drop the prompt; ccLoad maps
+		// it to a single user message, matching the Gemini and OpenAI target
+		// converters.
+		msg := []byte(`{"role":"user","content":""}`)
+		msg, _ = sjson.SetBytes(msg, "content", input.String())
+		appendMessage(msg)
 	}
 	flushPendingMessage()
+	hadMessages := len(messageBlocks) > 0
+	if !preserveEmptyThinkingBlocks {
+		messageBlocks = dropUnsupportedFableAssistantPrefill(modelName, messageBlocks)
+	}
 	// ccLoad's wire contract represents system-only input as the sole user turn;
 	// otherwise the request has instructions but no actual prompt.
 	if len(messageBlocks) == 0 && len(systemBlocks) > 0 {
@@ -427,6 +457,8 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		message, _ = sjson.SetRawBytes(message, "content", common.JoinRawArray(systemBlocks))
 		messageBlocks = append(messageBlocks, message)
 		systemBlocks = nil
+	} else if len(messageBlocks) == 0 && hadMessages {
+		messageBlocks = append(messageBlocks, []byte(`{"role":"user","content":[{"type":"text","text":""}]}`))
 	}
 	out = common.SetRawArrayItems(out, "messages", messageBlocks)
 	if len(systemBlocks) > 0 {
@@ -522,6 +554,20 @@ func isResponsesSystemLevelRole(role string) bool {
 	default:
 		return false
 	}
+}
+
+// dropUnsupportedFableAssistantPrefill removes the trailing assistant message
+// rejected by Claude Fable models.
+func dropUnsupportedFableAssistantPrefill(modelName string, messages [][]byte) [][]byte {
+	normalized := strings.ToLower(strings.TrimSpace(modelName))
+	if !strings.Contains(normalized, "fable") || len(messages) == 0 {
+		return messages
+	}
+	last := gjson.ParseBytes(messages[len(messages)-1])
+	if !strings.EqualFold(strings.TrimSpace(last.Get("role").String()), "assistant") {
+		return messages
+	}
+	return messages[:len(messages)-1]
 }
 
 // responsesSystemUnsupportedBlock represents a system-level content part that

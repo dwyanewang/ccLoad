@@ -5,7 +5,7 @@
 # ============================================
 # 阶段1: 基础工具链 (与 TARGETPLATFORM 无关，可复用)
 # ============================================
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS base
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS base
 
 # 安装交叉编译工具链（这层很少变，缓存命中率高）
 COPY --from=tonistiigi/xx:1.9.0 / /
@@ -104,6 +104,6 @@ ENV PORT=8080 \
     CCLOAD_CONTAINER=1
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --output-document=/dev/null http://localhost:8080/health || exit 1
+    CMD wget -q -O /dev/null --tries=1 http://localhost:8080/health || exit 1
 
 CMD ["./ccload"]

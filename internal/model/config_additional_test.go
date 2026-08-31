@@ -290,6 +290,31 @@ func TestAPIKey_IsCoolingDown(t *testing.T) {
 	}
 }
 
+func TestAPIKey_AllowsModel(t *testing.T) {
+	t.Parallel()
+
+	unrestricted := &APIKey{}
+	if !unrestricted.AllowsModel("gpt-5") {
+		t.Fatal("empty allowlist must preserve unrestricted behavior")
+	}
+
+	restricted := &APIKey{AllowedModels: []string{"GPT-5", "claude-sonnet-4(max)"}}
+	if !restricted.AllowsModel("gpt-5") {
+		t.Fatal("model matching should be case-insensitive")
+	}
+	if !restricted.AllowsModel("claude-sonnet-4") {
+		t.Fatal("thinking suffix must not change model identity")
+	}
+	if restricted.AllowsModel("qwen3") {
+		t.Fatal("unlisted model must be rejected")
+	}
+
+	empty := &APIKey{ModelScopeEmpty: true}
+	if empty.AllowsModel("gpt-5") || empty.AllowsModel("*") {
+		t.Fatal("explicit empty model scope must reject every model")
+	}
+}
+
 func TestDefaultHealthScoreConfig(t *testing.T) {
 	t.Parallel()
 
@@ -372,5 +397,13 @@ func TestConfig_CursorOAuthAuthType(t *testing.T) {
 	if NormalizeAuthType(AuthTypeCursorOAuth) != AuthTypeCursorOAuth ||
 		!cfg.UsesCursorOAuth() || !cfg.UsesOAuth() || cfg.UsesZAIOAuth() {
 		t.Fatalf("Cursor OAuth auth type was not isolated: %+v", cfg)
+	}
+}
+
+func TestConfig_ZedOAuthAuthType(t *testing.T) {
+	cfg := &Config{AuthType: AuthTypeZedOAuth}
+	if NormalizeAuthType(AuthTypeZedOAuth) != AuthTypeZedOAuth ||
+		!cfg.UsesZedOAuth() || !cfg.UsesOAuth() || cfg.UsesCodexOAuth() {
+		t.Fatalf("Zed OAuth auth type was not isolated: %+v", cfg)
 	}
 }

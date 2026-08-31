@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
+	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
@@ -100,8 +102,8 @@ func TestXAIChannelResponsesExposeOnlySafeOAuthMetadata(t *testing.T) {
 		Keys            []*model.APIKey     `json:"keys"`
 		OAuthCredential json.RawMessage     `json:"oauth_credential"`
 	}](t, editorResponse.Body.Bytes())
-	if editor.Data.Keys == nil || len(editor.Data.Keys) != 0 {
-		t.Fatalf("editor keys=%#v, want []", editor.Data.Keys)
+	if len(editor.Data.Keys) != 1 || editor.Data.Keys[0].APIKey != util.MaskAPIKey(credential.AccessToken) || editor.Data.Keys[0].CostMultiplier != created.CostMultiplier {
+		t.Fatalf("editor keys=%#v, want masked synthetic key with current multiplier", editor.Data.Keys)
 	}
 	if string(editor.Data.OAuthCredential) != credentialJSON {
 		t.Fatalf("editor oauth_credential=%s, want canonical credential %s", editor.Data.OAuthCredential, credentialJSON)
@@ -382,6 +384,18 @@ func TestHandleAddAndDeleteModels(t *testing.T) {
 		}
 	})
 
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-restricted", AllowedModels: []string{"m1", "M2"}},
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-unrestricted"},
+		{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "sk-only-removed", AllowedModels: []string{"m2"}},
+		{ChannelID: cfg.ID, KeyIndex: 3, APIKey: "sk-manual-off", Disabled: true},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+	if cachedKeys, err := server.getAPIKeys(ctx, cfg.ID); err != nil || len(cachedKeys) != 4 {
+		t.Fatalf("prewarm API key cache = (%d, %v), want (4, nil)", len(cachedKeys), err)
+	}
+
 	t.Run("delete success", func(t *testing.T) {
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodDelete, "/admin/channels/1/models", []byte(`{"models":["m2","absent"]}`)))
 		c.Params = gin.Params{{Key: "id", Value: "1"}}
@@ -397,6 +411,21 @@ func TestHandleAddAndDeleteModels(t *testing.T) {
 		}
 		if len(updated.ModelEntries) != 1 || updated.ModelEntries[0].Model != "m1" {
 			t.Fatalf("unexpected remaining models: %#v", updated.ModelEntries)
+		}
+		keys, err := server.getAPIKeys(ctx, cfg.ID)
+		if err != nil {
+			t.Fatalf("getAPIKeys after model deletion failed: %v", err)
+		}
+		if len(keys) != 4 || !slices.Equal(keys[0].AllowedModels, []string{"m1"}) || len(keys[1].AllowedModels) != 0 ||
+			len(keys[2].AllowedModels) != 0 || !keys[2].ModelScopeEmpty || !keys[2].Disabled || !keys[3].Disabled {
+			t.Fatalf("unexpected key model scopes after model deletion: %#v", keys)
+		}
+		available := availableModelFetchAPIKeys(keys, time.Now())
+		if !slices.ContainsFunc(available, func(key *model.APIKey) bool { return key.KeyIndex == 2 }) {
+			t.Fatalf("scope-auto-disabled key must stay eligible for read-only model discovery: %#v", available)
+		}
+		if slices.ContainsFunc(available, func(key *model.APIKey) bool { return key.KeyIndex == 3 }) {
+			t.Fatalf("manually disabled key must stay excluded: %#v", available)
 		}
 	})
 }
@@ -766,6 +795,14 @@ func TestHandleBatchPatchChannels(t *testing.T) {
 	c2 := createChannel("protocol-local", model.ProtocolTransformModeLocal)
 	c3 := createChannel("protocol-upstream", model.ProtocolTransformModeUpstream)
 
+	// c2 挂两个 API Key：批量倍率对 api_key 渠道必须落到 Key 级（Key 级成本倍率契约）
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: c2.ID, KeyIndex: 0, APIKey: "sk-test-batch-key-0", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: c2.ID, KeyIndex: 1, APIKey: "sk-test-batch-key-1", KeyStrategy: model.KeyStrategySequential},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch c2 failed: %v", err)
+	}
+
 	t.Run("invalid json", func(t *testing.T) {
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/channels/batch-advanced", []byte(`{`)))
 
@@ -908,8 +945,9 @@ func TestHandleBatchPatchChannels(t *testing.T) {
 			if cfg.Priority != -20 {
 				t.Fatalf("channel %d priority=%d, want -20", channelID, cfg.Priority)
 			}
-			if cfg.CostMultiplier != 0.25 {
-				t.Fatalf("channel %d cost_multiplier=%v, want 0.25", channelID, cfg.CostMultiplier)
+			// api_key 渠道的批量倍率落到 Key 级，渠道列保持不变（0=未设置）
+			if cfg.CostMultiplier != 0 {
+				t.Fatalf("channel %d cost_multiplier=%v, want unchanged (0)", channelID, cfg.CostMultiplier)
 			}
 			if cfg.DailyCostLimit != 12.5 || cfg.RPMLimit != 60 || cfg.MaxConcurrency != 3 {
 				t.Fatalf("channel %d limits=(%v, %d, %d), want (12.5, 60, 3)",
@@ -917,6 +955,16 @@ func TestHandleBatchPatchChannels(t *testing.T) {
 			}
 			if len(cfg.ModelEntries) != 2 || cfg.ModelEntries[1].Model != "new-model" || cfg.ModelEntries[1].RedirectModel != "upstream-model" {
 				t.Fatalf("channel %d models=%+v", channelID, cfg.ModelEntries)
+			}
+		}
+
+		keys, err := store.GetAPIKeys(ctx, c2.ID)
+		if err != nil || len(keys) != 2 {
+			t.Fatalf("c2 keys len=%d err=%v, want 2", len(keys), err)
+		}
+		for _, key := range keys {
+			if key.CostMultiplier != 0.25 {
+				t.Fatalf("c2 key %d cost_multiplier=%v, want 0.25", key.KeyIndex, key.CostMultiplier)
 			}
 		}
 	})

@@ -55,8 +55,9 @@ type HealthPoint struct {
 type StatsEntry struct {
 	ChannelID               *int     `json:"channel_id,omitempty"`
 	ChannelName             string   `json:"channel_name"`
-	ChannelPriority         *int     `json:"channel_priority,omitempty"` // 渠道优先级（用于前端排序）
-	CostMultiplier          *float64 `json:"cost_multiplier,omitempty"`  // 渠道配置倍率（默认1，前端角标仅显示该值）
+	ChannelPriority         *int     `json:"channel_priority,omitempty"`    // 渠道优先级（用于前端排序）
+	CostMultiplierMin       *float64 `json:"cost_multiplier_min,omitempty"` // 成本倍率区间下限（默认1，api_key 渠道为启用 Key 的最小倍率）
+	CostMultiplierMax       *float64 `json:"cost_multiplier_max,omitempty"` // 成本倍率区间上限；min 与 max 都为 1 时不下发
 	Model                   string   `json:"model"`
 	Success                 int      `json:"success"`
 	Error                   int      `json:"error"`
@@ -90,6 +91,20 @@ type StatsEntry struct {
 // ClientProtocolStats 按客户端入口协议聚合首页统计。
 type ClientProtocolStats struct {
 	ClientProtocol           string  `json:"client_protocol"`
+	TotalRequests            int     `json:"total_requests"`
+	SuccessRequests          int     `json:"success_requests"`
+	ErrorRequests            int     `json:"error_requests"`
+	TotalInputTokens         int64   `json:"total_input_tokens,omitempty"`
+	TotalOutputTokens        int64   `json:"total_output_tokens,omitempty"`
+	TotalCacheReadTokens     int64   `json:"total_cache_read_tokens,omitempty"`
+	TotalCacheCreationTokens int64   `json:"total_cache_creation_tokens,omitempty"`
+	TotalCost                float64 `json:"total_cost,omitempty"`
+	EffectiveCost            float64 `json:"effective_cost"`
+}
+
+// AuthTypeStats 按渠道认证类型聚合首页统计。
+type AuthTypeStats struct {
+	AuthType                 string  `json:"auth_type"`
 	TotalRequests            int     `json:"total_requests"`
 	SuccessRequests          int     `json:"success_requests"`
 	ErrorRequests            int     `json:"error_requests"`

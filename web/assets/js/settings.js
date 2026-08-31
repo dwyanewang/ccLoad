@@ -8,8 +8,13 @@ let runtimeMetricsPreviousFocus = null;
 let runtimeMetricsRefreshTimer = null;
 const RUNTIME_METRICS_REFRESH_MS = 3000;
 let globalCooldownRulesPreviousFocus = null;
+let multimodalFallbackPreviousFocus = null;
+let multimodalFallbackDraft = [];
+let multimodalFallbackModelOptions = null;
 
 const globalCooldownRulesSettingKey = 'global_cooldown_detection_rules';
+const modelMultimodalFallbackSettingKey = 'model_multimodal_fallback';
+const maxMultimodalFallbackMappings = 64;
 const containerImageManagedDisabledReason = 'container_image_managed';
 const advancedSettingKeys = new Set([
   globalCooldownRulesSettingKey,
@@ -334,6 +339,12 @@ function bindSettingsPageActions() {
     runtimeMetricsBtn.dataset.bound = '1';
   }
 
+  const multimodalFallbackBtn = document.getElementById('model-multimodal-fallback-btn');
+  if (multimodalFallbackBtn && !multimodalFallbackBtn.dataset.bound) {
+    multimodalFallbackBtn.addEventListener('click', (event) => openMultimodalFallbackModal(event.currentTarget));
+    multimodalFallbackBtn.dataset.bound = '1';
+  }
+
   const refreshBtn = document.getElementById('refresh-runtime-metrics-btn');
   if (refreshBtn && !refreshBtn.dataset.bound) {
     refreshBtn.addEventListener('click', loadRuntimeMetrics);
@@ -358,6 +369,7 @@ function bindSettingsPageActions() {
   }
 
   bindGlobalCooldownRulesModal();
+  bindMultimodalFallbackModal();
 }
 
 function bindGlobalCooldownRulesModal() {
@@ -479,6 +491,258 @@ function applyGlobalCooldownRules() {
   markChanged(input);
   updateGlobalCooldownRulesSummary(input.value);
   closeGlobalCooldownRulesModal();
+}
+
+// ===== 多模态回退模型映射编辑器 =====
+// 草稿三段式：打开时从 hidden input 解析进 DOM，编辑只改对话框 DOM，
+// 取消即丢弃；应用时才收集 DOM 写回 hidden input。
+
+function parseMultimodalFallback(value) {
+  try {
+    const parsed = JSON.parse(String(value || '{}'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    return Object.entries(parsed).map(([from, to]) => ({ from, to: String(to ?? '') }));
+  } catch (_) {
+    return [];
+  }
+}
+
+function multimodalFallbackCount(value) {
+  return parseMultimodalFallback(value).length;
+}
+
+function updateMultimodalFallbackSummary(value) {
+  const summary = document.getElementById('model-multimodal-fallback-summary');
+  if (!summary) return;
+  summary.textContent = t('settings.multimodalFallback.ruleCount', {
+    count: multimodalFallbackCount(value)
+  });
+}
+
+// 与后端 RoutingModelName 近似：剥掉尾部思考后缀（如 (max)）并统一小写，
+// 仅用于编辑器的重复/自映射提示，权威校验在后端。
+function normalizeModelKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s*\([^()]*\)\s*$/, '');
+}
+
+function multimodalFallbackOptionSources() {
+  if (Array.isArray(multimodalFallbackModelOptions)) return multimodalFallbackModelOptions;
+  // 加载失败时至少保留当前草稿里出现的模型，已配值不至于从下拉里消失。
+  const seen = new Set();
+  for (const row of multimodalFallbackDraft) {
+    for (const name of [row.from, row.to]) {
+      if (name) seen.add(name);
+    }
+  }
+  return Array.from(seen).sort();
+}
+
+function multimodalFallbackOptionsHtml(selected) {
+  const options = multimodalFallbackOptionSources();
+  if (selected && !options.includes(selected)) options.unshift(selected);
+  return options.map((name) => (
+    `<option value="${escapeHtml(name)}"${name === selected ? ' selected' : ''}>${escapeHtml(name)}</option>`
+  )).join('');
+}
+
+function renderMultimodalFallbackRow(pair) {
+  return `
+    <div class="multimodal-fallback-row">
+      <select class="form-input multimodal-fallback-select" data-field="from" aria-label="${escapeHtml(t('settings.multimodalFallback.fromModel'))}">
+        ${multimodalFallbackOptionsHtml(pair.from)}
+      </select>
+      <span class="multimodal-fallback-arrow" aria-hidden="true">&rarr;</span>
+      <select class="form-input multimodal-fallback-select" data-field="to" aria-label="${escapeHtml(t('settings.multimodalFallback.fallbackModel'))}">
+        ${multimodalFallbackOptionsHtml(pair.to)}
+      </select>
+      <button type="button" class="btn-icon multimodal-fallback-remove-btn" data-action="remove-multimodal-fallback-row"
+        aria-label="${escapeHtml(t('settings.multimodalFallback.removeRow'))}">&times;</button>
+    </div>`;
+}
+
+function renderMultimodalFallbackDraft() {
+  const container = document.getElementById('multimodalFallbackRows');
+  const empty = document.getElementById('multimodalFallbackEmpty');
+  if (!container) return;
+  container.innerHTML = multimodalFallbackDraft.map(renderMultimodalFallbackRow).join('');
+  if (empty) empty.hidden = multimodalFallbackDraft.length > 0;
+}
+
+async function loadMultimodalFallbackModelOptions() {
+  if (multimodalFallbackModelOptions !== null) return;
+  try {
+    const data = await fetchDataWithAuth('/admin/channels/filter-options?status=enabled');
+    multimodalFallbackModelOptions = Array.isArray(data?.models) ? data.models : [];
+  } catch (err) {
+    console.error('加载模型候选失败:', err);
+    multimodalFallbackModelOptions = [];
+  }
+}
+
+function showMultimodalFallbackError(message) {
+  const error = document.getElementById('multimodalFallbackError');
+  if (!error) return;
+  error.textContent = message || '';
+  error.hidden = !message;
+}
+
+async function openMultimodalFallbackModal(trigger) {
+  const modal = document.getElementById('multimodalFallbackModal');
+  const input = document.getElementById(modelMultimodalFallbackSettingKey);
+  if (!modal || !input) return;
+
+  multimodalFallbackPreviousFocus = trigger || document.activeElement;
+  multimodalFallbackDraft = parseMultimodalFallback(input.value);
+  showMultimodalFallbackError(null);
+  await loadMultimodalFallbackModelOptions();
+  renderMultimodalFallbackDraft();
+  document.querySelector('.app-container')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  modal.querySelector('.close-btn')?.focus();
+}
+
+function closeMultimodalFallbackModal() {
+  const modal = document.getElementById('multimodalFallbackModal');
+  if (!modal) return;
+
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.querySelector('.app-container')?.removeAttribute('inert');
+  if (multimodalFallbackPreviousFocus?.isConnected) multimodalFallbackPreviousFocus.focus();
+  multimodalFallbackPreviousFocus = null;
+  multimodalFallbackDraft = [];
+}
+
+function addMultimodalFallbackRow() {
+  if (multimodalFallbackDraft.length >= maxMultimodalFallbackMappings) {
+    showMultimodalFallbackError(t('settings.multimodalFallback.errorLimit', { max: maxMultimodalFallbackMappings }));
+    return;
+  }
+  multimodalFallbackDraft.push({ from: '', to: '' });
+  renderMultimodalFallbackDraft();
+}
+
+function removeMultimodalFallbackRow(row) {
+  const index = Array.from(row.parentNode?.children || []).indexOf(row);
+  if (index >= 0) multimodalFallbackDraft.splice(index, 1);
+  row.remove();
+  const empty = document.getElementById('multimodalFallbackEmpty');
+  if (empty) empty.hidden = multimodalFallbackDraft.length > 0;
+}
+
+// 收集对话框 DOM 中的映射。select 值由 searchable-select 增强层同步回原生
+// select（dispatchSelectionEvents），DOM 就是当前草稿的真源。
+function collectMultimodalFallbackDraft() {
+  const rows = [];
+  const container = document.getElementById('multimodalFallbackRows');
+  if (container) {
+    container.querySelectorAll('.multimodal-fallback-row').forEach((row) => {
+      rows.push({
+        from: String(row.querySelector('select[data-field="from"]')?.value || '').trim(),
+        to: String(row.querySelector('select[data-field="to"]')?.value || '').trim()
+      });
+    });
+  }
+  return rows;
+}
+
+function validateMultimodalFallbackRows(rows) {
+  if (rows.length > maxMultimodalFallbackMappings) {
+    return t('settings.multimodalFallback.errorLimit', { max: maxMultimodalFallbackMappings });
+  }
+  const seen = new Set();
+  for (const row of rows) {
+    if (!row.from || !row.to) return t('settings.multimodalFallback.errorBlank');
+    const fromKey = normalizeModelKey(row.from);
+    const toKey = normalizeModelKey(row.to);
+    if (fromKey === toKey) return t('settings.multimodalFallback.errorSelf', { model: row.from });
+    if (seen.has(fromKey)) return t('settings.multimodalFallback.errorDuplicate', { model: row.from });
+    seen.add(fromKey);
+  }
+  return null;
+}
+
+async function applyMultimodalFallback() {
+  const rows = collectMultimodalFallbackDraft();
+  const error = validateMultimodalFallbackRows(rows);
+  if (error) {
+    showMultimodalFallbackError(error);
+    return;
+  }
+  const mapping = {};
+  for (const row of rows) mapping[row.from] = row.to;
+
+  const value = JSON.stringify(mapping);
+  if (value === originalSettings[modelMultimodalFallbackSettingKey]) {
+    closeMultimodalFallbackModal();
+    return;
+  }
+
+  const modal = document.getElementById('multimodalFallbackModal');
+  const applyButton = modal?.querySelector('[data-action="apply-multimodal-fallback"]');
+  if (applyButton?.disabled) return;
+  if (applyButton) {
+    applyButton.disabled = true;
+    applyButton.setAttribute('aria-busy', 'true');
+  }
+  showMultimodalFallbackError(null);
+
+  try {
+    const result = await fetchDataWithAuth('/admin/settings/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [modelMultimodalFallbackSettingKey]: value })
+    });
+    syncSettingState(modelMultimodalFallbackSettingKey, value);
+    closeMultimodalFallbackModal();
+    showSuccess(result?.message || t('settings.msg.savedCount', { count: 1 }));
+  } catch (err) {
+    console.error('保存多模态回退映射异常:', err);
+    showMultimodalFallbackError(t('settings.msg.saveFailed') + ': ' + err.message);
+  } finally {
+    if (applyButton) {
+      applyButton.disabled = false;
+      applyButton.removeAttribute('aria-busy');
+    }
+  }
+}
+
+function bindMultimodalFallbackModal() {
+  const modal = document.getElementById('multimodalFallbackModal');
+  if (!modal || modal.dataset.bound) return;
+
+  modal.addEventListener('click', (event) => {
+    if (event.target === modal) {
+      closeMultimodalFallbackModal();
+      return;
+    }
+    const button = event.target.closest('[data-action]');
+    if (!button) return;
+    switch (button.dataset.action) {
+      case 'close-multimodal-fallback':
+        closeMultimodalFallbackModal();
+        break;
+      case 'apply-multimodal-fallback':
+        applyMultimodalFallback();
+        break;
+      case 'add-multimodal-fallback-row':
+        addMultimodalFallbackRow();
+        break;
+      case 'remove-multimodal-fallback-row':
+        removeMultimodalFallbackRow(button.closest('.multimodal-fallback-row'));
+        break;
+    }
+  });
+  modal.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeMultimodalFallbackModal();
+      return;
+    }
+    if (event.key === 'Tab') trapModalFocus(modal, event);
+  });
+  modal.dataset.bound = '1';
 }
 
 function openRuntimeMetricsModal() {
@@ -780,7 +1044,7 @@ function getSettingGroupInfo(key) {
   const defs = [
     { id: 'advanced', nameKey: 'settings.group.advanced', order: 70, match: () => advancedSettingKeys.has(k) },
     { id: 'channel', nameKey: 'settings.group.channel', order: 10, match: () => k.startsWith('channel_') || k === 'max_key_retries' },
-    { id: 'model', nameKey: 'settings.group.model', order: 15, match: () => k.startsWith('model_') },
+
     { id: 'upstream-connection', nameKey: 'settings.group.upstreamConnection', order: 19, match: () => k === 'upstream_connection_reuse_limit_seconds' || oauthBaseURLSettingKeys.has(k) },
     { id: 'websocket', nameKey: 'settings.group.websocket', order: 25, match: () => k.startsWith('responses_ws_') },
     { id: 'stream-timeout', nameKey: 'settings.group.streamTimeout', order: 20, match: () => k === 'stream_timeout' || k.endsWith('_first_byte_timeout') },
@@ -796,7 +1060,7 @@ function getSettingGroupInfo(key) {
   for (const d of defs) {
     if (d.match()) return { ...d, name: t(d.nameKey) };
   }
-  return { id: 'other', nameKey: 'settings.group.other', name: t('settings.group.other'), order: 999 };
+  return { id: 'advanced', nameKey: 'settings.group.advanced', name: t('settings.group.advanced'), order: 70 };
 }
 
 function getSettingOrder(key) {
@@ -920,6 +1184,14 @@ function renderSettings(settings) {
     for (const s of g.settings) {
       const displayValue = settingValueForDisplay(s.key, s.value);
       originalSettings[s.key] = displayValue;
+      // 多模态回退映射不渲染表格行：入口按钮与摘要常驻保存按钮区，
+      // hidden input 保存当前持久化值，对话框确认时单独提交。
+      if (s.key === modelMultimodalFallbackSettingKey) {
+        const hidden = document.getElementById(modelMultimodalFallbackSettingKey);
+        if (hidden) hidden.value = displayValue;
+        updateMultimodalFallbackSummary(displayValue);
+        continue;
+      }
       // 优先使用语言包中的描述，若没有则回退到后端返回的描述
       const descKey = `settings.desc.${s.key}`;
       const translatedDesc = t(descKey);
@@ -973,6 +1245,11 @@ function initSettingsEventDelegation() {
       openGlobalCooldownRulesModal(editGlobalRulesBtn);
       return;
     }
+    const updateCheckBtn = e.target.closest('[data-action="check-for-updates"]');
+    if (updateCheckBtn) {
+      checkForUpdates(updateCheckBtn);
+      return;
+    }
     const resetBtn = e.target.closest('.setting-reset-btn');
     if (resetBtn) {
       resetSetting(resetBtn.dataset.key);
@@ -984,6 +1261,28 @@ function initSettingsEventDelegation() {
     const input = e.target.closest('input, select');
     if (input) markChanged(input);
   });
+}
+
+// 手动触发完整更新流程：检查、下载、校验、替换，之后由服务端等待空闲重启。
+async function checkForUpdates(button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  button.setAttribute?.('aria-busy', 'true');
+  try {
+    const result = await fetchDataWithAuth('/admin/update/check', { method: 'POST' });
+    if (result.pending_restart) {
+      showSuccess(t('settings.updateCheck.pendingRestart', { version: result.pending_version }));
+    } else if (result.has_update) {
+      showSuccess(t('settings.updateCheck.found', { version: result.latest_version }));
+    } else {
+      showSuccess(t('settings.updateCheck.upToDate', { version: result.latest_version }));
+    }
+  } catch (err) {
+    showError(t('settings.updateCheck.failed') + ': ' + err.message);
+  } finally {
+    button.disabled = false;
+    button.removeAttribute?.('aria-busy');
+  }
 }
 
 function renderInput(setting) {
@@ -1014,10 +1313,21 @@ function renderInput(setting) {
     const optionsHtml = selectOptions.map(({ value, labelKey }) => (
       `<option value="${value}" ${setting.value === value ? 'selected' : ''}>${escapeHtml(t(labelKey))}</option>`
     )).join('');
-    return `
+    const selectHtml = `
       <select id="${safeKey}" class="settings-input settings-input--select" ${disabledAttributes}>
         ${optionsHtml}
       </select>`;
+    // 更新渠道旁提供手动检测按钮；容器模式（editable=false）不渲染、后端同样拒绝。
+    if (setting.key === 'auto_update_channel' && setting.editable !== false) {
+      return `
+        <div class="settings-update-channel-control">
+          ${selectHtml}
+          <button type="button" class="btn btn-secondary settings-update-check-btn" data-action="check-for-updates">
+            ${escapeHtml(t('settings.updateCheck.check'))}
+          </button>
+        </div>`;
+    }
+    return selectHtml;
   }
 
   if (byteSettingKeys.has(setting.key)) {
@@ -1049,6 +1359,7 @@ function renderInput(setting) {
 function markChanged(input) {
   input.removeAttribute?.('aria-invalid');
   const row = input.closest('tr');
+  if (!row) return; // 常驻控制区（如多模态回退 hidden input）没有表格行可高亮
   let key, currentValue;
 
   if (input.type === 'radio') {
@@ -1115,6 +1426,7 @@ function setSettingControlValue(key, value) {
   }
 
   if (key === globalCooldownRulesSettingKey) updateGlobalCooldownRulesSummary(normalizedValue);
+  if (key === modelMultimodalFallbackSettingKey) updateMultimodalFallbackSummary(normalizedValue);
   return control;
 }
 

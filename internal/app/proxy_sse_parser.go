@@ -7,6 +7,8 @@ import (
 	"log"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"ccLoad/internal/util"
 )
@@ -27,8 +29,9 @@ type usageAccumulator struct {
 	Cache5mInputTokens       int
 	Cache1hInputTokens       int
 	ToolCostUSD              float64
-	ServiceTier              string // OpenAI service_tier: "priority"/"flex"/"default"
+	ServiceTier              string // 上游实际声明的 service_tier/speed
 	ThinkingEffort           string
+	ResponseModel            string // 上游原始响应声明的模型；只用于日志观测
 	usageVersion             int
 	imageGenerationToolModel string
 	toolUsageSeen            bool
@@ -108,10 +111,11 @@ type sseLargeFieldSanitizer struct {
 type usageParser interface {
 	Feed([]byte) error
 	GetUsage() (inputTokens, outputTokens, cacheRead, cacheCreation int)
-	GetCacheBreakdown() (cache5m, cache1h int, serviceTier string) // 返回缓存分桶与 OpenAI service_tier
+	GetCacheBreakdown() (cache5m, cache1h int, serviceTier string) // 返回缓存分桶与上游 service_tier/speed
 	GetToolCostUSD() float64                                       // 返回 Responses 工具调用的额外费用
 	GetThinkingEffort() string
 	GetReasoningTokens() int
+	GetResponseModel() string
 	GetLastError() []byte       // [INFO] 返回SSE流中检测到的最后一个error事件（用于1308等错误的延迟处理）
 	IsStreamComplete() bool     // [INFO] 返回是否检测到流结束标志（[DONE]/message_stop）
 	HasStreamOutput() bool      // 语义输出，提交给客户端后不可再内部切渠道
@@ -134,6 +138,54 @@ func (u *usageAccumulator) GetThinkingEffort() string {
 
 func (u *usageAccumulator) GetReasoningTokens() int {
 	return u.ReasoningTokens
+}
+
+func (u *usageAccumulator) GetResponseModel() string {
+	return u.ResponseModel
+}
+
+func (u *usageAccumulator) captureResponseModel(payload map[string]any, upstreamProtocol string) {
+	if payload == nil {
+		return
+	}
+
+	var candidates []string
+	switch strings.ToLower(strings.TrimSpace(upstreamProtocol)) {
+	case "openai", "codex":
+		candidates = []string{nestedResponseModel(payload, "response"), responseModelValue(payload, "model")}
+	case "anthropic":
+		candidates = []string{nestedResponseModel(payload, "message"), responseModelValue(payload, "model")}
+	case "gemini":
+		candidates = []string{responseModelValue(payload, "modelVersion"), responseModelValue(payload, "model")}
+	default:
+		return
+	}
+
+	for _, candidate := range candidates {
+		if normalized := normalizeResponseModel(candidate); normalized != "" {
+			u.ResponseModel = normalized
+			return
+		}
+	}
+}
+
+func nestedResponseModel(payload map[string]any, key string) string {
+	nested, _ := payload[key].(map[string]any)
+	return responseModelValue(nested, "model")
+}
+
+func responseModelValue(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func normalizeResponseModel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || !utf8.ValidString(value) || utf8.RuneCountInString(value) > 191 ||
+		strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return ""
+	}
+	return value
 }
 
 const (
@@ -210,9 +262,6 @@ func (p *sseUsageParser) scanUsageFragments(data []byte) {
 		p.Cache5mInputTokens = p.scanner.Cache5mInputTokens
 		p.Cache1hInputTokens = p.scanner.Cache1hInputTokens
 		p.scanVersion = p.scanner.usageVersion
-	}
-	if p.scanner.ServiceTier != "" {
-		p.ServiceTier = p.scanner.ServiceTier
 	}
 	if p.scanner.ThinkingEffort != "" {
 		p.ThinkingEffort = p.scanner.ThinkingEffort
@@ -483,6 +532,7 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
 		return fmt.Errorf("json unmarshal failed: %w", err)
 	}
+	p.captureResponseModel(event, p.upstreamProtocol)
 	if usage := extractUsage(event); usage != nil {
 		p.applyUsage(usage, p.upstreamProtocol)
 	}
@@ -523,6 +573,12 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	if isAnthropicTerminal || isSuccessfulResponsesTerminal(eventType) || isSuccessfulResponsesTerminal(payloadType) {
 		p.streamComplete = true
 	}
+	// OpenAI Chat Completions 与 Gemini 在 finish_reason 处就已给出语义终态，
+	// 之后的 usage 分片和 [DONE] 都是可选尾巴。客户端常在读到 finish_reason 时
+	// 立刻断开，此处不认终态会把完整响应误判成 499（客户端取消）或 599（流不完整）。
+	if openAIStreamPayloadComplete(event) || geminiStreamPayloadComplete(event) {
+		p.streamComplete = true
+	}
 	if isSuccessfulResponsesTerminal(payloadType) {
 		if response, ok := event["response"].(map[string]any); ok {
 			output, _ := json.Marshal(response["output"])
@@ -539,13 +595,10 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 		}
 	}
 
-	// 提取 service_tier（OpenAI Chat/Responses API 顶层字段）
-	if tier, ok := event["service_tier"].(string); ok && tier != "" {
+	// Responses 的 response.created/queued/in_progress 通常只是请求回显，
+	// 不能当作实际上游服务档位。仅采信终止事件；无 type 的 Chat 分片仍可读取。
+	if tier := observedServiceTierFromEvent(eventType, payloadType, event); tier != "" {
 		p.ServiceTier = tier
-	} else if resp, ok := event["response"].(map[string]any); ok {
-		if tier, ok := resp["service_tier"].(string); ok && tier != "" {
-			p.ServiceTier = tier
-		}
 	}
 	if effort := extractThinkingEffortFromPayload(event); effort != "" {
 		p.ThinkingEffort = effort
@@ -557,9 +610,13 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 		return nil
 	}
 
-	// Anthropic fast mode: 从 usage.speed 推断计费层级
-	if speed, ok := usage["speed"].(string); ok && speed == "fast" {
-		p.ServiceTier = "fast"
+	// Anthropic fast mode: 以 usage.speed 记录上游实际档位，standard 也必须保留，
+	// 否则请求 fast、上游降为 standard 时无法在计费层识别降档。
+	if speed, ok := usage["speed"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(speed)) {
+		case "fast", "standard":
+			p.ServiceTier = strings.ToLower(strings.TrimSpace(speed))
+		}
 	}
 
 	return nil
@@ -641,6 +698,72 @@ func isSuccessfulResponsesTerminal(eventType string) bool {
 	default:
 		return false
 	}
+}
+
+func observedServiceTierFromEvent(eventType, payloadType string, event map[string]any) string {
+	if event == nil {
+		return ""
+	}
+	terminal := isSuccessfulResponsesTerminal(eventType) || isSuccessfulResponsesTerminal(payloadType)
+	if !terminal && (eventType != "" || payloadType != "") {
+		// Responses 的 typed delta 一律忽略，避免读取请求回显；没有 type
+		// 的自定义 Chat 事件仍可读取 service_tier。
+		if payloadType != "" {
+			return ""
+		}
+		switch eventType {
+		case "response.created", "response.queued", "response.in_progress",
+			"codex.rate_limits", "codex.response.metadata":
+			return ""
+		}
+	}
+
+	if tier, ok := event["service_tier"].(string); ok {
+		return normalizeBillingServiceTier(tier)
+	}
+	if response, ok := event["response"].(map[string]any); ok {
+		if tier, ok := response["service_tier"].(string); ok {
+			return normalizeBillingServiceTier(tier)
+		}
+	}
+	return ""
+}
+
+// openAIStreamPayloadComplete 判断 Chat Completions 分片是否给出终态。
+// 非空 finish_reason 代表该 choice 已结束；空串是部分中转的占位写法，不算终态。
+func openAIStreamPayloadComplete(payload map[string]any) bool {
+	choices, _ := payload["choices"].([]any)
+	for _, item := range choices {
+		choice, _ := item.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		finishReason, ok := choice["finish_reason"]
+		if !ok || finishReason == nil {
+			continue
+		}
+		if reason, isString := finishReason.(string); isString && strings.TrimSpace(reason) == "" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// geminiStreamPayloadComplete 判断 Gemini 流分片是否给出终态。
+// Gemini SSE 没有 [DONE]，非空 finishReason 是唯一的完成信号。
+func geminiStreamPayloadComplete(payload map[string]any) bool {
+	candidates, _ := payload["candidates"].([]any)
+	for _, item := range candidates {
+		candidate, _ := item.(map[string]any)
+		if candidate == nil {
+			continue
+		}
+		if reason, _ := candidate["finishReason"].(string); strings.TrimSpace(reason) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isHeartbeatEvent(eventType, data string) bool {
@@ -882,7 +1005,9 @@ func (p *jsonUsageParser) finishJSONValueCapture() {
 		case "service_tier":
 			var tier string
 			if err := json.Unmarshal(p.scanCaptureBuf, &tier); err == nil && tier != "" {
-				p.ServiceTier = tier
+				if normalized := normalizeBillingServiceTier(tier); normalized != "" {
+					p.ServiceTier = normalized
+				}
 			}
 		}
 	}
@@ -898,8 +1023,11 @@ func (p *jsonUsageParser) applyUsageMap(usage map[string]any) {
 	if usage == nil {
 		return
 	}
-	if speed, ok := usage["speed"].(string); ok && speed == "fast" {
-		p.ServiceTier = "fast"
+	if speed, ok := usage["speed"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(speed)) {
+		case "fast", "standard":
+			p.ServiceTier = strings.ToLower(strings.TrimSpace(speed))
+		}
 	}
 	p.applyUsage(usage, p.upstreamProtocol)
 }
@@ -933,6 +1061,7 @@ func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cach
 			p.ThinkingEffort = sseParser.GetThinkingEffort()
 			p.ReasoningTokens = sseParser.GetReasoningTokens()
 			p.ToolCostUSD = sseParser.GetToolCostUSD()
+			p.ResponseModel = sseParser.GetResponseModel()
 			return sseParser.GetUsage()
 		}
 	}
@@ -942,6 +1071,7 @@ func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cach
 		log.Printf("[WARN] usage JSON 解析失败: %v", err)
 		return 0, 0, 0, 0
 	}
+	p.captureResponseModel(payload, p.upstreamProtocol)
 
 	usage := extractUsage(payload)
 	// Anthropic fast mode: 从 usage.speed 推断计费层级
@@ -951,12 +1081,16 @@ func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cach
 		p.ThinkingEffort = effort
 	}
 
-	// 提取 service_tier（OpenAI Chat/Responses API 顶层字段）
+	// 非流式 JSON 整体就是响应体，可直接读取顶层或 response 内的档位。
 	if tier, ok := payload["service_tier"].(string); ok && tier != "" {
-		p.ServiceTier = tier
+		if normalized := normalizeBillingServiceTier(tier); normalized != "" {
+			p.ServiceTier = normalized
+		}
 	} else if resp, ok := payload["response"].(map[string]any); ok {
 		if tier, ok := resp["service_tier"].(string); ok && tier != "" {
-			p.ServiceTier = tier
+			if normalized := normalizeBillingServiceTier(tier); normalized != "" {
+				p.ServiceTier = normalized
+			}
 		}
 	}
 

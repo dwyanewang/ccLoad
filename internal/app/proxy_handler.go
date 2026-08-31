@@ -39,6 +39,10 @@ var ErrAllKeysUnavailable = errors.New("all channel keys unavailable")
 // ErrAllKeysExhausted 表示所有密钥都已耗尽
 var ErrAllKeysExhausted = errors.New("all keys exhausted")
 
+// ErrNoAPIKeyForModel means this channel has keys, but none may serve the requested model.
+// It must not be promoted to a channel cooldown: another model can still use the channel.
+var ErrNoAPIKeyForModel = errors.New("no API key available for model")
+
 // ErrChannelRPMExceeded 表示渠道RPM限制已达到
 var ErrChannelRPMExceeded = errors.New("channel rpm limit exceeded")
 
@@ -78,7 +82,8 @@ func (s *Server) acquireConcurrencySlotForContext(ctx context.Context) (func(), 
 // ============================================================================
 
 type incomingRequest struct {
-	// originalModel 是去掉思考后缀的基名，用于选路、鉴权、冷却与日志。
+	// originalModel 是去掉思考后缀的基名，用于选路、鉴权与冷却；命中多模态
+	// 回退后会替换成回退模型，因此日志必须在替换前单独保留客户端模型。
 	originalModel string
 	// requestedModel 是客户端字面写的模型名，可能带思考后缀。
 	requestedModel string
@@ -317,7 +322,6 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		}
 		return
 	}
-	originalModel := incoming.originalModel
 	all := incoming.body
 	isStreaming := incoming.isStreaming
 	httpMetrics.observeRequest(isStreaming, len(all))
@@ -330,6 +334,17 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyAlphaSearch {
 		all = sanitizeCodexAlphaSearchBody(all)
 	}
+
+	// 多模态回退：多模态请求自动切到配置的回退模型。改写必须发生在
+	// applyThinkingSuffix 与 Token 白名单之前——渠道候选过滤（SQL 按模型 JOIN）、
+	// 模型冷却过滤、Key 白名单全部按模型名做决策，事后换模型只会换来
+	// 渠道未声明的模型 + 404 + 逐渠道失败。改 incoming 字段后下游全部自动跟随。
+	clientModel := incoming.originalModel
+	if fallback := s.multimodalFallbackModel(incoming.originalModel, requestHasNonTextContent(clientProtocol, all)); fallback != "" {
+		incoming.originalModel = model.RoutingModelName(fallback)
+		incoming.requestedModel = fallback
+	}
+	originalModel := incoming.originalModel
 
 	// 先把后缀写成客户端协议字段；选定渠道后会再按实际上游模型能力收敛等级。
 	all = applyThinkingSuffix(all, clientProtocol, incoming.requestedModel)
@@ -415,7 +430,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		}
 		s.AddLogAsync(&model.LogEntry{
 			Time:           model.JSONTime{Time: time.Now()},
-			Model:          originalModel,
+			Model:          clientModel,
 			LogSource:      model.LogSourceProxy,
 			AuthTokenID:    tokenIDInt64,
 			ClientProtocol: string(clientProtocol),
@@ -448,6 +463,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	reqCtx := &proxyRequestContext{
+		clientModel:    clientModel,
 		originalModel:  originalModel,
 		requestedModel: incoming.requestedModel,
 		clientProtocol: clientProtocol,
@@ -480,8 +496,8 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		OnBytesRead: func(n int64) {
 			s.activeRequests.AddBytes(reqCtx.activeReqID, n)
 		},
-		OnFirstByteRead: func() {
-			s.activeRequests.SetClientFirstByteTime(reqCtx.activeReqID, time.Since(reqCtx.attemptStartTime))
+		OnFirstByteRead: func(firstByteTime time.Duration) {
+			s.activeRequests.SetClientFirstByteTime(reqCtx.activeReqID, firstByteTime)
 		},
 		OnUpstreamWebsocket: func(upstreamWebsocket bool) {
 			s.activeRequests.SetUpstreamWebsocket(reqCtx.activeReqID, upstreamWebsocket)
@@ -507,7 +523,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 
-	s.writeFinalProxyResponse(c, reqCtx, originalModel, isStreaming, lastResult, len(cands))
+	s.writeFinalProxyResponse(c, reqCtx, isStreaming, lastResult, len(cands))
 }
 
 func determineFinalClientStatus(lastResult *proxyResult) int {
@@ -618,6 +634,10 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	sawAlphaSearchUnsupported := false
 	for index, cfg := range cands {
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		if err != nil && errors.Is(err, ErrNoAPIKeyForModel) {
+			log.Printf("[INFO] 渠道 %s (ID=%d) 没有可用于模型 %s 的 Key，跳过该渠道", cfg.Name, cfg.ID, reqCtx.originalModel)
+			continue
+		}
 
 		// 所有Key冷却：触发渠道级冷却(503)，防止后续请求重复尝试
 		// 使用 cooldownManager.HandleError 统一处理（DRY原则）
@@ -690,7 +710,6 @@ func writeEmptyAlphaSearchResponse(w http.ResponseWriter) {
 func (s *Server) writeFinalProxyResponse(
 	c *gin.Context,
 	reqCtx *proxyRequestContext,
-	originalModel string,
 	isStreaming bool,
 	lastResult *proxyResult,
 	candidateCount int,
@@ -720,7 +739,7 @@ func (s *Server) writeFinalProxyResponse(
 	if !skipLog {
 		s.AddLogAsync(&model.LogEntry{
 			Time:           model.JSONTime{Time: reqCtx.startTime},
-			Model:          originalModel,
+			Model:          reqCtx.requestLogModel(),
 			LogSource:      model.LogSourceProxy,
 			ClientProtocol: string(reqCtx.clientProtocol),
 			StatusCode:     upstreamFinalStatus,

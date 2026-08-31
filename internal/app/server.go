@@ -36,6 +36,7 @@ import (
 	"ccLoad/internal/version"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
+	"ccLoad/internal/zedauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -45,9 +46,10 @@ type Server struct {
 	// ============================================================================
 	// 服务层
 	// ============================================================================
-	authService   *AuthService   // 认证授权服务
-	logService    *LogService    // 日志管理服务
-	configService *ConfigService // 配置管理服务
+	authService       *AuthService   // 认证授权服务
+	logService        *LogService    // 日志管理服务
+	configService     *ConfigService // 配置管理服务
+	channelManagement *channelManagementService
 
 	// ============================================================================
 	// 核心字段
@@ -98,6 +100,9 @@ type Server struct {
 	zaiService                    *zaiauth.Service
 	zaiCredentials                *zaiCredentialManager
 	zaiOAuth                      *zaiOAuthManager
+	zedService                    *zedauth.Service
+	zedCredentials                *zedCredentialManager
+	zedOAuth                      *codexOAuthManager
 	cursorService                 *cursorauth.Service
 	cursorCredentials             *cursorCredentialManager
 	cursorRunnerMu                sync.RWMutex
@@ -135,6 +140,9 @@ type Server struct {
 	codexMap429To503          bool
 	// 渠道未配置专属规则时使用的进程级默认规则。
 	globalCooldownDetectionRules *model.CooldownDetectionRules
+	// 多模态回退映射使用不可变快照热更新；更新锁保证持久化顺序与运行态发布顺序一致。
+	multimodalFallbackModels   atomic.Pointer[multimodalFallbackSnapshot]
+	multimodalFallbackUpdateMu sync.Mutex
 
 	// 登录速率限制器（用于传递给AuthService）
 	loginRateLimiter *util.LoginRateLimiter
@@ -277,10 +285,12 @@ func NewServer(store storage.Store) *Server {
 		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
 	}
+	s.setMultimodalFallbackModels(runtimeCfg.MultimodalFallbackModels)
 
 	reg := protocol.NewRegistry()
 	protocolbuiltin.Register(reg)
 	s.protocolRegistry = reg
+	s.channelManagement = newChannelManagementService(store, s.getClientForChannel)
 
 	// 初始化高性能缓存层（60秒TTL，避免数据库性能杀手查询）
 	s.channelCache = storage.NewChannelCache(store, 60*time.Second)
@@ -362,6 +372,15 @@ func NewServer(store storage.Store) *Server {
 			return cfg.ID, cfg.Name, nil
 		},
 	)
+	s.zedService = zedauth.NewService(s.client)
+	s.zedCredentials = newZedCredentialManager(s.zedService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.zedCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.zedOAuth = newZedOAuthManager(s.zedService, store, func(channelID int64) {
+		s.zedCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
 	s.cursorService = cursorauth.NewService(s.client)
 	s.cursorCredentials = newCursorCredentialManager(store, s.getClientForChannel, func(int64) {
 		s.InvalidateChannelListCache()
@@ -626,6 +645,7 @@ type serverRuntimeConfig struct {
 	ActiveRequestTitleEnabled    bool
 	CodexMap429To503             bool
 	GlobalCooldownDetectionRules *model.CooldownDetectionRules
+	MultimodalFallbackModels     map[string]string
 	Cooldown                     util.CooldownSettings
 }
 
@@ -636,6 +656,17 @@ func loadGlobalCooldownDetectionRules(cs *ConfigService) *model.CooldownDetectio
 		return nil
 	}
 	return rules
+}
+
+// loadMultimodalFallbackModels 读取多模态回退映射。解析失败只 WARN 回退 nil
+// （等于未配置），不让一条写坏的管理员配置挡住整个进程启动。
+func loadMultimodalFallbackModels(cs *ConfigService) map[string]string {
+	mappings, err := parseMultimodalFallbackModels(cs.GetString(modelMultimodalFallbackSettingKey, "{}"))
+	if err != nil {
+		log.Printf("[WARN] 无效的 %s，已回退为未配置: %v", modelMultimodalFallbackSettingKey, err)
+		return nil
+	}
+	return mappings
 }
 
 // loadPositiveInt 读取必须为正数的配置项，非法值回退默认并告警。
@@ -749,6 +780,7 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 		ActiveRequestTitleEnabled:    cs.GetBool(config.ActiveRequestTitleEnabledSettingKey, false),
 		CodexMap429To503:             cs.GetBool(config.CodexMap429To503SettingKey, false),
 		GlobalCooldownDetectionRules: loadGlobalCooldownDetectionRules(cs),
+		MultimodalFallbackModels:     loadMultimodalFallbackModels(cs),
 		Cooldown:                     loadCooldownSettings(cs),
 	}
 }
@@ -931,6 +963,8 @@ func (s *Server) startBackgroundWorkers() {
 
 	s.wg.Add(1)
 	go s.responsesExecutionSessionCleanupLoop()
+	s.wg.Add(1)
+	go s.managementCheckinLoop()
 }
 
 func (s *Server) disabledURLReloadLoop() {
@@ -1564,6 +1598,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
 		admin.POST("/channels/:id/codex-quota-reset", s.HandleResetCodexQuota)
 		admin.POST("/channels/oauth-usage/batch/stream", s.HandleOAuthUsageBatchStream)
+		admin.POST("/channels/usage/active/batch/stream", s.HandleActiveChannelUsageBatchStream)
 		admin.POST("/antigravity/oauth/start", s.HandleStartAntigravityOAuth)
 		admin.GET("/antigravity/oauth/status", s.HandleAntigravityOAuthStatus)
 		admin.POST("/antigravity/oauth/cancel", s.HandleCancelAntigravityOAuth)
@@ -1588,6 +1623,11 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/zai/oauth/cancel", s.HandleCancelZAIOAuth)
 		admin.POST("/zai/credentials/import", s.HandleImportZAICredential)
 		admin.POST("/channels/:id/zai-credential/refresh", s.HandleRefreshZAICredential)
+		admin.POST("/zed/oauth/start", s.HandleStartZedOAuth)
+		admin.GET("/zed/oauth/status", s.HandleZedOAuthStatus)
+		admin.POST("/zed/oauth/cancel", s.HandleCancelZedOAuth)
+		admin.POST("/zed/oauth/callback", s.HandleSubmitZedOAuthCallback)
+		admin.POST("/channels/:id/zed-credential/refresh", s.HandleRefreshZedCredential)
 		admin.POST("/cursor/credentials/import", s.HandleImportCursorCredential)
 		admin.POST("/channels/:id/cursor-credential/refresh", s.HandleRefreshCursorCredential)
 		admin.POST("/channels/check-duplicate", s.HandleCheckDuplicateChannel)
@@ -1602,6 +1642,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.DELETE("/channels/:id", s.HandleChannelByID)
 		admin.GET("/channels/:id/editor", s.HandleChannelEditor)
 		admin.GET("/channels/:id/keys", s.HandleChannelKeys)
+		admin.POST("/channel-management/sub2api-login", s.HandleChannelManagementSub2APILogin)
+		admin.POST("/channels/:id/management-account/balance", s.HandleChannelManagementBalance)
+		admin.POST("/channels/:id/management-account/checkin", s.HandleChannelManagementCheckin)
 		admin.GET("/channels/:id/model-stats", s.HandleChannelModelStats)
 		admin.GET("/channels/:id/url-stats", s.HandleChannelURLStats)
 		admin.POST("/channels/:id/url-disable", s.HandleURLDisable)
@@ -1609,7 +1652,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/key-disable", s.HandleAPIKeyDisable)
 		admin.POST("/channels/:id/key-enable", s.HandleAPIKeyEnable)
 		admin.POST("/channels/models/fetch", s.HandleFetchModelsPreview) // 临时渠道配置获取模型列表
-		admin.POST("/channels/billing/fetch", s.HandleFetchSub2APIBilling)
+		admin.POST("/channels/billing/fetch", s.HandleFetchKeyRate)
 		admin.POST("/channels/websocket-probe", s.HandleChannelWebsocketProbe)
 		admin.POST("/channels/models/refresh-batch", s.HandleBatchRefreshModels)
 		admin.GET("/channels/:id/models/fetch", s.HandleFetchModels) // 获取渠道可用模型列表(新增)
@@ -1631,6 +1674,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/active-requests", s.HandleActiveRequests) // 进行中请求（内存状态）
 		admin.GET("/runtime-metrics", s.HandleRuntimeMetrics)
 		admin.GET("/active-requests/:request_id/debug-log", s.HandleGetActiveRequestDebugLog)
+		admin.POST("/active-requests/:request_id/abort", s.HandleAbortActiveRequest) // 手动中断当前上游尝试（按上游断链处理）
 		admin.GET("/metrics", s.HandleMetrics)
 		admin.GET("/stats", s.HandleStats)
 		admin.GET("/stats/filter-options", s.HandleStatsFilterOptions)
@@ -1648,6 +1692,9 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.PUT("/settings/:key", s.AdminUpdateSetting)
 		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
+
+		// 手动触发完整更新流程（检查、下载、校验、替换、空闲后重启）
+		admin.POST("/update/check", s.HandleManualUpdate)
 	}
 
 	// Web 仪表盘只读 API。API Token 会话由服务端强制绑定 auth_token_id。
@@ -1836,6 +1883,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	if s.zaiOAuth != nil {
 		s.zaiOAuth.close()
+	}
+	if s.zedOAuth != nil {
+		s.zedOAuth.close()
 	}
 	if s.responsesExecutionSessions != nil {
 		s.responsesExecutionSessions.close()

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -72,6 +73,8 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 			{Action: model.RuleActionOverride, Name: "Authorization", Value: "Bearer attacker"},
 			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "attacker"},
 			{Action: model.RuleActionOverride, Name: "X-Configured", Value: "kept"},
+		}, Body: []model.CustomBodyRule{
+			{Action: model.RuleActionOverride, Path: "service_tier", Value: json.RawMessage(`"ultrafast"`)},
 		}},
 	}
 	body := []byte(`{"model":"gpt-5.4-mini","stream":false,"input":[{"role":"system","content":"rules"}],"reasoning":{"effort":"minimal"},"max_output_tokens":12,"temperature":0.2,"truncation":"auto","context_management":{"type":"compaction"},"user":"u","previous_response_id":"resp-old","generate":true,"tools":[{"type":"web_search_preview"}]}`)
@@ -153,6 +156,9 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 	}
 	if got := gjson.GetBytes(wireBody, "reasoning.effort").String(); got != "low" {
 		t.Fatalf("reasoning.effort = %q, want minimal normalized to low; body=%s", got, wireBody)
+	}
+	if got := gjson.GetBytes(wireBody, "service_tier").String(); got != "ultrafast" {
+		t.Fatalf("service_tier = %q, want custom rule to survive Codex normalization; body=%s", got, wireBody)
 	}
 	if instructions := gjson.GetBytes(wireBody, "instructions").String(); !strings.HasPrefix(instructions, "You are Codex, a coding agent based on GPT-5.") {
 		t.Fatalf("Codex model instructions missing: %s", wireBody)
@@ -315,6 +321,67 @@ func TestCodexOAuthNonStreamDiagnosticsOnlyForUpstreamFailure(t *testing.T) {
 		markIncompleteStreamForwardResult(result)
 		if result.Status != util.StatusStreamIncomplete {
 			t.Fatalf("status = %d, want %d", result.Status, util.StatusStreamIncomplete)
+		}
+	})
+}
+
+// 上游给出 finish_reason 就是 OpenAI 的语义终态，[DONE] 只是可选尾巴。
+// 客户端常在这一刻断开，此时数据已完整，必须记 200 并计费，而不是 499。
+func TestOpenAIStreamCompleteWithoutDoneMarkerSurvivesClientCancel(t *testing.T) {
+	t.Parallel()
+
+	chunk := func(payload string) string { return "data: " + payload + "\n\n" }
+	partial := chunk(`{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`)
+	complete := partial +
+		chunk(`{"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`) +
+		chunk(`{"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":84932,"completion_tokens":2347,"total_tokens":87279,"prompt_tokens_details":{"cached_tokens":83968}}}`)
+
+	// 上游数据读完后客户端断开：读取以 context.Canceled 收尾，且始终没有 [DONE]。
+	newBody := func(sse string) io.ReadCloser {
+		return io.NopCloser(io.MultiReader(
+			strings.NewReader(sse),
+			iotest.ErrReader(context.Canceled),
+		))
+	}
+
+	t.Run("finish_reason without done marker", func(t *testing.T) {
+		t.Parallel()
+		reqCtx := &requestContext{ctx: context.Background(), startTime: time.Now(), isStreaming: true}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       newBody(complete),
+		}
+		result, _, err := (&Server{}).handleSuccessResponse(
+			reqCtx, resp, resp.Header.Clone(), newRecorder(), string(protocol.OpenAI), &streamReadStats{}, nil,
+		)
+		if err != nil {
+			t.Fatalf("上游已给出 finish_reason，客户端取消不得判为失败: %v", err)
+		}
+		if result.Status != http.StatusOK {
+			t.Fatalf("status = %d, want %d", result.Status, http.StatusOK)
+		}
+		if result.OutputTokens != 2347 {
+			t.Fatalf("usage 未计入: %#v", result)
+		}
+		if result.StreamDiagMsg != "" {
+			t.Fatalf("流已完整不得写诊断（会被判为 599）: %q", result.StreamDiagMsg)
+		}
+	})
+
+	t.Run("cancel before finish_reason", func(t *testing.T) {
+		t.Parallel()
+		reqCtx := &requestContext{ctx: context.Background(), startTime: time.Now(), isStreaming: true}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       newBody(partial),
+		}
+		_, _, err := (&Server{}).handleSuccessResponse(
+			reqCtx, resp, resp.Header.Clone(), newRecorder(), string(protocol.OpenAI), &streamReadStats{}, nil,
+		)
+		if err == nil {
+			t.Fatal("未见终态就取消必须保留失败语义，交给 499 路径")
 		}
 	})
 }
@@ -687,6 +754,213 @@ func TestRetryBodyForRejectedRequest_StripsMissingRequiredInput(t *testing.T) {
 	}
 }
 
+func TestRetryBodyForRejectedRequest_StripsUnknownInputStatus(t *testing.T) {
+	t.Parallel()
+	// 两个 item 都带 status：一次性剥离全部，而不是只删上游点名的单个路径。
+	body := []byte(`{"input":[{"type":"function_call","id":"fc_0","call_id":"call_0","name":"exec","arguments":"{}","status":"completed"},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"}]}`)
+	res := &fwResult{
+		Status: http.StatusBadRequest,
+		Body:   []byte(`{"error":{"message":"Unknown parameter: 'input[1].status'. (request id: 202608290103048262047936468c0eZAfBH9NY)","type":"invalid_request_error","param":"input[1].status","code":"unknown_parameter"}}`),
+	}
+	plan := protocol.TransformPlan{
+		ClientProtocol: protocol.Codex, UpstreamProtocol: protocol.Codex,
+		RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: body,
+	}
+
+	got, strategy, ok := retryBodyForRejectedRequest(protocol.Codex, nil, plan, res)
+	if !ok {
+		t.Fatal("retryBodyForRejectedRequest returned ok=false")
+	}
+	if strategy != stripUnknownInputParameterStrategy {
+		t.Fatalf("strategy=%q, want %q", strategy, stripUnknownInputParameterStrategy)
+	}
+	if gjson.GetBytes(got, "input.#").Int() != 2 {
+		t.Fatalf("unknown-parameter retry dropped an input item: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.status").Exists() || gjson.GetBytes(got, "input.1.status").Exists() {
+		t.Fatalf("status survived retry body: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.call_id").String() != "call_0" ||
+		gjson.GetBytes(got, "input.1.call_id").String() != "call_1" {
+		t.Fatalf("function_call lost fields: %s", got)
+	}
+}
+
+func TestResponsesRetryBodyForUnknownParameter_Guards(t *testing.T) {
+	t.Parallel()
+	bodyWithStatus := []byte(`{"input":[{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"}]}`)
+	bodyWithoutStatus := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"}]}]}`)
+	tests := []struct {
+		name      string
+		body      []byte
+		resStatus int
+		errorBody []byte
+		wantOK    bool
+	}{
+		{
+			name:      "code unknown_parameter",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].status"}}`),
+			wantOK:    true,
+		},
+		{
+			name:      "code unsupported_parameter",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unsupported_parameter","param":"input[0].status"}}`),
+			wantOK:    true,
+		},
+		{
+			name:      "message only fallback",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"message":"Unknown parameter: 'input[0].status'."}}`),
+			wantOK:    true,
+		},
+		{
+			name:      "no status in body is noop",
+			body:      bodyWithoutStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0]","message":"Unknown parameter: 'input[0]'."}}`),
+			wantOK:    false,
+		},
+		{
+			name:      "different unknown parameter does not replay",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].metadata"}}`),
+			wantOK:    false,
+		},
+		{
+			name:      "nested status path does not replay",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].status.detail"}}`),
+			wantOK:    false,
+		},
+		{
+			name:      "structured status prefix does not replay",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].status/child"}}`),
+			wantOK:    false,
+		},
+		{
+			name:      "thinking error delegated to strip_codex_thinking",
+			body:      bodyWithStatus,
+			resStatus: http.StatusBadRequest,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].reasoning","message":"Unknown parameter: 'input[0].reasoning'."}}`),
+			wantOK:    false,
+		},
+		{
+			name:      "non bad request does not retry",
+			body:      bodyWithStatus,
+			resStatus: http.StatusInternalServerError,
+			errorBody: []byte(`{"error":{"code":"unknown_parameter","param":"input[0].status"}}`),
+			wantOK:    false,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := &fwResult{Status: tt.resStatus, Body: tt.errorBody}
+			plan := protocol.TransformPlan{
+				ClientProtocol: protocol.Codex, UpstreamProtocol: protocol.Codex,
+				RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: tt.body,
+			}
+			got, strategy, ok := responsesRetryBodyForUnknownParameter(protocol.Codex, plan, res)
+			if ok != tt.wantOK {
+				t.Fatalf("ok=%v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if strategy != stripUnknownInputParameterStrategy {
+				t.Fatalf("strategy=%q", strategy)
+			}
+			if gjson.GetBytes(got, "input.0.status").Exists() {
+				t.Fatalf("status survived retry body: %s", got)
+			}
+			if gjson.GetBytes(got, "input.0.call_id").String() != "call_1" {
+				t.Fatalf("function_call lost fields: %s", got)
+			}
+		})
+	}
+}
+
+func TestResponsesRetryBodyForUnknownParameter_RequiresCodexResponsesScope(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"input":[{"type":"function_call","status":"completed"}]}`)
+	res := &fwResult{
+		Status: http.StatusBadRequest,
+		Body:   []byte(`{"error":{"code":"unknown_parameter","param":"input[0].status"}}`),
+	}
+	tests := []struct {
+		name     string
+		upstream protocol.Protocol
+		plan     protocol.TransformPlan
+	}{
+		{
+			name:     "non Codex upstream",
+			upstream: protocol.OpenAI,
+			plan: protocol.TransformPlan{
+				ClientProtocol: protocol.Codex, RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: body,
+			},
+		},
+		{
+			name:     "non Codex client",
+			upstream: protocol.Codex,
+			plan: protocol.TransformPlan{
+				ClientProtocol: protocol.OpenAI, RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: body,
+			},
+		},
+		{
+			name:     "non Responses request",
+			upstream: protocol.Codex,
+			plan: protocol.TransformPlan{
+				ClientProtocol: protocol.Codex, RequestFamily: protocol.RequestFamilyChatCompletions, TranslatedBody: body,
+			},
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, _, ok := responsesRetryBodyForUnknownParameter(tc.upstream, tc.plan, res); ok {
+				t.Fatal("out-of-scope request must not be replayed")
+			}
+		})
+	}
+}
+
+func TestResponsesBodyForHTTPTransport_StripsInputItemStatus(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"gpt-5.6-sol","seed":9007199254740993,"input":[{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"},{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}]}`)
+	plan := protocol.TransformPlan{
+		ClientProtocol:   protocol.Codex,
+		UpstreamProtocol: protocol.Codex,
+		RequestFamily:    protocol.RequestFamilyResponses,
+	}
+	got := responsesBodyForHTTPTransport(&model.Config{}, plan, body)
+	if gjson.GetBytes(got, "input.0.status").Exists() {
+		t.Fatalf("HTTP Codex body kept input status: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.call_id").String() != "call_1" {
+		t.Fatalf("HTTP Codex body lost function_call: %s", got)
+	}
+	if gjson.GetBytes(got, "seed").Raw != "9007199254740993" {
+		t.Fatalf("HTTP Codex body changed large integer: %s", got)
+	}
+
+	plan.UpstreamProtocol = protocol.OpenAI
+	got = responsesBodyForHTTPTransport(&model.Config{}, plan, body)
+	if !gjson.GetBytes(got, "input.0.status").Exists() {
+		t.Fatalf("non-Codex upstream body lost input status: %s", got)
+	}
+}
+
 func TestResponsesRetryBodyForMissingStoredInputItem_StripsNamedReasoning(t *testing.T) {
 	t.Parallel()
 	const missingID = "rs_item_813dd000e22bc4aa5ed48884"
@@ -774,6 +1048,23 @@ func TestResponsesRetryBodyForMissingStoredInputItem_IgnoresNonMatchingErrors(t 
 			}
 		})
 	}
+
+	for _, itemType := range []string{"message", "function_call", "custom_tool_call"} {
+		t.Run("preserve "+itemType, func(t *testing.T) {
+			t.Parallel()
+			const itemID = "item_must_survive"
+			body := []byte(`{"input":[{"type":"` + itemType + `","id":"` + itemID + `"}]}`)
+			res := &fwResult{
+				Status: http.StatusNotFound,
+				Body:   []byte(`{"error":{"message":"Item with id '` + itemID + `' not found"}}`),
+			}
+			if _, _, ok := responsesRetryBodyForMissingStoredInputItem(
+				protocol.TransformPlan{TranslatedBody: body}, res,
+			); ok {
+				t.Fatalf("%s item must not be removed from a full replay", itemType)
+			}
+		})
+	}
 }
 
 func TestWriteSyntheticSSEFrameRoundTripsMultilineJSON(t *testing.T) {
@@ -836,6 +1127,49 @@ func TestCodexRetryBodyFor400_FallsThroughToThinkingWhenAnyrouterBodyUnchanged(t
 	if strings.Contains(text, `"reasoning"`) ||
 		!strings.Contains(text, `"type":"message"`) {
 		t.Fatalf("unexpected retry body: %s", text)
+	}
+}
+
+func TestCodexRetryBodyFor400_UsesSSEErrorStatusForEncryptedContent(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"compaction","encrypted_content":"drop-compaction"},
+			{"type":"reasoning","summary":[],"encrypted_content":"drop-reasoning"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"}]}
+		]
+	}`)
+	res := &fwResult{
+		Status:        http.StatusOK,
+		SSEErrorEvent: []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"invalid_encrypted_content","message":"The encrypted content could not be verified."},"status":400}`),
+	}
+	plan := protocol.TransformPlan{TranslatedBody: body}
+
+	got, strategy, ok := codexRetryBodyFor400(protocol.Codex, nil, plan, res)
+	if !ok {
+		t.Fatal("codexRetryBodyFor400 returned ok=false for an SSE 400 error")
+	}
+	if strategy != "strip_codex_encrypted_input" {
+		t.Fatalf("strategy=%q, want strip_codex_encrypted_input", strategy)
+	}
+	if items := gjson.GetBytes(got, "input").Array(); len(items) != 1 || items[0].Get("type").String() != "message" {
+		t.Fatalf("retry body should keep only the non-encrypted message, got %s", got)
+	}
+}
+
+func TestCodexRetryBodyFor400_DoesNotRetryCommittedSSEError(t *testing.T) {
+	t.Parallel()
+
+	res := &fwResult{
+		Status:            http.StatusOK,
+		ResponseCommitted: true,
+		SSEErrorEvent:     []byte(`{"type":"error","error":{"code":"invalid_encrypted_content"},"status":400}`),
+	}
+	plan := protocol.TransformPlan{TranslatedBody: []byte(`{"input":[{"type":"reasoning","encrypted_content":"drop"}]}`)}
+	if _, _, ok := codexRetryBodyFor400(protocol.Codex, nil, plan, res); ok {
+		t.Fatal("committed SSE error must not be retried")
 	}
 }
 
@@ -1161,6 +1495,82 @@ func TestHandleTranslatedStreamSuccessResponse_TreatsTranslatedStopAsComplete(t 
 	body := rec.Body.String()
 	if !strings.Contains(body, "event: message_stop") {
 		t.Fatalf("expected translated output to include message_stop, got %s", body)
+	}
+}
+
+// openai→anthropic 转换器只在 [DONE] 时吐终止事件。部分 OpenAI 兼容上游给完
+// finish_reason 就断流，客户端会一直等不到 message_stop——上游语义已完整时
+// 必须由网关补出完整终止序列，且不能在上游自带 [DONE] 时补重。
+func TestHandleTranslatedStreamSuccessResponse_SynthesizesTerminatorWhenUpstreamOmitsDone(t *testing.T) {
+	t.Parallel()
+
+	const (
+		finishChunk = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"tool_calls\"}]}\n\n"
+		usageChunk  = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n"
+		doneChunk   = "data: [DONE]\n\n"
+	)
+
+	cases := []struct {
+		name string
+		sse  string
+	}{
+		{name: "finish_reason only", sse: finishChunk},
+		{name: "finish_reason then usage", sse: finishChunk + usageChunk},
+		{name: "upstream sends done", sse: finishChunk + usageChunk + doneChunk},
+	}
+
+	clients := []struct {
+		protocol protocol.Protocol
+		model    string
+		terminal string
+	}{
+		{protocol: protocol.Anthropic, model: "claude-3-5-sonnet", terminal: "event: message_stop"},
+		{protocol: protocol.Codex, model: "gpt-5-codex", terminal: "event: response.completed"},
+	}
+
+	for _, client := range clients {
+		for _, tc := range cases {
+			t.Run(string(client.protocol)+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				reg := protocol.NewRegistry()
+				builtin.Register(reg)
+				s := &Server{protocolRegistry: reg}
+				reqCtx := &requestContext{
+					ctx:         context.Background(),
+					startTime:   time.Now(),
+					isStreaming: true,
+					transformPlan: protocol.TransformPlan{
+						ClientProtocol:   client.protocol,
+						UpstreamProtocol: protocol.OpenAI,
+						OriginalModel:    client.model,
+						ActualModel:      "gpt-4o",
+						NeedsTransform:   true,
+					},
+				}
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       io.NopCloser(strings.NewReader(tc.sse)),
+				}
+
+				rec := newRecorder()
+				res, _, err := s.handleTranslatedStreamSuccessResponse(
+					reqCtx, resp, resp.Header.Clone(), rec, string(protocol.OpenAI), &streamReadStats{}, nil,
+				)
+				if err != nil {
+					t.Fatalf("上游语义完整不得报错: %v", err)
+				}
+				if res.StreamDiagMsg != "" {
+					t.Fatalf("流已完整不得写诊断（会被判为 599）: %q", res.StreamDiagMsg)
+				}
+
+				body := rec.Body.String()
+				if got := strings.Count(body, client.terminal); got != 1 {
+					t.Fatalf("%q 出现 %d 次，want 1；body=%s", client.terminal, got, body)
+				}
+			})
+		}
 	}
 }
 
