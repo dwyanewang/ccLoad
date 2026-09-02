@@ -216,7 +216,30 @@ func main() {
 	// 监听系统信号，实现优雅关闭
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// 宿主机 MySQL 重启会重建 Unix Socket 的运行目录。若该目录以 bind
+	// mount 传给容器，旧容器可能永久看不到新 Socket；此时退出让 Docker
+	// 按 restart 策略重建容器并刷新挂载。仅 Unix Socket + 容器模式启用。
+	watchdog, err := storage.NewMySQLSocketWatchdogFromEnv()
+	if err != nil {
+		log.Fatalf("MySQL Socket 自愈配置错误: %v", err)
+	}
+	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
+	if watchdog != nil {
+		watchdog.Start(watchdogCtx, func() {
+			log.Printf("[INFO] 请求容器重启以恢复 MySQL Unix Socket 连接")
+			process, findErr := os.FindProcess(os.Getpid())
+			if findErr != nil {
+				log.Printf("[ERROR] 查找当前进程失败，无法触发容器重启: %v", findErr)
+				return
+			}
+			if signalErr := process.Signal(syscall.SIGTERM); signalErr != nil {
+				log.Printf("[ERROR] 发送 SIGTERM 触发容器重启失败: %v", signalErr)
+			}
+		})
+	}
 	<-quit
+	stopWatchdog()
 
 	// ✅ 停止信号监听,释放signal.Notify创建的后台goroutine
 	signal.Stop(quit)

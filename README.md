@@ -977,6 +977,7 @@ Environment variables cover bootstrap configuration only — the values ccLoad n
 | `CCLOAD_API_TOKENS` | None | Pre-seed API access tokens on startup. Format: `token1,token2` or `token1\|production,token2\|development`; existing tokens are not overwritten |
 | `API_TOKENS` | None | Compatibility alias for `CCLOAD_API_TOKENS`; startup fails if both variables are set with different values |
 | `CCLOAD_MYSQL` | None | MySQL DSN (optional, format: `user:pass@tcp(host:port)/db?charset=utf8mb4`)<br/>**Mutually exclusive with `CCLOAD_POSTGRES`** |
+| `CCLOAD_MYSQL_SOCKET_SELF_HEAL_SECONDS` | `60` in a container using a MySQL Unix-socket DSN | After this many continuously missing Socket seconds, exits so Docker can recreate the container and refresh its bind mount. `0` disables it; ignored for TCP, PostgreSQL, SQLite, and non-container deployments |
 | `CCLOAD_POSTGRES` | None | PostgreSQL DSN (optional, URL or libpq keywords, e.g. `postgres://user:pass@host:5432/db?sslmode=disable`)<br/>**Mutually exclusive with `CCLOAD_MYSQL`** |
 | `CCLOAD_ENABLE_SQLITE_REPLICA` | `0` | Hybrid storage mode switch (`1`=enable, needs MySQL or Postgres primary DSN) |
 | `CCLOAD_SQLITE_LOG_DAYS` | `7` | Initial log window when hybrid SQLite has no logs (-1=all); `0` disables all startup log imports, while other values make later startups import only logs after SQLite's latest timestamp |
@@ -993,6 +994,12 @@ Environment variables cover bootstrap configuration only — the values ccLoad n
 
 > If the service sits behind a reverse proxy or load balancer, set `TRUSTED_PROXIES` explicitly so spoofed `X-Forwarded-For` values cannot affect client IP detection or login rate limiting.
 > Responses WebSocket runtime usage and limits are available from `GET /admin/runtime-metrics`.
+
+#### MySQL Unix Socket container recovery
+
+When a host MySQL service recreates its runtime directory, an already-running container with that directory bind-mounted can remain attached to the old directory inode and permanently lose sight of the new Socket. For a container using `CCLOAD_MYSQL=user:pass@unix(/path/to/mysqld.sock)/db`, ccLoad watches only for that Socket path to be continuously absent. After 60 seconds by default it exits gracefully; Docker's existing `restart: unless-stopped` policy recreates the container and refreshes the mount.
+
+This is deliberately narrow: authentication failures, query failures, connection refusals, and short Socket interruptions do not trigger a restart. Set `CCLOAD_MYSQL_SOCKET_SELF_HEAL_SECONDS=0` to disable it, or adjust the grace period in seconds. The deployment must mount the Socket *directory* (not only the Socket file) and retain a Docker restart policy.
 
 #### Hybrid Storage Mode (Authoritative SQLite + Async Primary Replica)
 
