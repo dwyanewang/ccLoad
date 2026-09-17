@@ -79,20 +79,19 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates tzdata wget && \
     rm -rf /var/lib/apt/lists/*
 
-# 创建非root用户
+# 创建非root用户和数据目录（二进制由 COPY --chown 设置属主，避免 chown -R 在新层复制整份文件）
 RUN groupadd --gid 1001 ccload && \
-    useradd --uid 1001 --gid ccload --no-create-home --shell /usr/sbin/nologin ccload
+    useradd --uid 1001 --gid ccload --no-create-home --shell /usr/sbin/nologin ccload && \
+    mkdir -p /app/data && \
+    chown -R ccload:ccload /app
 
 WORKDIR /app
 
 # 从构建阶段复制（web资源已嵌入二进制）
-COPY --from=builder /app/ccload .
-COPY --from=cursor-bridge /app/cursor-sdk-bridge .
+# 低频变化的文件在前，每次发布都变化的 ccload 放最后一层，便于新旧版本镜像共享层
 COPY third_party/cursor-sdk-bridge/v1.0.28/LICENSE /usr/share/licenses/cursor-sdk-bridge/LICENSE
-
-# 创建数据目录并设置权限
-RUN mkdir -p /app/data && \
-    chown -R ccload:ccload /app
+COPY --from=cursor-bridge --chown=1001:1001 --chmod=0755 /app/cursor-sdk-bridge .
+COPY --from=builder --chown=1001:1001 --chmod=0755 /app/ccload .
 
 USER ccload
 
