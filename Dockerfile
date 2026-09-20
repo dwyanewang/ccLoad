@@ -89,7 +89,7 @@ WORKDIR /app
 
 # 从构建阶段复制（web资源已嵌入二进制）
 # 低频变化的文件在前，每次发布都变化的 ccload 放最后一层，便于新旧版本镜像共享层
-COPY third_party/cursor-sdk-bridge/v1.0.28/LICENSE /usr/share/licenses/cursor-sdk-bridge/LICENSE
+COPY third_party/cursor-sdk-bridge/v1.0.31/LICENSE /usr/share/licenses/cursor-sdk-bridge/LICENSE
 COPY --from=cursor-bridge --chown=1001:1001 --chmod=0755 /app/cursor-sdk-bridge .
 COPY --from=builder --chown=1001:1001 --chmod=0755 /app/ccload .
 
