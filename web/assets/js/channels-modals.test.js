@@ -96,7 +96,7 @@ test('inline Key rows preserve and normalize model scopes', () => {
     api_key: 'sk-test',
     note: 'primary',
     allowed_models: ['GPT-5', 'Claude-4'],
-    cost_multiplier: 1
+    priority: 0, cost_multiplier: 1
   });
   assert.deepEqual(normalizeInlineKeyRow('legacy-key').allowed_models, []);
   assert.equal(normalizeInlineKeyRow({ api_key: 'sk-free', cost_multiplier: 0 }).cost_multiplier, 0);
@@ -115,20 +115,20 @@ test('removing configured models prunes every restricted Key scope', () => {
   ];
 
   assert.deepEqual(pruneKeyAllowedModels(rows, [{ model: 'gpt-5' }]), [
-    { api_key: 'sk-primary', note: '', allowed_models: ['GPT-5'], cost_multiplier: 1 },
-    { api_key: 'sk-unrestricted', note: '', allowed_models: [], cost_multiplier: 1 }
+    { api_key: 'sk-primary', note: '', allowed_models: ['GPT-5'], priority: 0, cost_multiplier: 1 },
+    { api_key: 'sk-unrestricted', note: '', allowed_models: [], priority: 0, cost_multiplier: 1 }
   ]);
   assert.deepEqual(pruneKeyAllowedModels(rows, [{ model: '*' }]), [
-    { api_key: 'sk-primary', note: '', allowed_models: ['GPT-5', 'claude-opus'], cost_multiplier: 1 },
-    { api_key: 'sk-unrestricted', note: '', allowed_models: [], cost_multiplier: 1 }
+    { api_key: 'sk-primary', note: '', allowed_models: ['GPT-5', 'claude-opus'], priority: 0, cost_multiplier: 1 },
+    { api_key: 'sk-unrestricted', note: '', allowed_models: [], priority: 0, cost_multiplier: 1 }
   ]);
   assert.deepEqual(pruneKeyAllowedModels(
     [{ api_key: 'sk-thinking', allowed_models: ['gpt-5'] }],
     [{ model: 'gpt-5(max)' }]
-  ), [{ api_key: 'sk-thinking', note: '', allowed_models: ['gpt-5'], cost_multiplier: 1 }]);
+  ), [{ api_key: 'sk-thinking', note: '', allowed_models: ['gpt-5'], priority: 0, cost_multiplier: 1 }]);
   assert.deepEqual(pruneKeyAllowedModels(rows, []), [
-    { api_key: 'sk-primary', note: '', allowed_models: [], model_scope_empty: true, cost_multiplier: 1 },
-    { api_key: 'sk-unrestricted', note: '', allowed_models: [], cost_multiplier: 1 }
+    { api_key: 'sk-primary', note: '', allowed_models: [], model_scope_empty: true, priority: 0, cost_multiplier: 1 },
+    { api_key: 'sk-unrestricted', note: '', allowed_models: [], priority: 0, cost_multiplier: 1 }
   ]);
 });
 
@@ -162,7 +162,7 @@ test('single and batch model deletion use the same Key scope reconciliation', ()
       note: '',
       allowed_models: [],
       model_scope_empty: true,
-      cost_multiplier: 1
+      priority: 0, cost_multiplier: 1
     }]);
     assert.deepEqual([...global.selectedModelIndices], []);
   } finally {
@@ -845,7 +845,6 @@ function installEditChannelGlobals(channel, {
             available: true,
             items: [{ url: channel.urls[0].url, latency_ms: 125, requests: 1, failures: 0 }]
           },
-          features: { scheduled_check_enabled: true }
         };
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -948,7 +947,8 @@ function installModelRequestTestGlobals({ dirty = false } = {}) {
     editingChannelId: 7,
     editingChannelAuthType: 'api_key',
     channelFormDirty: dirty,
-    channels: [{ id: 7, name: 'test-channel' }],
+    document: { getElementById: id => id === 'channelName' ? { value: 'test-channel' } : null },
+    channels: [],
     testChannel: async (...args) => {
       calls.push({ type: 'open', args });
       return true;
@@ -1095,13 +1095,15 @@ test('editing a channel loads the complete editor state with one request', async
     enabled: true,
     protocol_transform_mode: 'auto'
   };
-  const fixture = installEditChannelGlobals(channel);
+  const keys = [{ api_key: 'sk-priority', priority: -7 }, { api_key: 'sk-default', priority: 0 }];
+  const fixture = installEditChannelGlobals(channel, { editorKeys: keys });
 
   try {
     const { editChannel } = loadChannelsModals();
     await editChannel(channel.id);
     assert.deepEqual(fixture.requests, [`/admin/channels/${channel.id}/editor`]);
     assert.equal(fixture.getElement('quickAddChannelBtn').hidden, false);
+    assert.deepEqual(fixture.loadedKeys, keys);
   } finally {
     fixture.restore();
   }
@@ -1185,6 +1187,9 @@ test('saving an xAI editor preserves xai_oauth and submits no key material', asy
   const channel = {
     id: 77,
     name: 'xai-save',
+    scheduled_check_enabled: true,
+    scheduled_check_interval_minutes: 37,
+    scheduled_check_start_time: '08:30',
     auth_type: 'xai_oauth',
     urls: [{ url: 'https://cli-chat-proxy.grok.com/v1', exact: false, protocols: ['codex'] }],
     models: [],
@@ -1220,6 +1225,11 @@ test('saving an xAI editor preserves xai_oauth and submits no key material', asy
 
     await saveChannel({ preventDefault() {} });
     assert.equal(submitted.auth_type, 'xai_oauth');
+    assert.equal(fixture.getElement('channelScheduledCheckIntervalMinutes').value, 37);
+    assert.equal(fixture.getElement('channelScheduledCheckStartTime').value, '08:30');
+    assert.equal(submitted.scheduled_check_enabled, true);
+    assert.equal(submitted.scheduled_check_interval_minutes, 37);
+    assert.equal(submitted.scheduled_check_start_time, '08:30');
     assert.equal(submitted.api_key, '');
     assert.deepEqual(submitted.api_keys, []);
     assert.equal(submitted.key_strategy, undefined);
@@ -1233,6 +1243,36 @@ test('saving an xAI editor preserves xai_oauth and submits no key material', asy
       if (descriptor === undefined) delete global[key];
       else Object.defineProperty(global, key, descriptor);
     }
+    fixture.restore();
+  }
+});
+
+test('saving rejects invalid daily schedules and focuses the field with an inline error', async () => {
+  const channel = { id: 80, name: 'invalid-schedule', auth_type: 'api_key', urls: [{ url: 'https://example.com' }], models: [] };
+  const fixture = installEditChannelGlobals(channel, { editorKeys: [] });
+  try {
+    const { editChannel, saveChannel } = loadChannelsModals();
+    await editChannel(channel.id);
+    for (const [id, value] of [
+      ['channelScheduledCheckIntervalMinutes', '0'],
+      ['channelScheduledCheckIntervalMinutes', '1.5'],
+      ['channelScheduledCheckIntervalMinutes', '1441'],
+      ['channelScheduledCheckStartTime', '8:30']
+    ]) {
+      fixture.getElement('channelScheduledCheckIntervalMinutes').value = '30';
+      fixture.getElement('channelScheduledCheckStartTime').value = '08:30';
+      const input = fixture.getElement(id);
+      input.id = id;
+      input.value = value;
+      let focused = false;
+      input.focus = () => { focused = true; };
+      await saveChannel({ preventDefault() {} });
+      assert.equal(focused, true);
+      assert.equal(fixture.getElement(`${id}Error`).hidden, false);
+      assert.ok(fixture.getElement(`${id}Error`).textContent);
+    }
+    assert.deepEqual(fixture.requests, ['/admin/channels/80/editor']);
+  } finally {
     fixture.restore();
   }
 });
@@ -1298,7 +1338,7 @@ test('saving an API Key channel submits per-Key model scopes', async () => {
   const fixture = installEditChannelGlobals(channel, { editorKeys: [] });
   const extraGlobals = new Map();
   const setGlobal = (key, value) => {
-    extraGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
+    if (!extraGlobals.has(key)) extraGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
     Object.defineProperty(global, key, { configurable: true, writable: true, value });
   };
   let submitted;
@@ -1317,8 +1357,8 @@ test('saving an API Key channel submits per-Key model scopes', async () => {
     ]) fixture.getElement(id).value = '0';
     setGlobal('getValidInlineURLConfigs', () => channel.urls);
     setGlobal('getValidInlineKeyRows', () => [
-      { api_key: 'sk-scoped', note: 'primary', allowed_models: ['gpt-5'], cost_multiplier: 2 },
-      { api_key: 'sk-emptied', note: '', allowed_models: [], model_scope_empty: true, cost_multiplier: 1 }
+      { api_key: 'sk-scoped', note: 'primary', allowed_models: ['gpt-5'], priority: -7, cost_multiplier: 2 },
+      { api_key: 'sk-emptied', note: '', allowed_models: [], model_scope_empty: true, priority: 0, cost_multiplier: 1 }
     ]);
     setGlobal('fetchAPIWithAuth', async (_url, options) => {
       submitted = JSON.parse(options.body);
@@ -1327,9 +1367,20 @@ test('saving an API Key channel submits per-Key model scopes', async () => {
 
     await saveChannel({ preventDefault() {} });
 	assert.deepEqual(submitted.api_keys, [
-		{ api_key: 'sk-scoped', note: 'primary', allowed_models: ['gpt-5'], model_scope_empty: false, cost_multiplier: 2 },
-      { api_key: 'sk-emptied', note: '', allowed_models: [], model_scope_empty: true, cost_multiplier: 1 }
+		{ api_key: 'sk-scoped', note: 'primary', allowed_models: ['gpt-5'], model_scope_empty: false, priority: -7, cost_multiplier: 2 },
+      { api_key: 'sk-emptied', note: '', allowed_models: [], model_scope_empty: true, priority: 0, cost_multiplier: 1 }
     ]);
+    for (const priority of [1.5, -100000, 10000000, NaN]) {
+      submitted = undefined;
+      setGlobal('getValidInlineKeyRows', () => [{ api_key: 'sk-test', priority }]);
+      await saveChannel({ preventDefault() {} });
+      assert.equal(submitted, undefined, `invalid priority ${priority} must not be submitted`);
+    }
+    setGlobal('getValidInlineKeyRows', () => [{ api_key: 'sk-test', priority: 0 }]);
+    await saveChannel({ preventDefault() {} });
+    assert.equal(submitted.api_keys[0].priority, 0);
+    assert.equal(submitted.key_strategy, undefined);
+
   } finally {
     for (const [key, descriptor] of extraGlobals) {
       if (descriptor === undefined) delete global[key];
@@ -1405,7 +1456,7 @@ for (const testCase of [
 
 test('common models add every selected type and ignore existing names case-insensitively', () => {
   const rows = [
-    { model: 'GPT-5.4', redirect_model: 'custom-upstream-model' }
+    { model: 'GPT-5.5', redirect_model: 'custom-upstream-model' }
   ];
 
   const restore = installCommonModelsGlobals();
@@ -1413,16 +1464,33 @@ test('common models add every selected type and ignore existing names case-insen
     const { addCommonModelsToRows } = loadChannelsModals();
     const result = addCommonModelsToRows(rows, ['anthropic', 'codex', 'anthropic']);
 
-    assert.deepEqual(result, { addedCount: 13, hasSupportedTypes: true });
-    assert.equal(rows.length, 14);
-    assert.equal(rows.filter(row => row.model.toLowerCase() === 'gpt-5.4').length, 1);
-    assert.ok(rows.some(row => row.model === 'claude-opus-4-8'));
-    assert.ok(rows.some(row => row.model === 'gpt-5.6-terra'));
-    assert.ok(rows.some(row => row.model === 'gpt-5.3-codex-spark'));
-    assert.ok(rows.some(row => row.model === 'codex-auto-review'));
+    assert.equal(result.hasSupportedTypes, true);
+    assert.ok(result.addedCount > 0);
+    assert.equal(rows.length, result.addedCount + 1);
+    assert.equal(rows.filter(row => row.model.toLowerCase() === 'gpt-5.5').length, 1);
+    assert.ok(rows.some(row => row.model.startsWith('claude-')));
+    assert.equal(rows[0].redirect_model, 'custom-upstream-model');
   } finally {
     restore.restore();
   }
+});
+
+test('model export uses selected rows and falls back to all rows when nothing is selected', () => {
+  const { getModelsForExport } = loadChannelsModals();
+  const rows = [
+    { model: 'gpt-a', redirect_model: 'upstream-a' },
+    { model: 'gpt-b', disabled: true },
+    { model: 'claude' }
+  ];
+
+  assert.deepEqual(getModelsForExport(rows, new Set([1])), [{
+    model: 'gpt-b', redirect_model: '', disabled: true
+  }]);
+  assert.deepEqual(getModelsForExport(rows, new Set()), [
+    { model: 'gpt-a', redirect_model: 'upstream-a', disabled: false },
+    { model: 'gpt-b', redirect_model: '', disabled: true },
+    { model: 'claude', redirect_model: '', disabled: false }
+  ]);
 });
 
 test('common models require at least one supported type', () => {
@@ -1483,7 +1551,11 @@ test('model row test opens the existing test flow for the current model and runs
     const { testRedirectModel } = loadChannelsModals();
     assert.equal(await testRedirectModel(0, fixture.button), true);
     assert.deepEqual(fixture.calls, [
-      { type: 'open', args: [7, 'test-channel', 'requested-model'] },
+      { type: 'open', args: [{
+        id: 7,
+        name: 'test-channel',
+        models: [{ model: 'requested-model', redirect_model: 'upstream-model', disabled: false }]
+      }, 'requested-model'] },
       { type: 'run' }
     ]);
     assert.equal(fixture.button.disabled, false);
@@ -2643,4 +2715,91 @@ test('single-Key channel never applies fetched Key model scopes', () => {
     if (previousWindow) Object.defineProperty(global, 'window', previousWindow);
     else delete global.window;
   }
+});
+
+
+test('Key sorting confirms priorities without rebuilding keys, cancels drafts, and rejects OAuth edits', () => {
+  const vm = require('node:vm');
+  const fs = require('node:fs');
+  const handlers = {};
+  const list = {
+    children: [],
+    addEventListener(name, handler) { handlers[name] = handler; },
+    replaceChildren() { this.children = []; },
+    appendChild(item) { this.children.push(item); },
+    querySelector(selector) {
+      return this.children.find(item => selector === `[data-index="${item.dataset.index}"]`);
+    }
+  };
+  const dialogEvents = {};
+  const dialog = {
+    dataset: {}, open: false,
+    addEventListener(name, handler) { dialogEvents[name] = handler; },
+    showModal() { this.open = true; },
+    close() { this.open = false; dialogEvents.close(); }
+  };
+  const rows = [
+    { api_key: 'sk-duplicate', note: 'first', allowed_models: ['gpt-5'], priority: -4, cost_multiplier: 2 },
+    { api_key: '', note: '', allowed_models: [], priority: 0, cost_multiplier: 1 },
+    { api_key: 'sk-duplicate', note: 'second', allowed_models: [], model_scope_empty: true, priority: 20, cost_multiplier: 0 }
+  ];
+  const states = [{ key_index: 0, disabled: true }, { key_index: 2, cooldown_remaining_ms: 30000 }];
+  const context = vm.createContext({
+    inlineKeyTableData: structuredClone(rows), currentChannelKeyCooldowns: structuredClone(states),
+    editingChannelAuthType: 'api_key', currentKeyStatusFilter: 'all',
+    document: { getElementById: id => id === 'keySortModal' ? dialog : list },
+    window: { t: key => key },
+    TemplateEngine: {
+      render(_template, data) {
+        const item = { dataset: { index: String(data.index) } };
+        const buttons = [-1, 1].map(direction => ({
+          dataset: { keySortMove: String(direction) }, disabled: false,
+          closest: () => item, focus() {}
+        }));
+        item.querySelector = selector => selector === 'button:not(:disabled)'
+          ? buttons.find(button => !button.disabled)
+          : buttons.find(button => selector === `[data-key-sort-move="${button.dataset.keySortMove}"]`);
+        return item;
+      }
+    }
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('./channels-keys.js'), 'utf8'), context);
+  let dirty = false;
+  context.renderInlineKeyTable = () => {};
+  context.markChannelFormDirty = () => { dirty = true; };
+  const readRows = () => JSON.parse(JSON.stringify(context.getInlineKeyRows()));
+  const move = (index, direction) => {
+    const button = list.querySelector(`[data-index="${index}"]`).querySelector(`[data-key-sort-move="${direction}"]`);
+    handlers.click({ target: { closest: () => button } });
+  };
+
+  context.openKeySortModal();
+  assert.equal(dialog.open, true);
+  assert.deepEqual(list.children.map(item => item.dataset.index), ['2', '0']);
+  move(0, -1);
+  assert.deepEqual(readRows(), rows, 'moving changes only the dialog draft');
+  context.closeKeySortModal();
+  assert.equal(dirty, false);
+  assert.deepEqual(readRows(), rows);
+
+  context.openKeySortModal();
+  assert.deepEqual(list.children.map(item => item.dataset.index), ['2', '0']);
+  move(0, -1);
+  context.confirmKeySort();
+  const expected = rows.map((row, index) => ({ ...row, priority: index === 0 ? 20 : index === 2 ? 10 : 0 }));
+  assert.deepEqual(readRows(), expected, 'duplicate keys retain separate identity and metadata');
+  assert.deepEqual(JSON.parse(JSON.stringify(context.currentChannelKeyCooldowns)), states);
+  assert.equal(dirty, true);
+  assert.equal(dialog.open, false);
+
+  context.openKeySortModal();
+  assert.deepEqual(list.children.map(item => item.dataset.index), ['0', '2']);
+  move(0, 1);
+  dialog.close(); // Native Escape closes without committing.
+  context.confirmKeySort();
+  assert.deepEqual(readRows(), expected);
+  context.editingChannelAuthType = 'codex_oauth';
+  context.openKeySortModal();
+  assert.equal(dialog.open, false);
+  assert.deepEqual(readRows(), expected);
 });

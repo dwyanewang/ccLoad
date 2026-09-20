@@ -28,6 +28,63 @@ func openTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestMigrateDailyChannelChecks(t *testing.T) {
+	for _, tc := range []struct {
+		hours            string
+		minutes, enabled int
+	}{
+		{"5", 300, 1}, {"0.5", 30, 1}, {"0.01", 1, 1},
+		{"0.51", 31, 1}, {"48", 1440, 1}, {"0", 300, 0},
+	} {
+		t.Run(tc.hours, func(t *testing.T) {
+			db, ctx := openTestDB(t), context.Background()
+			// Start with an actual legacy table, before the new columns exist.
+			_, err := db.ExecContext(ctx, `CREATE TABLE channels (
+				id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, url TEXT NOT NULL,
+				priority INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+				scheduled_check_enabled INTEGER NOT NULL DEFAULT 0,
+				cooldown_until INTEGER NOT NULL DEFAULT 0, cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
+				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+				INSERT INTO channels(id,name,url,scheduled_check_enabled,created_at,updated_at)
+				VALUES(1,'legacy','https://example.com',1,1,1);
+				CREATE TABLE system_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, value_type TEXT NOT NULL,
+				description TEXT NOT NULL, default_value TEXT NOT NULL, updated_at INTEGER NOT NULL);`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `INSERT INTO system_settings VALUES('channel_check_interval_hours',?,'float','','5',1)`, tc.hours); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrate(ctx, db, DialectSQLite); err != nil {
+				t.Fatal(err)
+			}
+			var minutes, enabled, remaining int
+			var start string
+			if err := db.QueryRowContext(ctx, `SELECT scheduled_check_interval_minutes,scheduled_check_start_time,scheduled_check_enabled FROM channels WHERE id=1`).Scan(&minutes, &start, &enabled); err != nil {
+				t.Fatal(err)
+			}
+			if minutes != tc.minutes || start != "00:00" || enabled != tc.enabled {
+				t.Fatalf("schedule=%d/%s/%d", minutes, start, enabled)
+			}
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM system_settings WHERE key='channel_check_interval_hours'`).Scan(&remaining); err != nil || remaining != 0 {
+				t.Fatalf("legacy setting remains: %d, %v", remaining, err)
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE channels SET scheduled_check_interval_minutes=17,scheduled_check_start_time='08:30' WHERE id=1`); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrate(ctx, db, DialectSQLite); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRowContext(ctx, `SELECT scheduled_check_interval_minutes,scheduled_check_start_time FROM channels WHERE id=1`).Scan(&minutes, &start); err != nil {
+				t.Fatal(err)
+			}
+			if minutes != 17 || start != "08:30" {
+				t.Fatalf("repeat migration overwrote schedule: %d/%s", minutes, start)
+			}
+		})
+	}
+}
+
 func TestMigrate_SQLite_AddsProtocolTransformModeWithAutoDefault(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1105,10 +1162,14 @@ func TestMigrateSQLite_BackfillsAPIKeyCostMultiplierFromChannels(t *testing.T) {
 	// api_key 渠道的 Key 下沉渠道倍率 2.5。
 	for _, keyIndex := range []int{0, 1} {
 		var multiplier float64
+		var priority int
 		if err := db.QueryRowContext(ctx, `
-			SELECT cost_multiplier FROM api_keys WHERE channel_id = 1 AND key_index = ?
-		`, keyIndex).Scan(&multiplier); err != nil {
+			SELECT cost_multiplier, priority FROM api_keys WHERE channel_id = 1 AND key_index = ?
+		`, keyIndex).Scan(&multiplier, &priority); err != nil {
 			t.Fatalf("query api key %d multiplier: %v", keyIndex, err)
+		}
+		if priority != 1-keyIndex {
+			t.Fatalf("legacy priority=%d, want %d", priority, 1-keyIndex)
 		}
 		if multiplier != 2.5 {
 			t.Fatalf("api key %d multiplier=%v, want 2.5", keyIndex, multiplier)
@@ -1125,6 +1186,10 @@ func TestMigrateSQLite_BackfillsAPIKeyCostMultiplierFromChannels(t *testing.T) {
 		t.Fatalf("oauth channel multiplier=%v, want 3.0", oauthMultiplier)
 	}
 
+	// 幂等迁移保留已经设置的 Key 优先级。
+	if _, err := db.ExecContext(ctx, `UPDATE api_keys SET priority = -7 WHERE channel_id = 1`); err != nil {
+		t.Fatal(err)
+	}
 	// 幂等：回填有一次性标记，渠道列后续变化不会再次下沉。
 	if _, err := db.ExecContext(ctx, `UPDATE channels SET cost_multiplier = 9.9 WHERE id = 1`); err != nil {
 		t.Fatalf("update channel multiplier: %v", err)
@@ -1133,10 +1198,14 @@ func TestMigrateSQLite_BackfillsAPIKeyCostMultiplierFromChannels(t *testing.T) {
 		t.Fatalf("second migrate: %v", err)
 	}
 	var multiplier float64
+	var priority int
 	if err := db.QueryRowContext(ctx, `
-		SELECT cost_multiplier FROM api_keys WHERE channel_id = 1 AND key_index = 0
-	`).Scan(&multiplier); err != nil {
+		SELECT cost_multiplier, priority FROM api_keys WHERE channel_id = 1 AND key_index = 0
+	`).Scan(&multiplier, &priority); err != nil {
 		t.Fatalf("query api key multiplier after second migrate: %v", err)
+	}
+	if priority != -7 {
+		t.Fatalf("second migrate priority=%d", priority)
 	}
 	if multiplier != 2.5 {
 		t.Fatalf("api key multiplier after second migrate=%v, want 2.5 (backfill must not rerun)", multiplier)
@@ -1501,7 +1570,6 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"gemini_non_stream_timeout",
 		"model_fuzzy_match",
 		"channel_test_content",
-		"channel_check_interval_hours",
 		"auto_update_interval_hours",
 		"auto_update_channel",
 		"channel_stats_range",
@@ -1526,9 +1594,6 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		).Scan(&val, &defaultValue)
 		if err != nil {
 			t.Errorf("setting %q not found: %v", key, err)
-		}
-		if key == "channel_check_interval_hours" && val != "5" {
-			t.Errorf("setting %q default = %q, want 5", key, val)
 		}
 		if key == "auto_update_interval_hours" && val != "12" {
 			t.Errorf("setting %q default = %q, want 12", key, val)
@@ -2097,5 +2162,76 @@ func TestHasMigration_NotApplied(t *testing.T) {
 
 	if hasMigration(ctx, db, "never_applied_migration", DialectSQLite) {
 		t.Fatal("never_applied_migration should not be applied")
+	}
+}
+
+func TestMigrateSQLite_SequentialKeyPriorities(t *testing.T) {
+	testSequentialKeyPrioritiesMigration(t, openTestDB(t), DialectSQLite)
+}
+
+// Shared by SQLite, MySQL and PostgreSQL startup migration tests.
+func testSequentialKeyPrioritiesMigration(t *testing.T, db *sql.DB, dialect Dialect) {
+	t.Helper()
+	ctx := context.Background()
+	if err := migrate(ctx, db, dialect); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name, auth, strategy string
+		priorities, want     []int
+	}{
+		{"sequential", "api_key", "sequential", []int{0, 0, 0}, []int{2, 1, 0}},
+		{"round-robin", "api_key", "round_robin", []int{0, 0, 0}, []int{0, 0, 0}},
+		{"custom-sequential", "api_key", "sequential", []int{0, -3, 8}, []int{0, -3, 8}},
+		{"custom-round-robin", "api_key", "round_robin", []int{9, 0, -2}, []int{9, 0, -2}},
+		{"oauth", "codex_oauth", "sequential", []int{0, 0, 0}, []int{0, 0, 0}},
+	}
+	for i, tc := range cases {
+		id := i + 1
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect,
+			"INSERT INTO channels (id,name,url,auth_type,created_at,updated_at) VALUES (?,?,'[]',?,1,1)"), id, tc.name, tc.auth); err != nil {
+			t.Fatal(err)
+		}
+		// Insert out of order with non-contiguous indices; include disabled/cooling keys.
+		for _, j := range []int{2, 0, 1} {
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `INSERT INTO api_keys
+    (channel_id,key_index,api_key,key_strategy,priority,disabled,cooldown_until,cooldown_duration_ms,created_at,updated_at)
+    VALUES (?,?,'sk-test',?,?,1,1234567,456,1,2)`), id, []int{2, 7, 21}[j], tc.strategy, tc.priorities[j]); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, "DELETE FROM schema_migrations WHERE version = ?"), sequentialKeyPrioritiesMigrationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(ctx, db, dialect); err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range cases {
+		for j, want := range tc.want {
+			var priority, disabled, until, duration, updated int
+			var strategy string
+			if err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, `SELECT priority,key_strategy,disabled,cooldown_until,cooldown_duration_ms,updated_at
+    FROM api_keys WHERE channel_id = ? AND key_index = ?`), i+1, []int{2, 7, 21}[j]).Scan(&priority, &strategy, &disabled, &until, &duration, &updated); err != nil {
+				t.Fatal(err)
+			}
+			if priority != want || strategy != tc.strategy || disabled != 1 || until != 1234567 || duration != 456 || updated != 2 {
+				t.Fatalf("%s key %d: priority=%d want=%d strategy=%s disabled=%d cooldown=%d/%d updated=%d", tc.name, j, priority, want, strategy, disabled, until, duration, updated)
+			}
+		}
+	}
+	// Clearing all priorities after the migration must survive later restarts.
+	if _, err := db.ExecContext(ctx, "UPDATE api_keys SET priority = 0 WHERE channel_id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(ctx, db, dialect); err != nil {
+		t.Fatal(err)
+	}
+	var total int
+	if err := db.QueryRowContext(ctx, "SELECT SUM(priority) FROM api_keys WHERE channel_id = 1").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Fatalf("migration reapplied: priority sum=%d", total)
 	}
 }

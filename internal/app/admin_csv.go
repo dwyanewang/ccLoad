@@ -16,6 +16,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/cursorauth"
@@ -99,7 +100,7 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 	writer := csv.NewWriter(buf)
 	defer writer.Flush()
 
-	header := []string{"id", "name", "api_key", "api_key_allowed_models", "api_key_cost_multipliers", "api_key_model_scope_empty", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "management_daily_checkin_enabled", "management_daily_checkin_time", "websockets"}
+	header := []string{"id", "name", "api_key", "api_key_allowed_models", "api_key_cost_multipliers", "api_key_priorities", "api_key_model_scope_empty", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "management_daily_checkin_enabled", "management_daily_checkin_time", "websockets", "scheduled_check_interval_minutes", "scheduled_check_start_time"}
 	if err := writer.Write(header); err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
@@ -129,6 +130,15 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 		apiKeyModelScopeEmptyJSON, err := sonic.Marshal(apiKeyModelScopeEmpty)
 		if err != nil {
 			RespondError(c, http.StatusInternalServerError, fmt.Errorf("serialize API key empty model scopes for channel %d: %w", cfg.ID, err))
+			return
+		}
+		apiKeyPriorities := make([]int, len(apiKeys))
+		for i, key := range apiKeys {
+			apiKeyPriorities[i] = key.Priority
+		}
+		apiKeyPrioritiesJSON, err := sonic.Marshal(apiKeyPriorities)
+		if err != nil {
+			RespondError(c, http.StatusInternalServerError, err)
 			return
 		}
 		apiKeyCostMultipliers := make([]float64, len(apiKeys))
@@ -196,6 +206,7 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 			apiKeyStr,
 			string(apiKeyAllowedModelsJSON),
 			string(apiKeyCostMultipliersJSON),
+			string(apiKeyPrioritiesJSON),
 			string(apiKeyModelScopeEmptyJSON),
 			string(urlsJSON),
 			strconv.Itoa(cfg.Priority),
@@ -215,6 +226,8 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 			managementCheckinEnabled,
 			managementCheckinTime,
 			strconv.FormatBool(cfg.Websockets),
+			strconv.Itoa(cfg.ScheduledCheckIntervalMinutes),
+			cfg.ScheduledCheckStartTime,
 		}
 		if err := writer.Write(record); err != nil {
 			RespondError(c, http.StatusInternalServerError, err)
@@ -279,28 +292,33 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 	_, hasRetryOtherKeysOnFailureColumn := columnIndex["retry_other_keys_on_failure"]
 	_, hasWebsocketsColumn := columnIndex["websockets"]
 	_, hasAPIKeyAllowedModelsColumn := columnIndex["api_key_allowed_models"]
+	_, hasAPIKeyPrioritiesColumn := columnIndex["api_key_priorities"]
 	_, hasAPIKeyCostMultipliersColumn := columnIndex["api_key_cost_multipliers"]
 	_, hasAPIKeyModelScopeEmptyColumn := columnIndex["api_key_model_scope_empty"]
 	existingScheduledCheckByName := make(map[string]bool)
 	existingScheduledCheckModelByName := make(map[string]string)
+	existingSchedulesByName := make(map[string]*model.Config)
+	_, hasInterval := columnIndex["scheduled_check_interval_minutes"]
+	_, hasStart := columnIndex["scheduled_check_start_time"]
 	existingCooldownDetectionRulesByName := make(map[string]*model.CooldownDetectionRules)
 	existingRetryOtherKeysOnFailureByName := make(map[string]bool)
 	existingWebsocketsByName := make(map[string]bool)
 	existingAPIKeysByName := make(map[string][]*model.APIKey)
-	if !hasScheduledCheckColumn || !hasScheduledCheckModelColumn || !hasCooldownDetectionRulesColumn || !hasRetryOtherKeysOnFailureColumn || !hasWebsocketsColumn || !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyModelScopeEmptyColumn {
+	if !hasInterval || !hasStart || !hasScheduledCheckColumn || !hasScheduledCheckModelColumn || !hasCooldownDetectionRulesColumn || !hasRetryOtherKeysOnFailureColumn || !hasWebsocketsColumn || !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn {
 		existingConfigs, err := s.store.ListConfigs(c.Request.Context())
 		if err != nil {
 			RespondError(c, http.StatusInternalServerError, err)
 			return
 		}
 		for _, cfg := range existingConfigs {
+			existingSchedulesByName[cfg.Name] = cfg
 			existingScheduledCheckByName[cfg.Name] = cfg.ScheduledCheckEnabled
 			existingScheduledCheckModelByName[cfg.Name] = cfg.ScheduledCheckModel
 			existingCooldownDetectionRulesByName[cfg.Name] = cfg.CooldownDetectionRules.Clone()
 			existingRetryOtherKeysOnFailureByName[cfg.Name] = cfg.RetryOtherKeysOnFailure
 			existingWebsocketsByName[cfg.Name] = cfg.Websockets
 		}
-		if !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyModelScopeEmptyColumn {
+		if !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn {
 			allAPIKeys, err := s.store.GetAllAPIKeys(c.Request.Context())
 			if err != nil {
 				RespondError(c, http.StatusInternalServerError, err)
@@ -342,6 +360,7 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 			hasWebsocketsColumn,
 			hasAPIKeyAllowedModelsColumn,
 			hasAPIKeyCostMultipliersColumn,
+			hasAPIKeyPrioritiesColumn,
 			hasAPIKeyModelScopeEmptyColumn,
 			existingScheduledCheckByName,
 			existingScheduledCheckModelByName,
@@ -349,6 +368,7 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 			existingRetryOtherKeysOnFailureByName,
 			existingWebsocketsByName,
 			existingAPIKeysByName,
+			existingSchedulesByName,
 		)
 		if skip {
 			if errMsg != "" {
@@ -483,6 +503,7 @@ func (s *Server) parseChannelImportRow(
 	hasWebsocketsColumn bool,
 	hasAPIKeyAllowedModelsColumn bool,
 	hasAPIKeyCostMultipliersColumn bool,
+	hasAPIKeyPrioritiesColumn bool,
 	hasAPIKeyModelScopeEmptyColumn bool,
 	existingScheduledCheckByName map[string]bool,
 	existingScheduledCheckModelByName map[string]string,
@@ -490,6 +511,7 @@ func (s *Server) parseChannelImportRow(
 	existingRetryOtherKeysOnFailureByName map[string]bool,
 	existingWebsocketsByName map[string]bool,
 	existingAPIKeysByName map[string][]*model.APIKey,
+	existingSchedulesByName map[string]*model.Config,
 ) (channel *model.ChannelWithKeys, errMsg string, skip bool) {
 	if isCSVRecordEmpty(record) {
 		return nil, "", true
@@ -507,6 +529,7 @@ func (s *Server) parseChannelImportRow(
 	apiKey := fetch("api_key")
 	apiKeyAllowedModelsRaw := fetch("api_key_allowed_models")
 	apiKeyCostMultipliersRaw := fetch("api_key_cost_multipliers")
+	apiKeyPrioritiesRaw := fetch("api_key_priorities")
 	apiKeyModelScopeEmptyRaw := fetch("api_key_model_scope_empty")
 	rawAuthType := fetch("auth_type")
 	oauthCredential := fetch("oauth_credential")
@@ -666,6 +689,24 @@ func (s *Server) parseChannelImportRow(
 		scheduledCheckEnabled = false
 	}
 
+	interval, start := model.DefaultScheduledCheckIntervalMinutes, model.DefaultScheduledCheckStartTime
+	if existing := existingSchedulesByName[name]; existing != nil {
+		interval, start = existing.ScheduledCheckIntervalMinutes, existing.ScheduledCheckStartTime
+	}
+	if _, present := columnIndex["scheduled_check_interval_minutes"]; present {
+		parsed, err := strconv.Atoi(fetch("scheduled_check_interval_minutes"))
+		if err != nil {
+			return nil, fmt.Sprintf("第%d行 scheduled_check_interval_minutes 必须为 1–1440 的整数分钟", lineNo), true
+		}
+		interval = parsed
+	}
+	if _, present := columnIndex["scheduled_check_start_time"]; present {
+		start = fetch("scheduled_check_start_time")
+	}
+	if err := model.ValidateScheduledCheckSchedule(interval, start); err != nil {
+		return nil, fmt.Sprintf("第%d行: %v", lineNo, err), true
+	}
+
 	rawScheduledCheckModel := fetch("scheduled_check_model")
 	scheduledCheckModel := existingScheduledCheckModelByName[name]
 	shouldValidateScheduledCheckModel := false
@@ -747,21 +788,23 @@ func (s *Server) parseChannelImportRow(
 	// 构建渠道配置
 	// CSV 中的 id 只在导出实例内有意义，跨库导入必须按渠道名称匹配。
 	cfg := &model.Config{
-		Name:                    name,
-		AuthType:                authType,
-		OAuthCredential:         oauthCredential,
-		Websockets:              websockets,
-		URLs:                    urls,
-		Priority:                priority,
-		RPMLimit:                rpmLimit,
-		MaxConcurrency:          maxConcurrency,
-		ModelEntries:            modelEntries,
-		ProtocolTransformMode:   protocolTransformMode,
-		Enabled:                 enabled,
-		ScheduledCheckEnabled:   scheduledCheckEnabled,
-		ScheduledCheckModel:     scheduledCheckModel,
-		CooldownDetectionRules:  cooldownDetectionRules,
-		RetryOtherKeysOnFailure: retryOtherKeysOnFailure,
+		Name:                          name,
+		AuthType:                      authType,
+		OAuthCredential:               oauthCredential,
+		Websockets:                    websockets,
+		URLs:                          urls,
+		Priority:                      priority,
+		RPMLimit:                      rpmLimit,
+		MaxConcurrency:                maxConcurrency,
+		ModelEntries:                  modelEntries,
+		ProtocolTransformMode:         protocolTransformMode,
+		Enabled:                       enabled,
+		ScheduledCheckEnabled:         scheduledCheckEnabled,
+		ScheduledCheckModel:           scheduledCheckModel,
+		ScheduledCheckIntervalMinutes: interval,
+		ScheduledCheckStartTime:       start,
+		CooldownDetectionRules:        cooldownDetectionRules,
+		RetryOtherKeysOnFailure:       retryOtherKeysOnFailure,
 	}
 
 	// 解析并构建API Keys
@@ -773,7 +816,7 @@ func (s *Server) parseChannelImportRow(
 		for i, key := range apiKeyList {
 			submitted[i].APIKey = key
 		}
-		preserveOmittedAPIKeyAllowedModels(submitted, existingAPIKeysByName[name])
+		preserveOmittedAPIKeyMetadata(submitted, existingAPIKeysByName[name])
 		for i := range submitted {
 			apiKeyAllowedModels[i] = submitted[i].AllowedModels
 			apiKeyModelScopeEmpty[i] = submitted[i].ModelScopeEmpty
@@ -825,6 +868,29 @@ func (s *Server) parseChannelImportRow(
 			}
 		}
 	}
+	apiKeyPriorities := make([]int, len(apiKeyList))
+	if !hasAPIKeyPrioritiesColumn {
+		existing := existingAPIKeysByName[name]
+		for i := range apiKeyPriorities {
+			if i < len(existing) && existing[i] != nil && existing[i].APIKey == apiKeyList[i] {
+				apiKeyPriorities[i] = existing[i].Priority
+			}
+		}
+	} else if apiKeyPrioritiesRaw != "" {
+		var submittedPriorities []*int
+		if err := sonic.Unmarshal([]byte(apiKeyPrioritiesRaw), &submittedPriorities); err != nil {
+			return nil, fmt.Sprintf("第%d行 api_key_priorities 无效: %v", lineNo, err), true
+		}
+		if len(submittedPriorities) != len(apiKeyList) {
+			return nil, fmt.Sprintf("第%d行 api_key_priorities 数量必须与 api_key 一致", lineNo), true
+		}
+		for i, priority := range submittedPriorities {
+			if priority == nil || *priority < -99999 || *priority > 9999999 {
+				return nil, fmt.Sprintf("第%d行 api_key_priorities[%d] 必须为 -99999～9999999 之间的整数", lineNo, i), true
+			}
+			apiKeyPriorities[i] = *priority
+		}
+	}
 	canonicalModels := make(map[string]string, len(modelEntries))
 	for _, entry := range modelEntries {
 		canonicalModels[strings.ToLower(model.RoutingModelName(entry.Model))] = model.RoutingModelName(entry.Model)
@@ -854,6 +920,7 @@ func (s *Server) parseChannelImportRow(
 			Disabled:        apiKeyModelScopeEmpty[i],
 			KeyStrategy:     keyStrategy,
 			CostMultiplier:  apiKeyCostMultipliers[i],
+			Priority:        apiKeyPriorities[i],
 		}
 	}
 
@@ -879,6 +946,12 @@ func exportChannelManagementCheckin(cfg *model.Config) (enabled, checkinTime str
 
 func normalizeCSVImportOAuthCredential(authType, raw string) (string, error) {
 	switch authType {
+	case model.AuthTypeCodeBuddyOAuth:
+		credential, err := codebuddyauth.ParseCredential([]byte(raw))
+		if err != nil {
+			return "", err
+		}
+		return credential.JSON()
 	case model.AuthTypeCodexOAuth:
 		credential, err := codexauth.ParseCredential([]byte(raw))
 		if err != nil {
@@ -981,6 +1054,29 @@ func (s *Server) validateCSVImportOAuthCredential(
 ) (string, error) {
 	client := s.getClientForChannel(existing)
 	switch imported.GetAuthType() {
+	case model.AuthTypeCodeBuddyOAuth:
+		credential, err := codebuddyauth.ParseCredential([]byte(imported.OAuthCredential))
+		if err != nil {
+			return "", err
+		}
+		current, err := codebuddyauth.ParseCredential([]byte(existing.OAuthCredential))
+		if err != nil {
+			return "", err
+		}
+		if !codeBuddyIdentityMatches(current, credential) {
+			return "", errors.New("CodeBuddy imported account does not match existing channel")
+		}
+		if credential.RefreshToken != "" {
+			service := *s.codeBuddyService
+			service.Client = client
+			credential, err = service.Refresh(ctx, credential)
+			if err != nil {
+				return "", err
+			}
+		} else if credential.AccessToken != current.AccessToken {
+			return "", errors.New("cannot validate replacement CodeBuddy token without refresh_token")
+		}
+		return credential.JSON()
 	case model.AuthTypeCodexOAuth:
 		credential, err := codexauth.ParseCredential([]byte(imported.OAuthCredential))
 		if err != nil {
@@ -1189,6 +1285,10 @@ func normalizeCSVHeader(name string) string {
 		return "scheduled_check_enabled"
 	case "scheduled-check-model", "scheduledcheckmodel", "scheduled check model":
 		return "scheduled_check_model"
+	case "scheduled-check-interval-minutes", "scheduledcheckintervalminutes", "scheduled check interval minutes":
+		return "scheduled_check_interval_minutes"
+	case "scheduled-check-start-time", "scheduledcheckstarttime", "scheduled check start time":
+		return "scheduled_check_start_time"
 	case "management-daily-checkin-enabled", "managementdailycheckinenabled", "management daily checkin enabled":
 		return "management_daily_checkin_enabled"
 	case "management-daily-checkin-time", "managementdailycheckintime", "management daily checkin time":

@@ -11,6 +11,7 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -80,27 +81,22 @@ func validateClientBodyMatchesProtocol(clientProtocol protocol.Protocol, body []
 }
 
 func sanitizeCodexAlphaSearchBody(body []byte) []byte {
-	var payload map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &payload); err != nil || payload == nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
 
-	removed := false
+	updated := body
 	for _, field := range []string{"prompt_cache_key", "prompt_cache_retention"} {
-		if _, exists := payload[field]; exists {
-			delete(payload, field)
-			removed = true
+		if !gjson.GetBytes(updated, field).Exists() {
+			continue
+		}
+		var err error
+		updated, err = sjson.DeleteBytes(updated, field)
+		if err != nil {
+			return body
 		}
 	}
-	if !removed {
-		return body
-	}
-
-	sanitized, err := sonic.Marshal(payload)
-	if err != nil {
-		return body
-	}
-	return sanitized
+	return updated
 }
 
 // multimodalMarkerWords 是跨协议的多模态特征词。请求体不含任何一个词时
@@ -168,13 +164,16 @@ func requestHasNonTextContent(clientProtocol protocol.Protocol, body []byte) boo
 // 表示命中，立即停止全部遍历并返回 true，全部未命中返回 false。`#` 组装的路径
 // （如 messages.#.content.#.type）会产生多层嵌套数组，gjson 的 @flatten 对这些
 // 结构不压平，必须自递归。
-func forEachJSONValue(result gjson.Result, visit func(gjson.Result) bool) bool {
+func forEachJSONValue(result gjson.Result, depth int, visit func(gjson.Result) bool) bool {
+	if depth > jsonWalkMaxDepth {
+		return visit(result)
+	}
 	if !result.IsArray() {
 		return visit(result)
 	}
 	found := false
 	result.ForEach(func(_, child gjson.Result) bool {
-		found = forEachJSONValue(child, visit)
+		found = forEachJSONValue(child, depth+1, visit)
 		return !found
 	})
 	return found
@@ -182,7 +181,7 @@ func forEachJSONValue(result gjson.Result, visit func(gjson.Result) bool) bool {
 
 // hasNonTextType 沿 gjson 路径收集 type 值，命中目标集合立即停止遍历。
 func hasNonTextType(body []byte, path string, tags map[string]bool) bool {
-	return forEachJSONValue(gjson.GetBytes(body, path), func(value gjson.Result) bool {
+	return forEachJSONValue(gjson.GetBytes(body, path), 0, func(value gjson.Result) bool {
 		return tags[value.String()]
 	})
 }
@@ -191,7 +190,7 @@ func hasNonTextType(body []byte, path string, tags map[string]bool) bool {
 // 只能按字段存在性判定；对 `#` 聚合路径做 Exists() 会因 gjson 把空命中返回成
 // `[]`/`[[]]`（JSON 数组）而恒真，所以必须落到单个 part 对象上逐个查。
 func hasGeminiNonTextPart(body []byte) bool {
-	return forEachJSONValue(gjson.GetBytes(body, "contents.#.parts"), func(part gjson.Result) bool {
+	return forEachJSONValue(gjson.GetBytes(body, "contents.#.parts"), 0, func(part gjson.Result) bool {
 		for _, key := range geminiNonTextKeys {
 			if part.Get(key).Exists() {
 				return true

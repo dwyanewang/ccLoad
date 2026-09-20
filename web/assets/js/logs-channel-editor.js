@@ -1,15 +1,21 @@
 (function () {
   const CHANNEL_MODAL_IDS = [
     'channelModal',
+    'quickAddChannelModal',
     'commonModelsModal',
+    'keyModelScopeModal',
     'keyImportModal',
     'keyExportModal',
+    'keySortModal',
     'modelImportModal',
-    'customRulesModal'
+    'customRulesModal',
+    'testModal',
+    'upstreamDetailModal'
   ];
 
   const CHANNEL_TEMPLATE_IDS = [
     'tpl-key-row',
+    'tpl-key-sort-item',
     'tpl-key-empty',
     'tpl-cooldown-badge',
     'tpl-key-normal-status',
@@ -17,18 +23,25 @@
     'tpl-url-row',
     'tpl-url-empty',
     'tpl-redirect-row',
-    'tpl-redirect-empty'
+    'tpl-redirect-empty',
+    'tpl-test-result-header',
+    'tpl-response-section',
+    'tpl-batch-fail-item'
   ];
 
   const CHANNEL_EDITOR_SCRIPTS = [
     '/web/assets/js/channels-state.js',
+    '/web/assets/js/channels-render.js',
     '/web/assets/js/channels-codex-auth.js',
     '/web/assets/js/channels-keys.js',
     '/web/assets/js/channels-urls.js',
     '/web/assets/js/channels-custom-rules.js',
     '/web/assets/js/channels-cooldown-detection.js',
+    '/web/assets/js/model-entry-parser.js',
     '/web/assets/js/channels-modals.js',
-    '/web/assets/js/channels-management.js'
+    '/web/assets/js/channels-management.js',
+    '/web/assets/js/channels-test.js',
+    '/web/assets/js/upstream-detail-modal.js'
   ];
 
   const loadedScriptPromises = new Map();
@@ -94,13 +107,17 @@
       return resolved;
     }
 
+    const script = document.createElement('script');
     const promise = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
       script.src = getVersionedAssetURL(path);
       script.defer = true;
       script.onload = () => resolve();
       script.onerror = () => reject(new Error(`Failed to load script: ${path}`));
       document.head.appendChild(script);
+    }).catch((error) => {
+      loadedScriptPromises.delete(normalizedPath);
+      script.remove();
+      throw error;
     });
 
     loadedScriptPromises.set(normalizedPath, promise);
@@ -151,6 +168,7 @@
       const modelImportModal = document.getElementById('modelImportModal');
       const keyImportModal = document.getElementById('keyImportModal');
       const keyExportModal = document.getElementById('keyExportModal');
+      const testModal = document.getElementById('testModal');
       const channelModal = document.getElementById('channelModal');
 
       if (customRulesModal && customRulesModal.classList.contains('show')) {
@@ -161,6 +179,8 @@
         closeKeyImportModal();
       } else if (keyExportModal && keyExportModal.classList.contains('show')) {
         closeKeyExportModal();
+      } else if (testModal && testModal.classList.contains('show')) {
+        closeTestModal();
       } else if (channelModal && channelModal.classList.contains('show')) {
         closeModal();
       }
@@ -181,7 +201,7 @@
   function installChannelModalHooks() {
     if (window.ChannelModalHooks) return;
     window.ChannelModalHooks = {
-      afterSave: async () => {
+      afterUpdate: async () => {
         if (typeof load === 'function') {
           await load(true);
         }
@@ -189,7 +209,7 @@
     };
   }
 
-  function initializeChannelEditorFeatures() {
+  async function initializeChannelEditorFeatures() {
     installChannelModalHooks();
 
     if (typeof initChannelEditorActions === 'function') {
@@ -213,6 +233,9 @@
 
     bindEscapeHandlerOnce();
     bindLocaleHandlerOnce();
+    if (typeof loadDefaultTestContent === 'function') {
+      await loadDefaultTestContent();
+    }
   }
 
   async function ensureLogChannelEditorReady() {
@@ -227,7 +250,7 @@
         await loadScriptOnce(scriptPath);
       }
 
-      initializeChannelEditorFeatures();
+      await initializeChannelEditorFeatures();
     })();
 
     try {

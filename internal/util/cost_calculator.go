@@ -48,10 +48,17 @@ func newCostComponent(quantity int, pricePerMillion float64) CostComponent {
 	}
 }
 
-func newCacheWriteCostComponent(cache5mTokens, cache1hTokens int, inputPricePerMillion float64) CostComponent {
+// newCacheWriteCostComponent 计算缓存创建成本。
+// 5 分钟档按显式单价或「生效输入价 × 1.25」；1 小时档恒为「生效输入价 × 2」
+// （OpenAI 不支持 cache_creation，只有 Claude 系会带 1h token）。
+func newCacheWriteCostComponent(cache5mTokens, cache1hTokens int, inputPricePerMillion, explicit5mPricePerMillion float64, hasExplicit5mPrice bool) CostComponent {
 	quantity := cache5mTokens + cache1hTokens
-	cost := (float64(cache5mTokens)*inputPricePerMillion*cacheWrite5mMultiplier +
-		float64(cache1hTokens)*inputPricePerMillion*cacheWrite1hMultiplier) / 1_000_000
+	cache5mPrice := inputPricePerMillion * cacheWrite5mMultiplier
+	if hasExplicit5mPrice {
+		cache5mPrice = explicit5mPricePerMillion
+	}
+	cache1hPrice := inputPricePerMillion * cacheWrite1hMultiplier
+	cost := (float64(cache5mTokens)*cache5mPrice + float64(cache1hTokens)*cache1hPrice) / 1_000_000
 	pricePerMillion := 0.0
 	if quantity > 0 {
 		pricePerMillion = cost * 1_000_000 / float64(quantity)
@@ -81,19 +88,22 @@ func scaleCostBreakdown(breakdown StandardCostBreakdown, multiplier float64) Sta
 	return breakdown
 }
 
-type imageGenerationToolPricing struct {
-	TextInputPrice   float64
-	TextCachedPrice  float64
-	ImageInputPrice  float64
-	ImageCachedPrice float64
-	ImageOutputPrice float64
-}
-
-type imageGenerationFallbackPricing map[string]map[string]float64
+type imageGenerationToolPricing = ImageGenerationPricing
+type imageGenerationFallbackPricing = ImageGenerationFallbackPricing
 
 var imageGenerationToolPricingByModel = map[string]imageGenerationToolPricing{
 	// 来源: https://openai.com/api/pricing/ (GPT Image 2, per 1M tokens)
 	"gpt-image-2": {
+		TextInputPrice: 5.00, TextCachedPrice: 1.25,
+		ImageInputPrice: 8.00, ImageCachedPrice: 2.00, ImageOutputPrice: 30.00,
+	},
+	// https://developers.openai.com/api/docs/models/gpt-image-2.5-flare
+	"gpt-image-2.5-flare": {
+		TextInputPrice: 5.00, TextCachedPrice: 1.25,
+		ImageInputPrice: 8.00, ImageCachedPrice: 2.00, ImageOutputPrice: 30.00,
+	},
+	// https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst
+	"gpt-image-2.5-sunburst": {
 		TextInputPrice: 5.00, TextCachedPrice: 1.25,
 		ImageInputPrice: 8.00, ImageCachedPrice: 2.00, ImageOutputPrice: 30.00,
 	},
@@ -167,7 +177,9 @@ const (
 func getTierThresholdForModel(model string) int {
 	lowerModel := strings.ToLower(model)
 	switch {
-	case strings.HasPrefix(lowerModel, "gpt-5.5"),
+	case strings.HasPrefix(lowerModel, "gpt-6"),
+		strings.HasPrefix(lowerModel, "gpt-5.6"),
+		strings.HasPrefix(lowerModel, "gpt-5.5"),
 		strings.HasPrefix(lowerModel, "gpt-5.4"):
 		return gpt54TierThreshold
 	case strings.HasPrefix(lowerModel, "minimax-m3"):
@@ -280,7 +292,7 @@ func calculateCostBreakdownDetailed(model string, inputTokens, outputTokens, cac
 		hasSelectedTier = true
 		inputPricePerM = selectedTier.InputPrice
 		outputPricePerM = selectedTier.OutputPrice
-	} else if pricing.InputPriceHigh > 0 && tierInputTokens > tierThreshold {
+	} else if (pricing.HasInputPriceHigh || pricing.InputPriceHigh > 0) && tierInputTokens > tierThreshold {
 		useHighPricing = true
 		inputPricePerM = pricing.InputPriceHigh
 		outputPricePerM = pricing.OutputPriceHigh // 分段定价同时影响输入和输出
@@ -296,6 +308,8 @@ func calculateCostBreakdownDetailed(model string, inputTokens, outputTokens, cac
 	cacheReadPrice := pricing.CacheReadPrice
 	if hasSelectedTier && selectedTier.HasCacheReadPrice {
 		cacheReadPrice = selectedTier.CacheReadPrice
+	} else if useHighPricing && (pricing.HasCacheReadPriceHigh || pricing.CacheReadPriceHigh > 0) {
+		cacheReadPrice = pricing.CacheReadPriceHigh
 	} else if !pricing.HasCacheReadPrice {
 		cacheMultiplier := cacheReadMultiplierClaude // Claude全系/Gemini: 10%折扣
 		if isOpenAIModel(model) {
@@ -305,13 +319,20 @@ func calculateCostBreakdownDetailed(model string, inputTokens, outputTokens, cac
 			cacheMultiplier = cacheReadMultiplierOpus // Opus: 10%折扣
 		}
 		cacheReadPrice = inputPricePerM * cacheMultiplier
-	} else if useHighPricing && pricing.CacheReadPriceHigh > 0 {
-		cacheReadPrice = pricing.CacheReadPriceHigh
 	}
 	breakdown.CacheRead = newCostComponent(cacheReadTokens, cacheReadPrice)
 
 	// 4/5. 缓存创建成本。日志 UI 只展示一行，因此按 Token 数合并为实际加权单价。
-	breakdown.CacheWrite = newCacheWriteCostComponent(cache5mTokens, cache1hTokens, inputPricePerM)
+	// 高上下文缓存创建价留空时按「生效输入价（此时已是高上下文价）× 倍率」回退。
+	cacheWritePrice := pricing.CacheWritePrice
+	hasCacheWritePrice := pricing.HasCacheWritePrice
+	if useHighPricing && (pricing.HasCacheWritePriceHigh || pricing.CacheWritePriceHigh > 0) {
+		cacheWritePrice = pricing.CacheWritePriceHigh
+		hasCacheWritePrice = true
+	}
+	breakdown.CacheWrite = newCacheWriteCostComponent(
+		cache5mTokens, cache1hTokens, inputPricePerM, cacheWritePrice, hasCacheWritePrice,
+	)
 
 	breakdown.Total = breakdown.Input.Cost + breakdown.Output.Cost +
 		breakdown.CacheRead.Cost + breakdown.CacheWrite.Cost
@@ -337,10 +358,19 @@ func CalculateImageGenerationToolCost(model string, usage ImageGenerationToolUsa
 	if model == "" {
 		model = "gpt-image-2"
 	}
+	// 图像专项费率只由系统目录维护：自定义价格不提供图像字段，
+	// 若此处保留自定义分支，任何自定义覆盖都会把图像成本静默归零。
 	pricing, ok := imageGenerationToolPricingByModel[model]
+	if !ok {
+		pricing, ok = imageGenerationToolPricingByModel[strings.TrimSuffix(model, "-2026-09-08")]
+	}
 	if !ok {
 		return 0
 	}
+	return calculateImageGenerationToolCost(pricing, usage)
+}
+
+func calculateImageGenerationToolCost(pricing imageGenerationToolPricing, usage ImageGenerationToolUsage) float64 {
 
 	textInput := usage.TextInputTokens
 	textCached := usage.TextCachedTokens
@@ -367,6 +397,7 @@ func CalculateImageGenerationToolCost(model string, usage ImageGenerationToolUsa
 
 // CalculateImageGenerationToolFallbackCost returns the fixed image output cost
 // when OpenAI Responses image_generation succeeds but omits tool_usage.
+// 费率同样只来自系统目录，自定义价格不参与图像计费。
 func CalculateImageGenerationToolFallbackCost(model, quality, size string) float64 {
 	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
@@ -402,9 +433,10 @@ func isOpenAIModel(model string) bool {
 }
 
 // serviceTierModels 列出支持 priority/flex service_tier 的 OpenAI 模型。
-// 来源：OpenAI 官方 Pricing 页 Priority 表；GPT-5.6 预览公告明确支持 API priority processing。
+// 来源：OpenAI 官方 Pricing 页 Priority 表；GPT-6 Astra 模型页另明确支持 Fast/Flex。
 // 注意：gpt-5.4-pro 虽在表中出现但价格列为空，不算支持。
 var serviceTierModels = map[string]bool{
+	"gpt-6-astra":       true,
 	"gpt-5.6":           true,
 	"gpt-5.6-sol":       true,
 	"gpt-5.6-terra":     true,
@@ -490,7 +522,7 @@ func OpenAIServiceTierMultiplier(model, serviceTier string) float64 {
 func openAIFastModeMultiplier(model string) float64 {
 	lowerModel := strings.ToLower(model)
 	switch {
-	case strings.HasPrefix(lowerModel, "gpt-5.6"), strings.HasPrefix(lowerModel, "gpt-5.5"):
+	case strings.HasPrefix(lowerModel, "gpt-6-astra"), strings.HasPrefix(lowerModel, "gpt-5.6"), strings.HasPrefix(lowerModel, "gpt-5.5"):
 		return 2.5
 	case strings.HasPrefix(lowerModel, "gpt-5.4"):
 		return 2.0
@@ -542,7 +574,7 @@ func calculateFastModeCostBreakdown(inputTokens, outputTokens, cacheReadTokens, 
 		ServiceTierMultiplier: inputPrice / baseInputPrice,
 	}
 
-	breakdown.CacheWrite = newCacheWriteCostComponent(cache5mTokens, cache1hTokens, baseInputPrice)
+	breakdown.CacheWrite = newCacheWriteCostComponent(cache5mTokens, cache1hTokens, baseInputPrice, 0, false)
 	breakdown.Total = breakdown.Input.Cost + breakdown.Output.Cost +
 		breakdown.CacheRead.Cost + breakdown.CacheWrite.Cost
 	return breakdown

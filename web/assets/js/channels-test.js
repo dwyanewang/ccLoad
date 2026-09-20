@@ -1,6 +1,25 @@
-async function testChannel(id, name, initialModel = '') {
-  const channel = channels.find(c => c.id === id);
+async function loadDefaultTestContent() {
+  try {
+    const setting = await fetchDataWithAuth('/admin/settings/channel_test_content');
+    const firstContent = getFirstConfiguredTestContent(setting?.value);
+    if (firstContent) defaultTestContent = firstContent;
+  } catch (error) {
+    console.warn('Failed to load default test content, using built-in default', error);
+  }
+}
+
+function getFirstConfiguredTestContent(value) {
+  const firstContent = window.TestContent?.firstPipeSeparatedTestContent;
+  if (typeof firstContent === 'function') return firstContent(value);
+  return String(value ?? '')
+    .split('|')
+    .map((content) => content.trim())
+    .find(Boolean) || '';
+}
+
+async function testChannel(channel, initialModel = '') {
   if (!channel) return false;
+  const { id, name } = channel;
 
   const modelNames = (channel.models || [])
     .map(entry => typeof entry === 'string' ? entry : entry.model)
@@ -20,7 +39,7 @@ async function testChannel(id, name, initialModel = '') {
   testingChannelId = id;
   document.getElementById('testChannelName').textContent = name;
 
-  const modelSelect = document.getElementById('testModelSelect');
+  const modelSelect = document.getElementById('channelTestModelSelect');
   modelSelect.innerHTML = '';
   modelNames.forEach(modelName => {
     const option = document.createElement('option');
@@ -38,6 +57,7 @@ async function testChannel(id, name, initialModel = '') {
   }
 
   const keys = apiKeys.map(k => k.api_key || k);
+  const keyNotes = apiKeys.map(k => typeof k === 'object' ? String(k.note || '').trim() : '');
   const keySelect = document.getElementById('testKeySelect');
   const keySelectGroup = document.getElementById('testKeySelectGroup');
   const batchTestBtn = document.getElementById('batchTestBtn');
@@ -51,7 +71,8 @@ async function testChannel(id, name, initialModel = '') {
     for (let i = 0; i < maxKeys; i++) {
       const option = document.createElement('option');
       option.value = i;
-      option.textContent = `Key ${i + 1}: ${maskKey(keys[i])}`;
+      const label = keyNotes[i] ? `Key ${i + 1}: ${maskKey(keys[i])} (${keyNotes[i]})` : `Key ${i + 1}: ${maskKey(keys[i])}`;
+      option.textContent = label;
       keySelect.appendChild(option);
     }
 
@@ -81,11 +102,11 @@ function closeTestModal() {
 }
 
 function resetTestModal() {
-  document.getElementById('testProgress').classList.remove('show');
+  document.getElementById('channelTestProgress').classList.remove('show');
   document.getElementById('batchTestProgress').classList.add('hidden');
   document.getElementById('testResult').classList.remove('show', 'success', 'error');
   document.getElementById('testUpstreamDetailBtn')?.classList.add('hidden');
-  document.getElementById('runTestBtn').disabled = false;
+  document.getElementById('channelRunTestBtn').disabled = false;
   document.getElementById('batchTestBtn').disabled = false;
   document.getElementById('testContentInput').value = defaultTestContent;
   document.getElementById('testConcurrency').value = '10';
@@ -94,7 +115,7 @@ function resetTestModal() {
 async function runChannelTest() {
   if (!testingChannelId) return;
 
-  const modelSelect = document.getElementById('testModelSelect');
+  const modelSelect = document.getElementById('channelTestModelSelect');
   const contentInput = document.getElementById('testContentInput');
   const keySelect = document.getElementById('testKeySelect');
   const streamCheckbox = document.getElementById('testStreamEnabled');
@@ -110,9 +131,9 @@ async function runChannelTest() {
     return;
   }
 
-  document.getElementById('testProgress').classList.add('show');
+  document.getElementById('channelTestProgress').classList.add('show');
   document.getElementById('testResult').classList.remove('show');
-  document.getElementById('runTestBtn').disabled = true;
+  document.getElementById('channelRunTestBtn').disabled = true;
 
   try {
     const testRequest = {
@@ -140,18 +161,15 @@ async function runChannelTest() {
       error: window.t('channels.test.requestFailed') + e.message
     });
   } finally {
-    document.getElementById('testProgress').classList.remove('show');
-    document.getElementById('runTestBtn').disabled = false;
+    document.getElementById('channelTestProgress').classList.remove('show');
+    document.getElementById('channelRunTestBtn').disabled = false;
 
-    await loadChannels();
+    await handleChannelUpdateSuccess({ savedChannelId: testingChannelId });
   }
 }
 
 async function runBatchTest() {
   if (!testingChannelId) return;
-
-  const channel = channels.find(c => c.id === testingChannelId);
-  if (!channel) return;
 
   let apiKeys = [];
   try {
@@ -166,7 +184,7 @@ async function runBatchTest() {
     return;
   }
 
-  const modelSelect = document.getElementById('testModelSelect');
+  const modelSelect = document.getElementById('channelTestModelSelect');
   const contentInput = document.getElementById('testContentInput');
   const streamCheckbox = document.getElementById('testStreamEnabled');
   const clientProtocolSelect = document.getElementById('testClientProtocolSelect');
@@ -183,7 +201,7 @@ async function runBatchTest() {
     return;
   }
 
-  document.getElementById('runTestBtn').disabled = true;
+  document.getElementById('channelRunTestBtn').disabled = true;
   document.getElementById('batchTestBtn').disabled = true;
 
   const progressDiv = document.getElementById('batchTestProgress');
@@ -255,10 +273,10 @@ async function runBatchTest() {
 
   displayBatchTestResult(successCount, failedCount, keys.length, failedKeys);
 
-  document.getElementById('runTestBtn').disabled = false;
+  document.getElementById('channelRunTestBtn').disabled = false;
   document.getElementById('batchTestBtn').disabled = false;
 
-  await loadChannels();
+  await handleChannelUpdateSuccess({ savedChannelId: testingChannelId });
 }
 
 function displayBatchTestResult(successCount, failedCount, totalCount, failedKeys) {
@@ -327,7 +345,7 @@ function displayTestResult(result) {
   const renderResponseSection = (title, content, display = 'none', hasToggle = true) => {
     const contentId = `response-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const toggleBtn = hasToggle
-      ? `<button type="button" class="toggle-btn" data-action="toggle-response" data-response-target="${contentId}">${window.t('channels.test.toggleResponse')}</button>`
+      ? `<button type="button" class="toggle-btn" data-action="toggle-channel-test-response" data-response-target="${contentId}">${window.t('channels.test.toggleResponse')}</button>`
       : '';
     const section = TemplateEngine.render('tpl-response-section', {
       title,
@@ -399,5 +417,5 @@ function displayTestResult(result) {
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { testChannel };
+  module.exports = { loadDefaultTestContent, testChannel, runChannelTest, runBatchTest };
 }

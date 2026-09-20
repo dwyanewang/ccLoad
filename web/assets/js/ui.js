@@ -209,9 +209,13 @@ window.WebAuth = window.WebAuth || {
   }
 
   function getStoredTheme() {
+    if (window.ccLoadTheme && typeof window.ccLoadTheme.getStoredTheme === 'function') {
+      return window.ccLoadTheme.getStoredTheme();
+    }
     try {
       const saved = localStorage.getItem(THEME_STORAGE_KEY);
-      return THEME_MODES.includes(saved) ? saved : 'system';
+      const mode = typeof saved === 'string' ? saved.split(':', 1)[0] : null;
+      return THEME_MODES.includes(mode) ? mode : 'system';
     } catch (_) {
       return 'system';
     }
@@ -264,8 +268,8 @@ window.WebAuth = window.WebAuth || {
     });
   }
 
-  function applyStoredTheme() {
-    currentThemeMode = getStoredTheme();
+  function applyThemeMode(mode) {
+    currentThemeMode = THEME_MODES.includes(mode) ? mode : 'system';
     const resolvedTheme = resolveTheme(currentThemeMode);
     document.documentElement.dataset.theme = currentThemeMode;
     document.documentElement.dataset.resolvedTheme = resolvedTheme;
@@ -277,13 +281,20 @@ window.WebAuth = window.WebAuth || {
     }));
   }
 
+  function applyStoredTheme() {
+    applyThemeMode(getStoredTheme());
+  }
+
   function setThemeMode(mode) {
     if (!THEME_MODES.includes(mode)) return;
-    try {
-      localStorage.setItem(THEME_STORAGE_KEY, mode);
-    } catch (_) { /* 存储失败时只应用当前页面 */ }
-    currentThemeMode = mode;
-    applyStoredTheme();
+    if (window.ccLoadTheme && typeof window.ccLoadTheme.setStoredTheme === 'function') {
+      window.ccLoadTheme.setStoredTheme(mode);
+    } else {
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, `${mode}:${Date.now()}`);
+      } catch (_) { /* 存储失败时只应用当前页面 */ }
+    }
+    applyThemeMode(mode);
   }
 
   function initTheme() {
@@ -1928,7 +1939,15 @@ window.WebAuth = window.WebAuth || {
         if (selected) row.classList.add('selected');
         if (idx === activeIndex) row.classList.add('active');
 
+        // Keep the option in the DOM until the click event is dispatched.
+        // Firefox retargets a click to the dialog when a mousedown handler
+        // removes the clicked node immediately; dialog backdrop handlers then
+        // mistake a normal selection for an outside click and close the modal.
         row.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        });
+        row.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
           commitOption(item);
@@ -2530,7 +2549,7 @@ window.WebAuth = window.WebAuth || {
     }
   }
 
-  const SENSITIVE_HEADER_RE = /^(authorization|x-api-key|api-key|x-goog-api-key|proxy-authorization)$/i;
+  const SENSITIVE_HEADER_RE = /^(authorization|x-refresh-token|x-api-key|api-key|x-goog-api-key|proxy-authorization)$/i;
 
   function maskHeaderValue(v) {
     if (typeof v !== 'string' || v.length <= 8) return '******';

@@ -19,7 +19,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func mustBuildTestTransformPlan(t testing.TB, cfg *model.Config, body []byte) protocol.TransformPlan {
+func mustBuildTestTransformPlan(t testing.TB, _ *model.Config, body []byte) protocol.TransformPlan {
 	t.Helper()
 
 	const requestPath = "/v1/messages"
@@ -230,7 +230,7 @@ func TestBuildProxyRequest_RebuildsClaudeCodeWireForAnthropicMessagesUpstream(t 
 	if strings.Contains(betas, "messages-2023-12-15") || !strings.Contains(betas, "claude-code-20250219") {
 		t.Fatalf("anthropic-beta = %q, want rebuilt Claude Code beta set", betas)
 	}
-	if got := headerValueFold(req.Header, "User-Agent"); got != "claude-cli/2.1.220 (external, cli)" {
+	if got := headerValueFold(req.Header, "User-Agent"); got != "claude-cli/2.1.258 (external, cli)" {
 		t.Fatalf("User-Agent = %q, want Claude Code CLI fingerprint", got)
 	}
 }
@@ -755,7 +755,7 @@ func TestForwardOnceAsync_CodexSessionInjectionUsesFinalBodyForDebug(t *testing.
 	srv.configService.mu.Unlock()
 	srv.client = &http.Client{
 		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-			gotSessionID = r.Header.Get("Session_id")
+			gotSessionID = r.Header.Get("Session-Id")
 			gotBody, _ = io.ReadAll(r.Body)
 			return &http.Response{
 				StatusCode: http.StatusInternalServerError,
@@ -803,10 +803,10 @@ func TestForwardOnceAsync_CodexSessionInjectionUsesFinalBodyForDebug(t *testing.
 		t.Fatalf("forwardOnceAsync error = %v", err)
 	}
 	if gotSessionID == "" || !uuidPattern.MatchString(gotSessionID) {
-		t.Fatalf("Session_id header missing or invalid: %q", gotSessionID)
+		t.Fatalf("Session-Id header missing or invalid: %q", gotSessionID)
 	}
 	if key := readCodexPromptCacheKey(gotBody); key != gotSessionID {
-		t.Fatalf("prompt_cache_key = %q, want Session_id %q; body=%s", key, gotSessionID, gotBody)
+		t.Fatalf("prompt_cache_key = %q, want Session-Id %q; body=%s", key, gotSessionID, gotBody)
 	}
 	assertFieldOrder(t, string(gotBody), `"model"`, `"instructions"`, `"input"`, `"prompt_cache_key"`)
 	if result.DebugData == nil {
@@ -906,7 +906,9 @@ func TestForwardOnceAsync_CodexStaticKeyUsesDedicatedHeaderContract(t *testing.T
 		"Connection":            "Keep-Alive",
 		"Content-Type":          "application/json",
 		"Originator":            "codex-tui",
-		"Session_id":            "session-1",
+		"Session-Id":            "session-1",
+		"Session_id":            "",
+		"Conversation_id":       "",
 		"User-Agent":            codexUserAgent,
 		"Version":               codexVersion,
 		"X-Client-Request-Id":   "request-1",
@@ -961,7 +963,7 @@ func TestClientCancelClosesUpstream(t *testing.T) {
 		// 如果连接被关闭，Write会失败
 		for i := 2; i <= 100; i++ {
 			time.Sleep(50 * time.Millisecond)
-			data := []byte(fmt.Sprintf("data: chunk%d\n\n", i))
+			data := fmt.Appendf(nil, "data: chunk%d\n\n", i)
 			_, err := w.Write(data)
 			if err != nil {
 				// 连接已关闭！这是我们期望的结果

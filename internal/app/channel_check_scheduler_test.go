@@ -3,18 +3,25 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"math"
+	"io"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/testutil"
 )
 
 func createScheduledCheckChannel(t *testing.T, srv *Server, cfg *model.Config, keys ...*model.APIKey) *model.Config {
 	t.Helper()
 
+	if cfg.ScheduledCheckIntervalMinutes == 0 {
+		cfg.ScheduledCheckIntervalMinutes = 1
+	}
 	created, err := srv.store.CreateConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("CreateConfig failed: %v", err)
@@ -40,29 +47,178 @@ func createScheduledCheckChannel(t *testing.T, srv *Server, cfg *model.Config, k
 	return created
 }
 
-func TestNormalizeChannelCheckIntervalHours(t *testing.T) {
-	t.Parallel()
+func TestConfiguredChannelTestContentUsesFirstPipeSeparatedValue(t *testing.T) {
+	srv := newInMemoryServerWithSettings(t, map[string]string{
+		"channel_test_content": " first prompt | second prompt ",
+	})
 
-	tests := []struct {
-		name string
-		in   float64
-		want float64
-	}{
-		{name: "positive_kept", in: 5, want: 5},
-		{name: "decimal_kept", in: 0.5, want: 0.5},
-		{name: "zero_disables", in: 0, want: 0},
-		{name: "negative_uses_default", in: -0.1, want: defaultChannelCheckIntervalHours},
-		{name: "nan_uses_default", in: math.NaN(), want: defaultChannelCheckIntervalHours},
-		{name: "infinity_uses_default", in: math.Inf(1), want: defaultChannelCheckIntervalHours},
-		{name: "overflow_uses_default", in: float64(maxSettingDurationHours + 1), want: defaultChannelCheckIntervalHours},
+	if got := configuredChannelTestContent(srv.configService); got != "first prompt" {
+		t.Fatalf("configuredChannelTestContent() = %q, want %q", got, "first prompt")
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := normalizeChannelCheckIntervalHours(tt.in); got != tt.want {
-				t.Fatalf("normalizeChannelCheckIntervalHours(%v) = %v, want %v", tt.in, got, tt.want)
+func TestScheduledCheckUsesURLProtocol(t *testing.T) {
+	for _, mode := range []string{model.ProtocolTransformModeAuto, model.ProtocolTransformModeLocal, model.ProtocolTransformModeUpstream} {
+		for _, tc := range []struct {
+			name      string
+			protocols []string
+			paths     []string
+			multiURL  bool
+		}{
+			{name: "undeclared", paths: []string{"/v1/chat/completions"}},
+			{name: "declared_openai", protocols: []string{"openai"}, paths: []string{"/v1/chat/completions"}},
+			{name: "declared_anthropic_first", protocols: []string{"anthropic", "openai"}, paths: []string{"/v1/messages"}},
+			{name: "declared_codex_first", protocols: []string{"codex", "openai"}, paths: []string{"/v1/responses"}},
+			{name: "undeclared_fallback", paths: []string{"/v1/chat/completions", "/v1/messages"}},
+			{name: "next_url_uses_own_protocol", multiURL: true, paths: []string{"/first/v1/messages", "/v1/chat/completions"}},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				var paths []string
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					paths = append(paths, r.URL.Path)
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("decode request: %v", err)
+					}
+					if body["model"] != "test-model" {
+						t.Errorf("model = %v", body["model"])
+					}
+					field := "messages"
+					if r.URL.Path == "/v1/responses" {
+						field = "input"
+					}
+					if _, ok := body[field]; !ok {
+						t.Errorf("request missing %s: %v", field, body)
+					}
+					if len(paths) < len(tc.paths) {
+						http.Error(w, `{"error":{"message":"endpoint not found"}}`, http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					switch r.URL.Path {
+					case "/v1/messages":
+						_, _ = io.WriteString(w, `{"id":"msg-test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+					case "/v1/responses":
+						_, _ = io.WriteString(w, `{"id":"resp-test","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+					default:
+						_, _ = io.WriteString(w, `{"id":"test","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+					}
+				}))
+				defer upstream.Close()
+				srv := newInMemoryServer(t)
+				urls := model.ChannelURLs{{URL: upstream.URL, Protocols: tc.protocols}}
+				if tc.multiURL {
+					urls = append(model.ChannelURLs{{URL: upstream.URL + "/first", Protocols: []string{"anthropic"}}}, urls...)
+					srv.urlSelector = nil // Keep the failing URL first to exercise fallback deterministically.
+				}
+				createScheduledCheckChannel(t, srv, &model.Config{
+					Name: "protocol-check", Enabled: true, ScheduledCheckEnabled: true,
+					URLs:                  urls,
+					ProtocolTransformMode: mode, ModelEntries: []model.ModelEntry{{Model: "test-model"}},
+				}, &model.APIKey{APIKey: "sk-test"})
+				ctx := context.Background()
+				if err := srv.runScheduledChannelChecks(ctx, time.Now().Add(time.Minute)); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Join(paths, ",") != strings.Join(tc.paths, ",") {
+					t.Fatalf("paths = %v, want %v", paths, tc.paths)
+				}
+				logs, err := srv.store.ListLogs(ctx, time.Now().Add(-time.Minute), 10, 0, &model.LogFilter{LogSource: model.LogSourceScheduledCheck})
+				if err != nil || len(logs) != 1 {
+					t.Fatalf("logs = %v, err = %v", logs, err)
+				}
+				if logs[0].StatusCode != http.StatusOK {
+					t.Fatalf("detection failed: %+v", logs[0])
+				}
+			})
+		}
+	}
+}
+
+func TestDailyScheduledChecksIndependentChannelsAndChanges(t *testing.T) {
+	var slowCalls, fastCalls atomic.Int32
+	started := make(chan string, 10)
+	release := make(chan struct{})
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/slow") {
+			slowCalls.Add(1)
+			started <- "slow"
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
 			}
-		})
+		} else {
+			fastCalls.Add(1)
+			started <- "fast"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"test","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+	srv := newInMemoryServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var fast *model.Config
+	for _, name := range []string{"slow", "fast"} {
+		cfg := createScheduledCheckChannel(t, srv, &model.Config{
+			Name: name, URLs: model.ChannelURLs{{URL: upstream.URL + "/" + name}}, Enabled: true,
+			ScheduledCheckEnabled: true, ScheduledCheckIntervalMinutes: 360, ScheduledCheckStartTime: "08:30",
+			ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		}, &model.APIKey{APIKey: "sk-test"})
+		if name == "fast" {
+			fast = cfg
+		}
+	}
+	now := time.Now().AddDate(1, 0, 0)
+	now = time.Date(now.Year(), now.Month(), now.Day(), 8, 30, 0, 0, time.Local)
+	done := make(chan error, 1)
+	go func() { done <- srv.runScheduledChannelChecks(ctx, now) }()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("slow channel blocked another channel")
+		}
+	}
+	// Fast detection must finish before the next simulated tick.
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		if _, running := srv.scheduledChannelChecksRunning.Load(fast.ID); !running {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("fast detection did not finish")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := srv.runScheduledChannelChecks(ctx, now.Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if slowCalls.Load() != 1 || fastCalls.Load() != 2 {
+		t.Fatalf("overlap or blocking: slow=%d fast=%d", slowCalls.Load(), fastCalls.Load())
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.runScheduledChannelChecks(ctx, now.Add(7*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if slowCalls.Load() != 1 || fastCalls.Load() != 2 {
+		t.Fatal("missed schedules were replayed")
+	}
+	fast.ScheduledCheckStartTime, fast.ScheduledCheckIntervalMinutes = "15:30", 120
+	if _, err := srv.store.UpdateConfig(ctx, fast.ID, fast); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.runScheduledChannelChecks(ctx, now.Add(7*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if fastCalls.Load() != 3 {
+		t.Fatal("updated schedule did not take effect")
 	}
 }
 
@@ -162,6 +318,180 @@ var testRequestOpenAI = testutil.TestChannelRequest{
 	Content:        "hello",
 }
 
+func TestScheduledCheckCodexSSECostUsesRedirectedModel(t *testing.T) {
+	resetAt := time.Now().Add(time.Hour).Unix()
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		event, err := json.Marshal(map[string]any{
+			"type": "codex.rate_limits",
+			"additional_rate_limits": map[string]any{
+				"GPT-5.3-Codex-Spark": map[string]any{
+					"primary": map[string]any{"used_percent": 42, "window_minutes": 10080, "reset_at": resetAt},
+				},
+			},
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = io.WriteString(w, "data: "+string(event)+"\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":100}}}\n\n")
+	}))
+	srv := newInMemoryServer(t)
+	cfg := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	cfg.ModelEntries = []model.ModelEntry{{Model: "test-alias", RedirectModel: "gpt-5.3-codex-spark"}}
+	cfg.ProtocolTransformMode = model.ProtocolTransformModeLocal
+	srv.runScheduledChannelCheck(context.Background(), cfg, nil, "hello")
+	stored, err := srv.store.GetConfig(context.Background(), cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := codexauth.ParseCredential([]byte(stored.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.PassiveUsage == nil || len(credential.PassiveUsage.Windows) != 1 || credential.PassiveUsage.Windows[0].UsedPercent != 42 {
+		t.Fatalf("missing progress: %+v", credential.PassiveUsage)
+	}
+	if credential.QuotaCostUsage == nil || len(credential.QuotaCostUsage.Windows) != 1 {
+		t.Fatalf("missing cost window: %+v", credential.QuotaCostUsage)
+	}
+	window := credential.QuotaCostUsage.Windows[0]
+	if window.Family != oauthcost.FamilySpark || window.StandardCostMicroUSD <= 0 {
+		t.Fatalf("redirected detection must charge Spark: %+v", window)
+	}
+}
+
+func TestRunScheduledChannelChecks_CodexOAuthWithoutAPIKeys(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		expired      bool
+		invalid      bool
+		refreshFails bool
+		wantSkip     string
+	}{
+		{name: "current credential"},
+		{name: "expired credential", expired: true},
+		{name: "invalid credential", invalid: true, wantSkip: "加载 Codex OAuth 凭证失败"},
+		{name: "refresh failure", expired: true, refreshFails: true, wantSkip: "加载 Codex OAuth 凭证失败"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var inferenceCalls, refreshCalls atomic.Int32
+			wantToken := "at-scheduled-current"
+			if tc.expired {
+				wantToken = "at-scheduled-refreshed"
+			}
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/oauth/token" {
+					refreshCalls.Add(1)
+					if err := r.ParseForm(); err != nil {
+						t.Errorf("parse refresh request: %v", err)
+					}
+					if r.Form.Get("refresh_token") != "rt-scheduled-current" {
+						t.Errorf("unexpected refresh token: %q", r.Form.Get("refresh_token"))
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if tc.refreshFails {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"access_token":"at-scheduled-refreshed","refresh_token":"rt-scheduled-rotated","expires_in":3600}`)
+					return
+				}
+				inferenceCalls.Add(1)
+				if r.URL.Path != "/backend-api/codex/responses" {
+					t.Errorf("unexpected inference path: %s", r.URL.Path)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+					t.Errorf("Authorization = %q, want Bearer %s", got, wantToken)
+				}
+				if got := r.Header.Get("Chatgpt-Account-Id"); got != "account-scheduled" {
+					t.Errorf("account ID = %q", got)
+				}
+				var body struct {
+					Model  string `json:"model"`
+					Stream bool   `json:"stream"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode inference request: %v", err)
+				}
+				if body.Model != "gpt-5.6-luna" || !body.Stream {
+					t.Errorf("unexpected Codex request: %+v", body)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")
+				_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_scheduled\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n")
+			}))
+			srv := newInMemoryServer(t)
+			srv.codexCredentials.service.TokenURL = upstream.URL + "/oauth/token"
+			ctx := context.Background()
+			expires := time.Now().Add(time.Hour)
+			if tc.expired {
+				expires = time.Now().Add(-time.Hour)
+			}
+			credentialJSON, err := (&codexauth.Credential{
+				Type: "codex", AccessToken: "at-scheduled-current", RefreshToken: "rt-scheduled-current",
+				AccountID: "account-scheduled", Expired: expires.UTC().Format(time.RFC3339),
+			}).JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.invalid {
+				credentialJSON = "invalid credential"
+			}
+			cfg := createScheduledCheckChannel(t, srv, &model.Config{
+				Name: "scheduled-codex", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+				URLs:                  model.ChannelURLs{{URL: upstream.URL + "/backend-api/codex/responses", Exact: true, Protocols: []string{"codex"}}},
+				ProtocolTransformMode: model.ProtocolTransformModeLocal,
+				Enabled:               true, ScheduledCheckEnabled: true, ScheduledCheckModel: "gpt-5.6-luna",
+				ModelEntries: []model.ModelEntry{{Model: "gpt-5.4-mini"}, {Model: "gpt-5.6-luna"}},
+			})
+			if err := srv.runScheduledChannelChecks(ctx, time.Now().Add(time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			wantRefreshCalls := int32(0)
+			if tc.expired {
+				wantRefreshCalls = 1
+			}
+			if got := refreshCalls.Load(); got != wantRefreshCalls {
+				t.Errorf("refresh calls = %d, want %d", got, wantRefreshCalls)
+			}
+			logs, err := srv.store.ListLogs(ctx, time.Now().Add(-time.Minute), 20, 0, &model.LogFilter{LogSource: model.LogSourceScheduledCheck})
+			if err != nil || len(logs) != 1 {
+				t.Fatalf("scheduled logs = %d, err = %v", len(logs), err)
+			}
+			entry := logs[0]
+			if entry.ChannelID != cfg.ID || entry.Model != "gpt-5.6-luna" || entry.APIKeyUsed != "" {
+				t.Fatalf("unexpected OAuth detection log: %+v", entry)
+			}
+			if tc.wantSkip != "" {
+				if inferenceCalls.Load() != 0 || entry.StatusCode != 0 || !strings.Contains(entry.Message, tc.wantSkip) {
+					t.Fatalf("expected credential skip, calls = %d, log = %+v", inferenceCalls.Load(), entry)
+				}
+				return
+			}
+			if inferenceCalls.Load() != 1 || entry.StatusCode != http.StatusOK || entry.InputTokens != 10 || entry.OutputTokens != 5 {
+				t.Fatalf("expected successful OAuth detection, calls = %d, log = %+v", inferenceCalls.Load(), entry)
+			}
+			storedKeys, err := srv.store.GetAPIKeys(ctx, cfg.ID)
+			if err != nil || len(storedKeys) != 0 {
+				t.Fatalf("OAuth detection persisted API keys: %v, err = %v", storedKeys, err)
+			}
+			if tc.expired {
+				persisted, err := srv.store.GetConfig(ctx, cfg.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				credential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
+				if err != nil || credential.AccessToken != wantToken || credential.RefreshToken != "rt-scheduled-rotated" {
+					t.Fatalf("refreshed credential was not persisted: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestRunScheduledChannelChecks_UsesScheduledCheckModelAndAvailableKey(t *testing.T) {
 	var (
 		eligibleCalls int
@@ -224,7 +554,7 @@ func TestRunScheduledChannelChecks_UsesScheduledCheckModelAndAvailableKey(t *tes
 		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
 	}, &model.APIKey{APIKey: "sk-disabled", KeyStrategy: model.KeyStrategySequential})
 
-	if err := srv.runScheduledChannelChecks(ctx); err != nil {
+	if err := srv.runScheduledChannelChecks(ctx, time.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("runScheduledChannelChecks failed: %v", err)
 	}
 
@@ -272,7 +602,7 @@ func TestRunScheduledChannelChecks_WritesScheduledCheckLogsForRunAndSkip(t *test
 		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
 	})
 
-	if err := srv.runScheduledChannelChecks(ctx); err != nil {
+	if err := srv.runScheduledChannelChecks(ctx, time.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("runScheduledChannelChecks failed: %v", err)
 	}
 
@@ -333,19 +663,10 @@ func TestRunScheduledChannelChecks_SkipsChannelsWithoutRunnableKey(t *testing.T)
 		t.Fatalf("SetKeyCooldown failed: %v", err)
 	}
 
-	if err := srv.runScheduledChannelChecks(ctx); err != nil {
+	if err := srv.runScheduledChannelChecks(ctx, time.Now().Add(time.Minute)); err != nil {
 		t.Fatalf("runScheduledChannelChecks failed: %v", err)
 	}
 	if called != 0 {
 		t.Fatalf("expected no upstream call when all keys cooled down, got %d", called)
-	}
-}
-
-func TestTriggerScheduledChannelChecks_SkipsReentry(t *testing.T) {
-	srv := newInMemoryServer(t)
-	srv.scheduledChannelChecksRunning.Store(true)
-
-	if started := srv.triggerScheduledChannelChecks(); started {
-		t.Fatal("expected triggerScheduledChannelChecks to skip when previous run is active")
 	}
 }

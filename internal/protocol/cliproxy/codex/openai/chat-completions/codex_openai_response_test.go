@@ -575,6 +575,7 @@ func assertUsageMapping(t *testing.T, payload []byte, wantCachedCreation int64, 
 	}
 
 	gotCachedCreation := gjson.GetBytes(payload, "usage.prompt_tokens_details.cached_creation_tokens")
+	gotCacheWrite := gjson.GetBytes(payload, "usage.prompt_tokens_details.cache_write_tokens")
 	if expectCachedCreation {
 		if !gotCachedCreation.Exists() {
 			t.Fatalf("expected cached_creation_tokens to exist, payload=%s", string(payload))
@@ -582,8 +583,14 @@ func assertUsageMapping(t *testing.T, payload []byte, wantCachedCreation int64, 
 		if gotCachedCreation.Int() != wantCachedCreation {
 			t.Fatalf("expected cached_creation_tokens=%d, got %d; payload=%s", wantCachedCreation, gotCachedCreation.Int(), string(payload))
 		}
-	} else if gotCachedCreation.Exists() {
-		t.Fatalf("expected cached_creation_tokens to be omitted, payload=%s", string(payload))
+		if !gotCacheWrite.Exists() {
+			t.Fatalf("expected cache_write_tokens to exist, payload=%s", string(payload))
+		}
+		if gotCacheWrite.Int() != wantCachedCreation {
+			t.Fatalf("expected cache_write_tokens=%d, got %d; payload=%s", wantCachedCreation, gotCacheWrite.Int(), string(payload))
+		}
+	} else if gotCachedCreation.Exists() || gotCacheWrite.Exists() {
+		t.Fatalf("expected cache creation/write tokens to be omitted, payload=%s", string(payload))
 	}
 	if legacy := gjson.GetBytes(payload, "usage.cache_creation_input_tokens"); legacy.Exists() {
 		t.Fatalf("expected legacy cache_creation_input_tokens to be omitted, payload=%s", string(payload))
@@ -606,5 +613,123 @@ func TestConvertCodexResponseToOpenAI_NonStreamMultiMessageEmptyTrailingKeepsCon
 	}
 	if got.String() != "the real answer" {
 		t.Fatalf("expected content %q, got %q; resp=%s", "the real answer", got.String(), string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_StreamReasoningTextDeltaAndDone(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	deltaRaw := []byte(`data: {"type":"response.reasoning_text.delta","delta":"Thinking step 1"}`)
+	streamOut := ConvertCodexResponseToOpenAI(ctx, "MiniMax-M3", nil, nil, deltaRaw, &param)
+	if len(streamOut) != 1 {
+		t.Fatalf("expected 1 streaming chunk for reasoning_text.delta, got %d", len(streamOut))
+	}
+	if got := gjson.GetBytes(streamOut[0], "choices.0.delta.reasoning_content").String(); got != "Thinking step 1" {
+		t.Fatalf("expected reasoning_content %q, got %q; payload=%s", "Thinking step 1", got, streamOut[0])
+	}
+	if got := gjson.GetBytes(streamOut[0], "choices.0.delta.role").String(); got != "assistant" {
+		t.Fatalf("expected role assistant, got %q; payload=%s", got, streamOut[0])
+	}
+
+	doneRaw := []byte(`data: {"type":"response.reasoning_text.done","text":"Thinking step 1"}`)
+	doneOut := ConvertCodexResponseToOpenAI(ctx, "MiniMax-M3", nil, nil, doneRaw, &param)
+	if len(doneOut) != 1 {
+		t.Fatalf("expected 1 streaming chunk for reasoning_text.done, got %d", len(doneOut))
+	}
+	if got := gjson.GetBytes(doneOut[0], "choices.0.delta.reasoning_content").String(); got != "\n\n" {
+		t.Fatalf("expected reasoning_content %q, got %q; payload=%s", "\n\n", got, doneOut[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_NonStreamReasoningTextContent(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"MiniMax-M3","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"output_tokens_details":{"reasoning_tokens":15}},"output":[` +
+		`{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"Full reasoning from MiniMax"}]},` +
+		`{"type":"message","content":[{"type":"output_text","text":"Answer"}]}` +
+		`]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "MiniMax-M3", nil, nil, raw, nil)
+
+	got := gjson.GetBytes(out, "choices.0.message.reasoning_content")
+	if !got.Exists() || got.Type == gjson.Null {
+		t.Fatalf("expected reasoning_content to exist, got null/missing; payload=%s", string(out))
+	}
+	if got.String() != "Full reasoning from MiniMax" {
+		t.Fatalf("expected reasoning_content %q, got %q; payload=%s", "Full reasoning from MiniMax", got.String(), string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_NonStreamReasoningSummaryAndContent(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"MiniMax-M3","status":"completed","usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"output_tokens_details":{"reasoning_tokens":15}},"output":[` +
+		`{"type":"reasoning","summary":[{"type":"summary_text","text":"Summary part"}],"content":[{"type":"reasoning_text","text":" and Content part"}]},` +
+		`{"type":"message","content":[{"type":"output_text","text":"Answer"}]}` +
+		`]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "MiniMax-M3", nil, nil, raw, nil)
+
+	got := gjson.GetBytes(out, "choices.0.message.reasoning_content")
+	if !got.Exists() || got.Type == gjson.Null {
+		t.Fatalf("expected reasoning_content to exist, got null/missing; payload=%s", string(out))
+	}
+	// ccLoad uses full reasoning when supplied and falls back to summaries otherwise.
+	if got.String() != " and Content part" {
+		t.Fatalf("expected reasoning_content %q, got %q; payload=%s", " and Content part", got.String(), string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_Issue5543_CacheWriteTokensAndServiceTier(t *testing.T) {
+	ctx := context.Background()
+	raw := []byte(`{"type":"response.completed","response":{"id":"resp_example","model":"example-model","service_tier":"default","output":[],"usage":{"input_tokens":7378,"output_tokens":6,"total_tokens":7384,"input_tokens_details":{"cached_tokens":7168,"cache_write_tokens":128}}}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "example-model", nil, nil, raw, nil)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "default" {
+		t.Fatalf("service_tier=%q, want default; payload=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "usage.prompt_tokens_details.cache_write_tokens").Int(); got != 128 {
+		t.Fatalf("cache_write_tokens=%d, want 128; payload=%s", got, out)
+	}
+	var state any
+	created := ConvertCodexResponseToOpenAI(ctx, "example-model", nil, nil, []byte(`data: {"type":"response.created","response":{"id":"resp_stream","model":"example-model","service_tier":"priority"}}`), &state)
+	if len(created) != 0 {
+		t.Fatalf("response.created emitted %d chunks", len(created))
+	}
+	delta := ConvertCodexResponseToOpenAI(ctx, "example-model", nil, nil, []byte(`data: {"type":"response.output_text.delta","delta":"hello"}`), &state)
+	if len(delta) != 1 || gjson.GetBytes(delta[0], "service_tier").String() != "priority" {
+		t.Fatalf("service tier was not carried to delta: %s", delta)
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_RestoresNormalizedToolNames(t *testing.T) {
+	ctx := context.Background()
+	originalName := "mcp.server:search tool"
+	normalizedName := "mcp_server_search_tool"
+	originalRequest := []byte(`{
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "` + originalName + `"
+				}
+			}
+		]
+	}`)
+
+	// Test non-stream response
+	rawNonStream := []byte(`{"type":"response.completed","response":{"id":"resp_1","created_at":1700000000,"model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"output":[{"type":"function_call","call_id":"call_1","name":"` + normalizedName + `","arguments":"{}"}]}}`)
+	outNonStream := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.6-sol", originalRequest, nil, rawNonStream, nil)
+	gotNameNonStream := gjson.GetBytes(outNonStream, "choices.0.message.tool_calls.0.function.name").String()
+	if gotNameNonStream != originalName {
+		t.Fatalf("non-stream expected restored name %q, got %q", originalName, gotNameNonStream)
+	}
+
+	// Test stream response
+	var param any
+	rawStreamAdded := []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"` + normalizedName + `"}}`)
+	streamChunks := ConvertCodexResponseToOpenAI(ctx, "gpt-5.6-sol", originalRequest, nil, rawStreamAdded, &param)
+	if len(streamChunks) != 1 {
+		t.Fatalf("expected 1 stream chunk, got %d", len(streamChunks))
+	}
+	gotNameStream := gjson.GetBytes(streamChunks[0], "choices.0.delta.tool_calls.0.function.name").String()
+	if gotNameStream != originalName {
+		t.Fatalf("stream expected restored name %q, got %q", originalName, gotNameStream)
 	}
 }

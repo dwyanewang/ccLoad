@@ -11,9 +11,10 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
 )
 
-// Codex Responses API 的 prompt 缓存需要 `prompt_cache_key` 请求体字段与 `Session_id` 请求头配合，
+// Codex Responses API 的 prompt 缓存使用 `prompt_cache_key` 请求体字段与 `Session-Id` 请求头配合，
 // 仅当稳定分桶时 OpenAI 才能稳定命中缓存。ccLoad 需在 Anthropic/OpenAI 客户端转换到 Codex 上游时补齐，
 // 策略参考 CLIProxyAPI internal/runtime/executor/codex_executor.go:cacheHelper。
 
@@ -69,7 +70,7 @@ func codexSessionIDForOpenAIKey(apiKey string) string {
 //   - OpenAI 客户端：基于 apiKey 生成确定性 UUID
 //   - 其他协议：返回空
 func resolveCodexSessionHint(reqCtx *requestContext, translatedBody []byte, apiKey string, header http.Header) string {
-	if reqCtx == nil || runtimeUpstreamProtocol(reqCtx, nil) != string(protocol.Codex) {
+	if reqCtx == nil || runtimeUpstreamProtocol(reqCtx) != string(protocol.Codex) {
 		return ""
 	}
 	switch reqCtx.clientProtocol {
@@ -102,8 +103,8 @@ func injectCodexPromptCacheKey(body []byte, id string) []byte {
 	if readCodexPromptCacheKey(body) != "" {
 		return body
 	}
-	var payload map[string]any
-	if err := sonic.Unmarshal(body, &payload); err != nil || payload == nil {
+	root := gjson.ParseBytes(body)
+	if !root.IsObject() {
 		return body
 	}
 

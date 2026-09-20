@@ -60,6 +60,7 @@ func TestFinalizeZAICodingPlanBodyStampsZCodeFingerprint(t *testing.T) {
 	if decodeZAIRequestIdentity(t, repeat).SessionID != identity.SessionID {
 		t.Fatal("session id must be stable for the same conversation")
 	}
+	assertFieldOrder(t, string(finalized), `"model"`, `"messages"`, `"metadata"`)
 }
 
 // A client fingerprint (Claude Code's, for instance) must never reach z.ai.
@@ -260,7 +261,7 @@ func TestZAIUsageSnapshotPersistsOnCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseOAuthUsageCredentialState() error = %v", err)
 	}
-	if state.provider != zaiauth.ChannelType || state.authType != model.AuthTypeZAIOAuth || state.tracksQuotaCost {
+	if state.provider != zaiauth.ChannelType || state.authType != model.AuthTypeZAIOAuth || state.tracksQuotaCost() {
 		t.Fatalf("state = %+v", state)
 	}
 	snapshot := []byte(`{"requested_at":"2026-08-18T00:00:00Z","sampled_at":"2026-08-18T00:00:01Z",` +

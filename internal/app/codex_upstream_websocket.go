@@ -21,6 +21,7 @@ import (
 	"ccLoad/internal/config"
 	"ccLoad/internal/model"
 
+	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -709,7 +710,9 @@ func (s *codexUpstreamWebsocketSession) writeRequest(conn *websocket.Conn, body 
 func isCodexWebsocketSemanticEvent(eventType string) bool {
 	// eventType != "" 不能省：isResponsesMetadataEvent("") == false，
 	// 省掉后未解析出 type 的 WS 帧会被当成语义输出。
-	return eventType != "" && !isResponsesMetadataEvent(eventType)
+	// keepalive 与 ping 同为保活帧，必须在首个语义输出前保持可重连，
+	// 与 SSE 路径的 isHeartbeatEvent 判定对齐。
+	return eventType != "" && !isResponsesMetadataEvent(eventType) && !isHeartbeatEventType(eventType)
 }
 
 func isCodexWebsocketTerminalEvent(eventType string) bool {
@@ -854,7 +857,7 @@ func isCodexWebsocketHandshakeFallbackError(err error) bool {
 }
 
 func buildCodexWebsocketRequestBody(body []byte) ([]byte, error) {
-	if !gjson.ValidBytes(body) {
+	if !sonic.Valid(body) {
 		return nil, errors.New("invalid Codex websocket request JSON")
 	}
 	body = sanitizeCodexInputItemIDs(body)
@@ -1008,9 +1011,17 @@ func shortenCodexInputItemID(id string, attempt int) string {
 	return string(runes[:prefixLength]) + suffix
 }
 
-func copyCodexWebsocketInputHeaders(target, source http.Header) {
+func prepareCodexWebsocketInputHeaders(target, source http.Header, rules []model.CustomHeaderRule) {
 	if target == nil {
 		return
+	}
+	// HTTP candidates carry the client window ID, but native WebSocket only
+	// sends an explicitly configured value. Rebuild that header's rules once.
+	target.Del("X-Codex-Window-Id")
+	for i, rule := range rules {
+		if strings.EqualFold(strings.TrimSpace(rule.Name), "X-Codex-Window-Id") {
+			applyHeaderRules(target, rules[i:i+1])
+		}
 	}
 	for _, name := range codexWebsocketForwardHeaders {
 		if target.Get(name) != "" {
@@ -1040,18 +1051,14 @@ func codexWebsocketHeaders(source http.Header) http.Header {
 
 	// Current Codex clients use the canonical Session-Id header. Keep it intact:
 	// a downstream ccLoad instance needs Session-Id + Thread-Id to isolate parent
-	// and subagent execution sessions. The official websocket still receives its
-	// legacy aliases, all normalized from the same canonical value.
+	// and subagent execution sessions. Accept the legacy session header as a
+	// fallback without synthesizing legacy aliases for the upstream.
 	sessionID := strings.TrimSpace(header.Get("Session-Id"))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(header.Get("Session_id"))
 	}
 	if sessionID != "" {
 		header.Set("Session-Id", sessionID)
-		header.Set("Session_id", sessionID)
-		if strings.TrimSpace(header.Get("Conversation_id")) == "" {
-			header.Set("Conversation_id", sessionID)
-		}
 	}
 	return header
 }
@@ -1507,11 +1514,20 @@ func (s *Server) doCodexWebsocketRequest(
 	incrementalBody []byte,
 	baseURL string,
 ) (*http.Response, *http.Request, []byte, error) {
+	// input item 的 status 由 Codex 上游统一拒绝，HTTP 与 WebSocket 是同一套后端校验。
+	// HTTP 侧在 responsesBodyForHTTPTransport 前置剥离，WS 侧必须在同一层做：从 HTTP
+	// 渠道切换过来的完整 transcript 带 status，原样发出会撞 400 unknown_parameter，只
+	// 能靠 400 之后的重试自愈补救。原生 WS 只在 Codex→Codex Responses 直通下启用
+	// （见 forwardOnce 的 nativeAttempt 构造条件），此处 scope 与 HTTP 侧判定等价。
 	if replayReq != nil {
-		replayBody = normalizeCodexWebsocketParallelToolCalls(replayBody, replayReq.Header)
+		replayBody = stripResponsesInputItemStatus(
+			normalizeCodexWebsocketParallelToolCalls(replayBody, replayReq.Header),
+		)
 	}
 	if incrementalReq != nil {
-		incrementalBody = normalizeCodexWebsocketParallelToolCalls(incrementalBody, incrementalReq.Header)
+		incrementalBody = stripResponsesInputItemStatus(
+			normalizeCodexWebsocketParallelToolCalls(incrementalBody, incrementalReq.Header),
+		)
 	}
 	release, err := s.reserveUpstreamRequest(cfg)
 	if err != nil {
@@ -1535,7 +1551,7 @@ func (s *Server) doCodexWebsocketRequest(
 			s.persistCodexPassiveUsage(ctx, cfg, &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     headers,
-			})
+			}, gjson.GetBytes(replayBody, "model").String())
 		},
 	)
 	if err != nil {

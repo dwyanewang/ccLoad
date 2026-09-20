@@ -60,6 +60,8 @@ let channelSelectCombobox = null;
 let channelKeyCombobox = null;
 let modelSelectCombobox = null;
 let clientProtocolCombobox = null;
+let modelTestContentCombobox = null;
+let modelTestContentOptions = [];
 
 const headRow = document.getElementById('model-test-head-row');
 const tbody = document.getElementById('model-test-tbody');
@@ -68,6 +70,7 @@ const channelSelectorLabel = document.getElementById('channelSelectorLabel');
 const keySelectorLabel = document.getElementById('keySelectorLabel');
 const modelSelectorLabel = document.getElementById('modelSelectorLabel');
 const clientProtocolSelect = document.getElementById('clientProtocolSelect');
+const modelTestContentInput = document.getElementById('modelTestContent');
 const modelSelect = document.getElementById('testModelSelect');
 const mobileNameFilterInput = document.getElementById('modelTestMobileNameFilter');
 const chatToolbar = document.getElementById('chatToolbar');
@@ -1519,6 +1522,38 @@ function selectClientProtocol(value) {
   }
 }
 
+function splitModelTestContentOptions(value) {
+  const splitter = window.TestContent?.splitPipeSeparatedTestContents;
+  if (typeof splitter === 'function') return splitter(value);
+  return [...new Set(String(value ?? '')
+    .split('|')
+    .map((content) => content.trim())
+    .filter(Boolean))];
+}
+
+function syncModelTestContentCombobox() {
+  if (!modelTestContentInput || typeof window.createSearchableCombobox !== 'function') return;
+
+  if (!modelTestContentCombobox) {
+    const initialValue = modelTestContentInput.value.trim();
+    modelTestContentCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'modelTestContent',
+      dropdownId: 'modelTestContentDropdown',
+      initialValue,
+      initialLabel: initialValue,
+      allowCustomInput: true,
+      showAllOptionsOnOpen: true,
+      getOptions: () => modelTestContentOptions.map((content) => ({
+        value: content,
+        label: content
+      }))
+    });
+  }
+
+  modelTestContentCombobox?.refresh();
+}
+
 function isModelSupported(channel, modelName) {
   if (!channel || !modelName || !Array.isArray(channel.models)) return false;
   return channel.models.some(entry => {
@@ -1662,22 +1697,22 @@ function syncSelectAllCheckbox() {
   selectAllCheckbox.indeterminate = true;
 }
 
-function renderEmptyRow(message) {
+function renderEmptyRow(messageKey) {
   tbody.innerHTML = '';
-  const row = TemplateEngine.render('tpl-empty-row', { message, colspan: getResultTableColspan() });
+  const row = TemplateEngine.render('tpl-empty-row', { message: i18nText(messageKey), messageKey, colspan: getResultTableColspan() });
   if (row) tbody.appendChild(row);
   finalizeTableRender();
 }
 
 function renderChannelModeRows() {
   if (!selectedChannel) {
-    renderEmptyRow(i18nText('modelTest.selectChannelFirst', '请先选择渠道'));
+    renderEmptyRow('modelTest.selectChannelFirst');
     return;
   }
 
   const models = selectedChannel.models || [];
   if (models.length === 0) {
-    renderEmptyRow(i18nText('modelTest.channelNoModels', '该渠道没有配置模型'));
+    renderEmptyRow('modelTest.channelNoModels');
     return;
   }
 
@@ -1730,13 +1765,13 @@ function populateModelSelector() {
 function renderModelModeRows() {
   const previousSelectionState = captureRowSelectionState();
   if (!selectedProtocol) {
-    renderEmptyRow(i18nText('modelTest.selectProtocolFirst', '请先选择请求协议'));
+    renderEmptyRow('modelTest.selectProtocolFirst');
     return;
   }
 
   const models = getAllModels();
   if (models.length === 0) {
-    renderEmptyRow(i18nText('modelTest.noModelsAvailable', '没有可用模型'));
+    renderEmptyRow('modelTest.noModelsAvailable');
     return;
   }
 
@@ -1757,7 +1792,7 @@ function renderModelModeRows() {
     : getChannelModelPairsMatching(selectedModelName);
 
   if (pairs.length === 0) {
-    renderEmptyRow(i18nText('modelTest.noChannelSupportsModel', '没有渠道支持该模型'));
+    renderEmptyRow('modelTest.noChannelSupportsModel');
     return;
   }
 
@@ -1937,6 +1972,13 @@ function getSelectedTargets() {
     .filter(Boolean);
 }
 
+function setModelTestStatusLabel(row, key, params = {}, translateTitle = false) {
+  const cell = row.querySelector('.response');
+  cell._localizedStatus = { key, params, translateTitle };
+  cell.textContent = i18nText(key, undefined, params);
+  if (translateTitle) cell.title = cell.textContent;
+}
+
 function resetRowStatus(row) {
   row.querySelector('.first-byte-duration').textContent = '-';
   row.querySelector('.duration').textContent = '-';
@@ -1948,12 +1990,13 @@ function resetRowStatus(row) {
   const costCell = row.querySelector('.cost');
   costCell.textContent = '-';
   if (costCell.dataset) delete costCell.dataset.sortValue;
-  row.querySelector('.response').textContent = i18nText('modelTest.waiting', '等待中...');
+  setModelTestStatusLabel(row, 'modelTest.waiting');
   row.querySelector('.response').title = '';
   row.style.background = '';
 }
 
 function applyTestResultToRow(row, data) {
+  row.querySelector('.response')._localizedStatus = null;
   row.querySelector('.first-byte-duration').innerHTML = formatFirstByteDurationMs(data.first_byte_duration_ms);
   row.querySelector('.duration').innerHTML = formatTotalDurationMs(data.duration_ms);
 
@@ -1996,6 +2039,7 @@ function applyTestResultToRow(row, data) {
     const responseCell = row.querySelector('.response');
     responseCell.textContent = successText;
     responseCell.title = successText;
+    if (!respText) setModelTestStatusLabel(row, 'common.success', {}, true);
 
     if (data.upstream_request_url) {
       row._upstreamData = {
@@ -2073,11 +2117,8 @@ function sleepModelTest(delayMs) {
 
 function markModelTestRPMWait(row, delayMs) {
   const seconds = Math.max(1, Math.ceil(delayMs / 1000));
-  const message = i18nText('modelTest.waitingRpmLimit', 'RPM限制，等待 {seconds}s 后重试', { seconds });
   row.style.background = 'rgba(250, 204, 21, 0.14)';
-  const responseCell = row.querySelector('.response');
-  responseCell.textContent = message;
-  responseCell.title = message;
+  setModelTestStatusLabel(row, 'modelTest.waitingRpmLimit', { seconds }, true);
 }
 
 async function waitModelTestRPMRetry(row, delayMs) {
@@ -2110,13 +2151,13 @@ async function fetchModelTestWithRPMWait(target, payload) {
 
     const delayMs = getRPMRetryDelayMs(data);
     await waitModelTestRPMRetry(row, delayMs);
-    row.querySelector('.response').textContent = i18nText('modelTest.testing', '测试中...');
+    setModelTestStatusLabel(row, 'modelTest.testing');
   }
 }
 
 async function runBatchTests(targets) {
   const streamEnabled = document.getElementById('streamEnabled').checked;
-  const content = document.getElementById('modelTestContent').value.trim() || 'hi';
+  const content = modelTestContentInput?.value.trim() || modelTestContentOptions[0] || 'hi';
   const concurrency = parseInt(document.getElementById('concurrency').value, 10) || 5;
 
   targets.forEach(({ row }) => resetRowStatus(row));
@@ -2124,7 +2165,7 @@ async function runBatchTests(targets) {
   const testOne = async (target) => {
     const { row, model, channelId, clientProtocol } = target;
     const selectedProtocol = clientProtocol;
-    row.querySelector('.response').textContent = i18nText('modelTest.testing', '测试中...');
+    setModelTestStatusLabel(row, 'modelTest.testing');
 
     try {
       const payload = { model, stream: streamEnabled, content, client_protocol: selectedProtocol };
@@ -2138,7 +2179,7 @@ async function runBatchTests(targets) {
       row.querySelector('.first-byte-duration').textContent = '-';
       row.querySelector('.duration').textContent = '-';
       row.querySelector('.speed').textContent = '-';
-      row.querySelector('.response').textContent = i18nText('modelTest.requestFailed', '请求失败');
+      setModelTestStatusLabel(row, 'modelTest.requestFailed');
       row.querySelector('.response').title = e.message;
       const costCell = row.querySelector('.cost');
       costCell.textContent = '-';
@@ -2895,7 +2936,7 @@ async function onChannelChange() {
   if (!selectedChannel) {
     await loadChannelKeys(null);
     syncClientProtocolCombobox();
-    renderEmptyRow(i18nText('modelTest.selectChannelFirst', '请先选择渠道'));
+    renderEmptyRow('modelTest.selectChannelFirst');
     return;
   }
 
@@ -2927,9 +2968,12 @@ function normalizeModelTestKeyIndex(value) {
 
 function formatModelTestKeyLabel(key) {
   const raw = String(key?.api_key || '').trim();
-  if (!raw) return `#${key?.key_index ?? '?'}`;
-  if (raw.length <= 6) return raw;
-  return `${raw.slice(0, 3)}.${raw.slice(-3)}`;
+  const maskedKey = raw.length > 6
+    ? `${raw.slice(0, 3)}.${raw.slice(-3)}`
+    : raw || `#${key?.key_index ?? '?'}`;
+  const note = String(key?.note || '').trim();
+  const multiplier = normalizeModelTestCostMultiplier(key?.cost_multiplier ?? 1);
+  return `${maskedKey}(${note}${multiplier}x)`;
 }
 
 function getModelTestKeyOptionClass(key) {
@@ -3125,11 +3169,16 @@ async function loadDefaultTestContent() {
     if (!Array.isArray(settings)) return;
 
     const setting = settings.find(s => s.key === 'channel_test_content');
-    if (!setting) return;
+    modelTestContentOptions = splitModelTestContentOptions(setting?.value);
+    if (!modelTestContentInput) return;
 
-    const input = document.getElementById('modelTestContent');
-    input.value = setting.value;
-    input.placeholder = '';
+    const initialContent = modelTestContentOptions[0] || '';
+    modelTestContentInput.value = initialContent;
+    modelTestContentInput.placeholder = initialContent
+      ? ''
+      : i18nText('modelTest.inputPlaceholder', '输入测试内容...');
+    modelTestContentCombobox?.setValue(initialContent, initialContent);
+    syncModelTestContentCombobox();
   } catch (e) {
     console.error('加载默认测试内容失败:', e);
   }
@@ -3138,10 +3187,31 @@ async function loadDefaultTestContent() {
 function bindEvents() {
   ensureModelSelectCombobox();
   syncClientProtocolCombobox();
+  syncModelTestContentCombobox();
   window.addEventListener('localechange', () => {
     syncClientProtocolCombobox();
     syncChatClientProtocolCombobox();
     refreshModelTestDynamicPriorityTitles();
+    const labels = {
+      name: testMode === TEST_MODE_CHANNEL ? 'common.model' : 'modelTest.channel',
+      priority: 'channels.table.priority', enabled: 'channels.table.enabled',
+      'first-byte': 'modelTest.firstByteDuration', duration: 'modelTest.totalDuration',
+      input: 'common.input', output: 'common.output', speed: 'modelTest.speed',
+      'cache-read': 'modelTest.cacheRead', 'cache-create': 'modelTest.cacheCreate',
+      cost: 'common.cost', response: 'modelTest.responseContent'
+    };
+    for (const [column, key] of Object.entries(labels)) {
+      document.querySelectorAll(`#model-test-tbody .model-test-col-${column}`).forEach(cell => {
+        cell.dataset.mobileLabel = i18nText(key);
+      });
+    }
+    document.querySelectorAll('#model-test-tbody .channel-enable-switch').forEach(button => {
+      applyModelTestRowEnabledStyle(button.closest('tr'), button.dataset.enabled === 'true');
+    });
+    document.querySelectorAll('#model-test-tbody .response').forEach(cell => {
+      const status = cell._localizedStatus;
+      if (status) setModelTestStatusLabel(cell.closest('tr'), status.key, status.params, status.translateTitle);
+    });
   });
   const streamEnabled = document.getElementById('streamEnabled');
   if (streamEnabled) {
@@ -4375,6 +4445,15 @@ function createChatActionButton(action, label, iconHTML, extraClass = '') {
   btn.setAttribute('data-action', action);
   btn.setAttribute('aria-label', label);
   btn.title = label;
+  const labelKey = {
+    'retry-chat-message': 'modelTest.chat.refreshMessage',
+    'edit-chat-message': 'modelTest.chat.editMessage',
+    'copy-chat-message': 'common.copy'
+  }[action];
+  if (labelKey) {
+    btn.setAttribute('data-i18n-title', labelKey);
+    btn.setAttribute('data-i18n-aria-label', labelKey);
+  }
   btn.innerHTML = iconHTML;
   return btn;
 }
@@ -4706,7 +4785,7 @@ async function bootstrap() {
     return;
   }
   window.ChannelModalHooks = {
-    afterSave: async () => {
+    afterUpdate: async () => {
       await loadChannels({ preserveSelection: true, preserveTableState: true });
     }
   };

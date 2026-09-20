@@ -94,6 +94,40 @@ func prepareCodexOAuthResponsesBody(
 	return body
 }
 
+// stripInjectedCodexOAuthInstructionsForWebsocket removes only the default
+// instructions synthesized by the shared HTTP/WS request finalizer. Explicit
+// non-empty caller instructions remain untouched.
+func stripInjectedCodexOAuthInstructionsForWebsocket(
+	cfg *model.Config,
+	sourceBody []byte,
+	body []byte,
+) []byte {
+	if cfg == nil || !cfg.UsesCodexOAuth() {
+		return body
+	}
+	sourceInstructions := gjson.GetBytes(sourceBody, "instructions")
+	if sourceInstructions.Exists() && sourceInstructions.Type == gjson.String &&
+		strings.TrimSpace(sourceInstructions.String()) != "" {
+		return body
+	}
+	instructions := gjson.GetBytes(body, "instructions")
+	if instructions.Type != gjson.String || strings.TrimSpace(instructions.String()) == "" {
+		return body
+	}
+	defaultInstructions := codexBaseInstructionsForModel(gjson.GetBytes(body, "model").String())
+	if instructions.String() != defaultInstructions {
+		sourceModel := strings.TrimSpace(gjson.GetBytes(sourceBody, "model").String())
+		if sourceModel == "" || instructions.String() != codexBaseInstructionsForModel(sourceModel) {
+			return body
+		}
+	}
+	stripped, err := sjson.DeleteBytes(body, "instructions")
+	if err != nil {
+		return body
+	}
+	return stripped
+}
+
 func prepareCodexOAuthHTTPBody(cfg *model.Config, upstreamProtocol protocol.Protocol, requestPath string, body []byte) []byte {
 	if !isCodexOAuthResponsesRequest(cfg, upstreamProtocol, requestPath) {
 		return body
@@ -124,14 +158,9 @@ func (s *Server) handleResponsesSSENonStreamSuccessResponse(
 	parser := newSSEUsageParser(string(protocol.Codex))
 	collector := newCodexNonStreamCollector(parser)
 	consume := collector.consume
-	if reqCtx.codexMultiAgentV2Optimized {
-		consume = func(rawEvent []byte) error {
-			return collector.consume(restoreCodexMultiAgentV2SSEEvent(rawEvent, true))
-		}
-	}
 	stopAfterEvent := collector.done
-	if isXAIImagesResponsesPlan(reqCtx.transformPlan) {
-		stopAfterEvent = collector.doneForXAIImages
+	if isImagesResponsesPlan(reqCtx.transformPlan) {
+		stopAfterEvent = collector.doneForImages
 	}
 	streamErr := streamTransformSSEEventsUntil(
 		reqCtx.ctx,
@@ -174,9 +203,9 @@ func (s *Server) handleResponsesSSENonStreamSuccessResponse(
 	}
 
 	terminal := collector.patchedTerminal()
-	if isXAIImagesResponsesPlan(reqCtx.transformPlan) &&
+	if isImagesResponsesPlan(reqCtx.transformPlan) &&
 		gjson.GetBytes(terminal, "type").String() != "response.completed" {
-		err := errors.New("xAI Responses image generation did not complete")
+		err := errors.New("responses image generation did not complete")
 		result.Body = terminal
 		result.StreamDiagMsg = err.Error()
 		return result, reqCtx.Duration().Seconds(), err
@@ -186,11 +215,8 @@ func (s *Server) handleResponsesSSENonStreamSuccessResponse(
 		return result, reqCtx.Duration().Seconds(), fmt.Errorf("responses terminal event is missing response")
 	}
 	responseBody := []byte(response.Raw)
-	if reqCtx.codexMultiAgentV2Optimized {
-		responseBody = restoreCodexMultiAgentV2Response(responseBody, true)
-	}
-	if isXAIImagesResponsesPlan(reqCtx.transformPlan) {
-		translatedBody, err := buildOpenAIImagesResponseFromXAIResponses(
+	if isImagesResponsesPlan(reqCtx.transformPlan) {
+		translatedBody, err := buildOpenAIImagesResponseFromResponses(
 			responseBody,
 			reqCtx.transformPlan.OriginalBody,
 		)
@@ -317,8 +343,11 @@ func (c *codexNonStreamCollector) done() bool {
 	return c.err != nil || c.parser.GetLastError() != nil || len(c.terminal) > 0
 }
 
-func (c *codexNonStreamCollector) doneForXAIImages() bool {
-	if c.err != nil || c.parser.GetLastError() != nil || len(c.terminal) == 0 {
+func (c *codexNonStreamCollector) doneForImages() bool {
+	if c.err != nil || c.parser.GetLastError() != nil {
+		return true
+	}
+	if len(c.terminal) == 0 {
 		return false
 	}
 	if gjson.GetBytes(c.terminal, "type").String() != "response.completed" {

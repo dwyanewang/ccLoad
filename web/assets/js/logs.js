@@ -17,6 +17,15 @@ let logsExactModelValue = '';
 let logsDefaultTestContent = 'sonnet 4.0的发布日期是什么'; // 默认测试内容（从设置加载）
 let logChannelClickAction = 'edit'; // 日志页渠道名点击行为：edit|navigate
 
+function firstConfiguredLogsTestContent(value) {
+  const firstContent = window.TestContent?.firstPipeSeparatedTestContent;
+  if (typeof firstContent === 'function') return firstContent(value, logsDefaultTestContent);
+  return String(value ?? '')
+    .split('|')
+    .map((content) => content.trim())
+    .find(Boolean) || logsDefaultTestContent;
+}
+
 let latestActiveRequests = []; // 缓存 ui.js 最近一次推送的活动请求，供 load() 即时刷新
 let lastActiveRequestStates = null; // Map<id, fingerprint>：上次活跃请求状态，用于检测请求结束/渠道切换
 let logsLoadInFlight = false;
@@ -1009,12 +1018,12 @@ function renderActiveRequests(activeRequests) {
   }
 }
 
-// 中断运行中请求的当前上游尝试（服务端按上游连接重置处理，随后正常故障切换）
+// 中断当前渠道：响应未提交则切下一渠道，已提交则终止请求。
 async function abortActiveRequest(button) {
   const id = button.dataset.abortRequestId;
   if (!id || abortingActiveRequests.has(id)) return;
 
-  const confirmMsg = (typeof t === 'function' ? t('logs.abortConfirm') : '') || '确定中断这个进行中的请求吗？将按上游网络故障处理。';
+  const confirmMsg = (typeof t === 'function' ? t('logs.abortConfirm') : '') || '确定中断当前渠道的请求吗？尚未发送响应时将切换渠道，已经开始响应则立即终止。';
   if (!confirm(confirmMsg)) return;
 
   abortingActiveRequests.set(id, Number(button.dataset.abortStart) || 0);
@@ -1049,7 +1058,29 @@ function formatCacheUtilRate(inputTokens, cacheReadTokens, cacheCreationTokens) 
   return `<span class="token-metric-value" style="color: var(--success-600);">${pct.toFixed(1)}%</span>`;
 }
 
+// buildCacheCreationDisplay 渲染缓存建列，分桶角标按实际数据判定。
+// 上游给了 5m/1h 明细就显示，不看模型名或协议——走 codex 协议的 gpt 模型同样
+// 会上报分桶，用模型名判断会把这些真实分桶吞掉。
+function buildCacheCreationDisplay(entry) {
+  const total = entry.cache_creation_input_tokens || 0;
+  if (total <= 0) return '';
+
+  const cache5m = entry.cache_5m_input_tokens || 0;
+  const cache1h = entry.cache_1h_input_tokens || 0;
+
+  let badge = '';
+  if (cache5m > 0 && cache1h === 0) {
+    badge = ' <sup style="color: var(--primary-500); font-size: 0.75em; font-weight: 600;">5m</sup>';
+  } else if (cache1h > 0 && cache5m === 0) {
+    badge = ' <sup style="color: var(--warning-600); font-size: 0.75em; font-weight: 600;">1h</sup>';
+  } else if (cache5m > 0 && cache1h > 0) {
+    badge = ' <sup style="color: var(--primary-500); font-size: 0.75em; font-weight: 600;">5m</sup><sup style="color: var(--warning-600); font-size: 0.75em; font-weight: 600;">+1h</sup>';
+  }
+  return `<span class="token-metric-value" style="color: var(--primary-600);">${total.toLocaleString()}${badge}</span>`;
+}
+
 function renderLogsLoading() {
+  displayedLogs = null;
   const tbody = document.getElementById('tbody');
   const colspan = getTableColspan();
   const loadingRow = TemplateEngine.render('tpl-log-loading', { colspan });
@@ -1058,6 +1089,7 @@ function renderLogsLoading() {
 }
 
 function renderLogsError() {
+  displayedLogs = null;
   const tbody = document.getElementById('tbody');
   const colspan = getTableColspan();
   const errorRow = TemplateEngine.render('tpl-log-error', { colspan });
@@ -1065,7 +1097,10 @@ function renderLogsError() {
   if (errorRow) tbody.appendChild(errorRow);
 }
 
+let displayedLogs = null;
+
 function renderLogs(data) {
+  displayedLogs = data;
   const tbody = document.getElementById('tbody');
   const colspan = getTableColspan();
   const logMobileLabels = getLogMobileLabels();
@@ -1101,7 +1136,7 @@ function renderLogs(data) {
     const statusCode = entry.status_code;
 
     // 3. 模型显示（支持重定向与思考等级角标）
-    const displayedActualModel = entry.response_model || entry.actual_model;
+    const displayedActualModel = entry.actual_model || entry.response_model;
     const modelDisplay = buildLogModelDisplay(entry.model, displayedActualModel, entry.thinking_effort, entry.reasoning_tokens);
 
     // 4. 响应时间显示(流式/非流式)
@@ -1164,27 +1199,7 @@ function renderLogs(data) {
     const cacheReadDisplay = tokenValue(entry.cache_read_input_tokens, 'var(--success-600)');
 
     // 缓存建列
-    let cacheCreationDisplay = '';
-    const total = entry.cache_creation_input_tokens || 0;
-    const cache5m = entry.cache_5m_input_tokens || 0;
-    const cache1h = entry.cache_1h_input_tokens || 0;
-
-    if (total > 0) {
-      const model = (entry.model || '').toLowerCase();
-      const isClaudeOrCodex = model.includes('claude') || model.includes('codex');
-
-      let badge = '';
-      if (isClaudeOrCodex && (cache5m > 0 || cache1h > 0)) {
-        if (cache5m > 0 && cache1h === 0) {
-          badge = ' <sup style="color: var(--primary-500); font-size: 0.75em; font-weight: 600;">5m</sup>';
-        } else if (cache1h > 0 && cache5m === 0) {
-          badge = ' <sup style="color: var(--warning-600); font-size: 0.75em; font-weight: 600;">1h</sup>';
-        } else if (cache5m > 0 && cache1h > 0) {
-          badge = ' <sup style="color: var(--primary-500); font-size: 0.75em; font-weight: 600;">5m</sup><sup style="color: var(--warning-600); font-size: 0.75em; font-weight: 600;">+1h</sup>';
-        }
-      }
-      cacheCreationDisplay = `<span class="token-metric-value" style="color: var(--primary-600);">${total.toLocaleString()}${badge}</span>`;
-    }
+    const cacheCreationDisplay = buildCacheCreationDisplay(entry);
 
     // 7. 成本显示
     const costInfo = getLogCostInfo(entry);
@@ -1893,7 +1908,9 @@ window.initPageBootstrap({
 
   // 从 bootstrap 数据应用设置（bootstrap 失败时各字段回退到原有 fetch 路径）
   if (bootstrap) {
-    if (bootstrap.channel_test_content) logsDefaultTestContent = bootstrap.channel_test_content;
+    if (bootstrap.channel_test_content) {
+      logsDefaultTestContent = firstConfiguredLogsTestContent(bootstrap.channel_test_content);
+    }
     const clickAction = String(bootstrap.log_channel_click_action || '').trim().toLowerCase();
     logChannelClickAction = clickAction === 'navigate' ? 'navigate' : 'edit';
     window.availableLogsModels = [...new Set(bootstrap.models || [])];
@@ -2823,5 +2840,14 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { isPrefixOrSuffixVariant, buildLogModelDisplay };
+  module.exports = { isPrefixOrSuffixVariant, buildLogModelDisplay, buildCacheCreationDisplay };
+}
+
+if (typeof window !== 'undefined') {
+  window.i18n?.onLocaleChange?.(() => {
+    if (displayedLogs !== null) {
+      renderLogs(displayedLogs);
+      window.i18n.translatePage();
+    }
+  });
 }

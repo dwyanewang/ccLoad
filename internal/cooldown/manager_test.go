@@ -3,6 +3,7 @@ package cooldown
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -490,6 +491,50 @@ func TestHandleError_HTTP400CoolsOnlyCurrentModel(t *testing.T) {
 	}
 }
 
+func TestHandleError_HTTP413CoolsOnlyCurrentModel(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	manager := NewManager(store, nil)
+	ctx := context.Background()
+
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "test-http-413-model-scope",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 10,
+		Enabled:  true,
+		ModelEntries: []model.ModelEntry{
+			{Model: "model-a"},
+			{Model: "model-b"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create config: %v", err)
+	}
+
+	action := manager.HandleError(ctx, ErrorInput{
+		ChannelID:  cfg.ID,
+		Model:      "model-a",
+		KeyIndex:   0,
+		StatusCode: 413,
+		ErrorBody:  []byte(`{"code":"RequestTooLarge","message":"Request body size exceeds maximum allowed size"}`),
+	})
+
+	if action != ActionRetryModel {
+		t.Fatalf("action=%v, want ActionRetryModel", action)
+	}
+	until, exists := getModelCooldownUntil(ctx, store, cfg.ID, "model-a")
+	if !exists || !until.After(time.Now()) {
+		t.Fatalf("model-a should be cooled, until=%v exists=%v", until, exists)
+	}
+	channelCfg, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if channelCfg.IsCoolingDown(time.Now()) {
+		t.Fatal("HTTP 413 must not cool the whole channel while another model is available")
+	}
+}
+
 func TestHandleError_Upstream499CoolsOnlyCurrentModel(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -707,6 +752,15 @@ func TestHandleErrorWithKeyFallback(t *testing.T) {
 					Enabled: true, Name: "planned relay maintenance", Priority: 0, StatusCodes: []int{502},
 					Scope: model.CooldownScopeChannel, Mode: model.CooldownModeFixed, CooldownSeconds: 120,
 				}}},
+			},
+			wantAction: ActionRetryChannel, wantChannelCool: true,
+		},
+		{
+			name: "cloudflare challenge remains channel scoped",
+			input: ErrorInput{
+				Model: "test-model", KeyIndex: 0, StatusCode: 503,
+				ErrorBody: []byte(`<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>`),
+				Headers:   map[string][]string{"cf-mitigated": {"challenge"}},
 			},
 			wantAction: ActionRetryChannel, wantChannelCool: true,
 		},
@@ -1523,6 +1577,46 @@ func TestHandleError_ModelCooldownResetSeconds(t *testing.T) {
 	})
 }
 
+func TestHandleError_CodexUsageFrequencyLimitMsgResetTime(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	manager := NewManager(store, nil)
+	ctx := context.Background()
+	cfg := createTestChannel(t, store, "test-codex-usage-frequency-limit")
+	_ = store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   cfg.ID,
+		KeyIndex:    0,
+		APIKey:      "sk-codex-usage-frequency-limit",
+		KeyStrategy: model.KeyStrategySequential,
+	}})
+
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	resetAt := time.Now().In(loc).Add(2 * time.Hour).Truncate(time.Second)
+	body := []byte(fmt.Sprintf(`{"code":6004,"msg":"您的使用量已超出频率限制，将在 %s UTC+8 重置，您也可以切换其他模型继续使用。"}`, resetAt.Format("2006-01-02 15:04:05")))
+
+	action := manager.HandleError(ctx, ErrorInput{
+		ChannelID:  cfg.ID,
+		Model:      "gpt-6-astra",
+		KeyIndex:   0,
+		StatusCode: 429,
+		ErrorBody:  body,
+	})
+	if action != ActionRetryModel {
+		t.Fatalf("action=%v, want ActionRetryModel", action)
+	}
+
+	modelCooldownUntil, exists := getModelCooldownUntil(ctx, store, cfg.ID, "gpt-6-astra")
+	if !exists {
+		t.Fatal("expected model cooldown")
+	}
+	if !modelCooldownUntil.Equal(resetAt) {
+		t.Fatalf("model cooldown until=%s, want %s", modelCooldownUntil, resetAt)
+	}
+	if keyCooldownUntil, exists := getKeyCooldownUntil(ctx, store, cfg.ID, 0); exists && keyCooldownUntil.After(time.Now()) {
+		t.Fatalf("model-scoped cooldown must not cool the key, got until %s", keyCooldownUntil)
+	}
+}
+
 func TestHandleError_GeminiResourceExhaustedRetryIn(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -1759,6 +1853,52 @@ func TestHandleError_Structured429QuotaSingleKeyPromotesChannel(t *testing.T) {
 	channelUntil := time.Unix(channelCfg.CooldownUntil, 0)
 	if channelUntil.Sub(cooldownUntil).Abs() > time.Second {
 		t.Fatalf("channel cooldown=%s, want key recovery time %s", channelUntil, cooldownUntil)
+	}
+}
+
+func TestHandleError_TokenHarborRollingFreeAllowancePromotesSingleKeyChannel(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	manager := NewManager(store, nil)
+	ctx := context.Background()
+
+	cfg := createTestChannel(t, store, "test-token-harbor-rolling-free-allowance")
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   cfg.ID,
+		KeyIndex:    0,
+		APIKey:      "sk-token-harbor",
+		KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	resetAt := time.Now().UTC().Add(4 * 24 * time.Hour).Truncate(time.Microsecond)
+	body := []byte(fmt.Sprintf(`{"type":"error","error":{"type":"rate_limit_error","message":"You've used this period's free allowance. Your next rolling 7-day period starts at %s. Use the paid model 'deepseek-v4.1-flash' to keep going."}}`, resetAt.Format(time.RFC3339Nano)))
+	action := manager.HandleError(ctx, ErrorInput{
+		ChannelID:  cfg.ID,
+		KeyIndex:   0,
+		StatusCode: http.StatusTooManyRequests,
+		Model:      "deepseek-v4.1-flash",
+		ErrorBody:  body,
+	})
+
+	if action != ActionRetryChannel {
+		t.Fatalf("action=%v, want ActionRetryChannel", action)
+	}
+	keyUntil, exists := getKeyCooldownUntil(ctx, store, cfg.ID, 0)
+	if !exists || !sameTimeSecond(keyUntil, resetAt) {
+		t.Fatalf("key cooldown=%v exists=%v, want %v", keyUntil, exists, resetAt)
+	}
+	channelCfg, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	channelUntil := time.Unix(channelCfg.CooldownUntil, 0)
+	if !sameTimeSecond(channelUntil, resetAt) {
+		t.Fatalf("channel cooldown=%v, want %v", channelUntil, resetAt)
+	}
+	if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "deepseek-v4.1-flash"); exists {
+		t.Fatal("credential-wide free allowance must not create a model cooldown")
 	}
 }
 
@@ -2218,5 +2358,40 @@ func TestHandleError_WebsocketConnectionLimit(t *testing.T) {
 	}
 	if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "model-a"); exists {
 		t.Error("connection slot exhaustion must not cool down the model")
+	}
+}
+
+// Cloudflare 质询按渠道级冷却。OAuth 渠道没有独立 Key（KeyIndex=NoKeyIndex），
+// 若分类退回 Key 级，则既不会写 Key 冷却也不会写渠道冷却，坏渠道会被无限重试。
+func TestHandleError_CloudflareChallengeCoolsChannelWithoutKeys(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	manager := NewManager(store, nil)
+	ctx := context.Background()
+
+	cfg := createTestChannel(t, store, "test-cf-challenge")
+
+	action := manager.HandleError(ctx, ErrorInput{
+		ChannelID:  cfg.ID,
+		KeyIndex:   NoKeyIndex, // OAuth 渠道：无独立 Key
+		StatusCode: http.StatusForbidden,
+		Model:      "test-model",
+		ErrorBody:  []byte(`<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Verifying you are human</body></html>`),
+		Headers:    map[string][]string{"cf-mitigated": {"challenge"}},
+	})
+
+	if action != ActionRetryChannel {
+		t.Fatalf("action=%v, want ActionRetryChannel", action)
+	}
+
+	channelCfg, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("GetConfig: %v", err)
+	}
+	if !channelCfg.IsCoolingDown(time.Now()) {
+		t.Fatal("cloudflare challenge must install a channel cooldown on a keyless channel")
+	}
+	if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "test-model"); exists {
+		t.Error("cloudflare challenge is IP/fingerprint scoped, it must not cool down the model")
 	}
 }

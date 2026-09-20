@@ -3,14 +3,18 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	"ccLoad/internal/util"
+
+	"github.com/tidwall/gjson"
 )
 
 // ============================================================================
@@ -29,7 +33,8 @@ type usageAccumulator struct {
 	Cache5mInputTokens       int
 	Cache1hInputTokens       int
 	ToolCostUSD              float64
-	ServiceTier              string // 上游实际声明的 service_tier/speed
+	ImageUsage               util.ImageGenerationToolUsage // Native Images usage, distinct from Responses tool usage.
+	ServiceTier              string                        // 上游实际声明的 service_tier/speed
 	ThinkingEffort           string
 	ResponseModel            string // 上游原始响应声明的模型；只用于日志观测
 	usageVersion             int
@@ -113,6 +118,7 @@ type usageParser interface {
 	GetUsage() (inputTokens, outputTokens, cacheRead, cacheCreation int)
 	GetCacheBreakdown() (cache5m, cache1h int, serviceTier string) // 返回缓存分桶与上游 service_tier/speed
 	GetToolCostUSD() float64                                       // 返回 Responses 工具调用的额外费用
+	GetImageUsage() util.ImageGenerationToolUsage
 	GetThinkingEffort() string
 	GetReasoningTokens() int
 	GetResponseModel() string
@@ -130,6 +136,10 @@ func (u *usageAccumulator) GetCacheBreakdown() (cache5m, cache1h int, serviceTie
 
 func (u *usageAccumulator) GetToolCostUSD() float64 {
 	return u.ToolCostUSD
+}
+
+func (u *usageAccumulator) GetImageUsage() util.ImageGenerationToolUsage {
+	return u.ImageUsage
 }
 
 func (u *usageAccumulator) GetThinkingEffort() string {
@@ -261,6 +271,7 @@ func (p *sseUsageParser) scanUsageFragments(data []byte) {
 		p.CacheCreationInputTokens = p.scanner.CacheCreationInputTokens
 		p.Cache5mInputTokens = p.scanner.Cache5mInputTokens
 		p.Cache1hInputTokens = p.scanner.Cache1hInputTokens
+		p.ImageUsage = p.scanner.ImageUsage
 		p.scanVersion = p.scanner.usageVersion
 	}
 	if p.scanner.ThinkingEffort != "" {
@@ -459,7 +470,7 @@ func (s *sseLargeFieldSanitizer) clearPending() {
 }
 
 func isLargeJSONStringField(key string) bool {
-	return key == "result" || key == "partial_image_b64"
+	return key == "result" || key == "partial_image_b64" || key == "b64_json"
 }
 
 // parseBuffer 解析缓冲区中的SSE事件（增量解析）
@@ -527,9 +538,16 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	}
 
 	// 先解析 usage。失败终态也可能包含已经消耗的 token，计费不能因为
-	// response.failed 提前返回而静默归零。
-	var event map[string]any
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
+	// response.failed 提前返回而静默归零。Unmarshal 失败不改写、不丢弃
+	// 下游已经在拷的字节；终态仍用廉价字段认，避免把完整流记成 599。
+	event, err := sseJSONObjectMap([]byte(data))
+	if err != nil {
+		if eventType == "error" || eventType == "response.failed" || isErrorPayload(data) {
+			log.Printf("[WARN]  [SSE错误事件] 上游返回error内容(eventType=%q): %s", eventType, data)
+			p.lastError = []byte(data)
+			return nil
+		}
+		markSSETerminalFromRaw(p, eventType, data)
 		return fmt.Errorf("json unmarshal failed: %w", err)
 	}
 	p.captureResponseModel(event, p.upstreamProtocol)
@@ -573,6 +591,9 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	if isAnthropicTerminal || isSuccessfulResponsesTerminal(eventType) || isSuccessfulResponsesTerminal(payloadType) {
 		p.streamComplete = true
 	}
+	if isImagesStreamTerminal(payloadType) || (payloadType == "" && isImagesStreamTerminal(eventType)) {
+		p.streamComplete = true
+	}
 	// OpenAI Chat Completions 与 Gemini 在 finish_reason 处就已给出语义终态，
 	// 之后的 usage 分片和 [DONE] 都是可选尾巴。客户端常在读到 finish_reason 时
 	// 立刻断开，此处不认终态会把完整响应误判成 499（客户端取消）或 599（流不完整）。
@@ -580,15 +601,17 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 		p.streamComplete = true
 	}
 	if isSuccessfulResponsesTerminal(payloadType) {
-		if response, ok := event["response"].(map[string]any); ok {
-			output, _ := json.Marshal(response["output"])
-			if len(output) == 0 || string(output) == "null" {
+		responseRaw := gjson.Get(data, "response")
+		if responseRaw.IsObject() {
+			outputRaw := responseRaw.Get("output")
+			output := []byte(outputRaw.Raw)
+			if !outputRaw.IsArray() {
 				output = []byte("[]")
 			}
-			responseID, _ := response["id"].(string)
+			responseID := strings.TrimSpace(responseRaw.Get("id").String())
 			p.responsesTurnResult = responsesWebsocketTurnResult{
 				completedOutput:     output,
-				completedResponseID: strings.TrimSpace(responseID),
+				completedResponseID: responseID,
 				pendingToolCallIDs:  responsesWebsocketPendingToolCallIDs(output),
 			}
 			p.hasResponsesTurn = true
@@ -700,6 +723,107 @@ func isSuccessfulResponsesTerminal(eventType string) bool {
 	}
 }
 
+func isImagesStreamTerminal(eventType string) bool {
+	return eventType == "image_generation.completed" || eventType == "image_edit.completed"
+}
+
+// sseJSONObjectMap 解析单个 SSE 帧。
+//
+// 值构造用 gjson 是刻意的：gjson 对重复成员采用前者，和 parseEvent 里用
+// gjson.Get(data, "response") 提取 Responses 终态的那条路径一致，避免同一帧的
+// usage 和 response 取自两个不同的成员。这只统一 parseEvent 内共同裁决同一帧的
+// 两条路径，不代表全仓库 JSON 读取语义已经统一。
+//
+// 守卫用 encoding/json 而不是 gjson.ValidBytes：两者只在嵌套深度上分歧——
+// encoding/json 有 10000 层硬上限，gjson 无上限且随后 root.Value() 的物化是
+// O(n²)，1 MiB 以内的深嵌套帧实测可烧掉 20 秒以上 CPU。非法 \u 转义、尾随数据、
+// 多余逗号等其余分歧点两者判定一致，典型帧上多付约 18 ns。
+func sseJSONObjectMap(raw []byte) (map[string]any, error) {
+	if !json.Valid(raw) {
+		return nil, sseJSONSyntaxError(raw)
+	}
+	root := gjson.ParseBytes(raw)
+	event, ok := root.Value().(map[string]any)
+	if !ok {
+		if root.Type == gjson.Null {
+			return nil, errors.New("JSON object expected, got null")
+		}
+		return nil, errors.New("JSON object expected")
+	}
+	return event, nil
+}
+
+// sseJSONSyntaxError 只在守卫已判定失败后调用，重新解析一次换取定位信息。
+// json.Valid 是布尔的，而 sonic 的错误原本带 index——上游帧坏在哪个字节是排障的
+// 起点，不能因为换了守卫就丢掉。多扫一遍只发生在失败路径，热路径不受影响。
+func sseJSONSyntaxError(raw []byte) error {
+	var probe json.RawMessage
+	err := json.Unmarshal(raw, &probe)
+	if err == nil {
+		return errors.New("invalid JSON object")
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return fmt.Errorf("invalid JSON object at offset %d: %w", syntaxErr.Offset, err)
+	}
+	return fmt.Errorf("invalid JSON object: %w", err)
+}
+
+// markSSETerminalFromRaw 用廉价字段在解析失败的帧上补认终态。只认语法完整的首个
+// JSON 值：gjson 对未闭合结构是宽松的，能从被截断的字节里读出 finish_reason，把真实
+// 中断的流记成完整流——那正是 599 要抓的故障。反过来，尾随垃圾之前的那个值本身是完整
+// 的，不该因为帧尾多了字节就把一次送达完整的响应误判成中断。
+func markSSETerminalFromRaw(p *sseUsageParser, eventType, data string) {
+	var first json.RawMessage
+	if err := json.NewDecoder(strings.NewReader(data)).Decode(&first); err != nil {
+		return
+	}
+	payload := string(first)
+	payloadType := gjson.Get(payload, "type").String()
+	isAnthropicTerminal := payloadType == "message_stop" || (payloadType == "" && eventType == "message_stop")
+	if isAnthropicTerminal || isSuccessfulResponsesTerminal(payloadType) ||
+		(payloadType == "" && isSuccessfulResponsesTerminal(eventType)) {
+		p.streamComplete = true
+	}
+	if isImagesStreamTerminal(payloadType) || (payloadType == "" && isImagesStreamTerminal(eventType)) {
+		p.streamComplete = true
+	}
+	if gjsonOpenAIStreamComplete(payload) || gjsonGeminiStreamComplete(payload) {
+		p.streamComplete = true
+	}
+}
+
+func gjsonOpenAIStreamComplete(data string) bool {
+	choices := gjson.Get(data, "choices")
+	if !choices.IsArray() {
+		return false
+	}
+	for _, choice := range choices.Array() {
+		reason := choice.Get("finish_reason")
+		if !reason.Exists() || reason.Type == gjson.Null {
+			continue
+		}
+		if reason.Type == gjson.String && strings.TrimSpace(reason.String()) == "" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func gjsonGeminiStreamComplete(data string) bool {
+	candidates := gjson.Get(data, "candidates")
+	if !candidates.IsArray() {
+		return false
+	}
+	for _, candidate := range candidates.Array() {
+		if strings.TrimSpace(candidate.Get("finishReason").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func observedServiceTierFromEvent(eventType, payloadType string, event map[string]any) string {
 	if event == nil {
 		return ""
@@ -767,7 +891,7 @@ func geminiStreamPayloadComplete(payload map[string]any) bool {
 }
 
 func isHeartbeatEvent(eventType, data string) bool {
-	if eventType == "ping" {
+	if isHeartbeatEventType(eventType) {
 		return true
 	}
 	if data == "" {
@@ -776,7 +900,21 @@ func isHeartbeatEvent(eventType, data string) bool {
 	var event struct {
 		Type string `json:"type"`
 	}
-	return json.Unmarshal([]byte(data), &event) == nil && event.Type == "ping"
+	return json.Unmarshal([]byte(data), &event) == nil && isHeartbeatEventType(event.Type)
+}
+
+// isHeartbeatEventType 判断事件类型是否为纯心跳。
+// Codex 上游在响应开始与终态之间插入 `event: keepalive`
+// （data: {"type":"keepalive","sequence_number":N}）。它和 ping 一样只是保活，
+// 既不是语义输出（否则 deferredWriter 提前 commit，后续 error 无法切渠道），
+// 也不能阻止首个语义输出前的重试。
+func isHeartbeatEventType(eventType string) bool {
+	switch eventType {
+	case "ping", "keepalive":
+		return true
+	default:
+		return false
+	}
 }
 
 // isErrorPayload 检测 data 是否为 error 事件 JSON，用于兼容不带 event: error 行的不规范上游。
@@ -1061,6 +1199,7 @@ func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cach
 			p.ThinkingEffort = sseParser.GetThinkingEffort()
 			p.ReasoningTokens = sseParser.GetReasoningTokens()
 			p.ToolCostUSD = sseParser.GetToolCostUSD()
+			p.ImageUsage = sseParser.GetImageUsage()
 			p.ResponseModel = sseParser.GetResponseModel()
 			return sseParser.GetUsage()
 		}
@@ -1274,20 +1413,58 @@ func imageGenerationToolUsageFromMap(usage map[string]any) util.ImageGenerationT
 	}
 }
 
+// Images API input detail counts include cached tokens; the cost calculator
+// accepts disjoint buckets, unlike the Responses image tool's flat details.
+func imageAPIUsageFromMap(usage map[string]any) util.ImageGenerationToolUsage {
+	result := imageGenerationToolUsageFromMap(usage)
+	input, _ := usage["input_tokens_details"].(map[string]any)
+	cached, _ := input["cached_tokens_details"].(map[string]any)
+	if cached != nil {
+		result.TextCachedTokens = usageInt(cached, "text_tokens")
+		result.ImageCachedTokens = usageInt(cached, "image_tokens")
+	}
+	result.TextCachedTokens = min(result.TextInputTokens, result.TextCachedTokens)
+	result.ImageCachedTokens = min(result.ImageInputTokens, result.ImageCachedTokens)
+	result.TextInputTokens -= result.TextCachedTokens
+	result.ImageInputTokens -= result.ImageCachedTokens
+	return result
+}
+
+// usageTokenCount 是 usage 数值转 token 计数的唯一入口。
+//
+// 上游 JSON 里的数字一律解成 float64，直接 int(v) 会把 NaN、±Inf、1e300 这类坏数据
+// 变成 MaxInt，随后按单价乘进成本、写进日志、参与限额判定。这里统一收敛：非有限、
+// 负数、超出 int 表示范围的值一律归零，当作「上游没给这个计数」——这正是本函数
+// default 分支已有的语义。新增 usage 字段一律走这里，不要在调用点各补一次
+// math.IsInf。
+//
+// 第二个返回值只表示「字段存在且是数字」，不表示值落在合法区间：字段存在但数值荒谬
+// 时仍然覆盖成 0，因为上游确实声明了这个计数。
+func usageTokenCount(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		if math.IsNaN(v) || v < 0 || v >= math.MaxInt {
+			return 0, true
+		}
+		return int(v), true
+	case int:
+		return max(v, 0), true
+	case int64:
+		if v < 0 {
+			return 0, true
+		}
+		return int(min(v, math.MaxInt)), true
+	default:
+		return 0, false
+	}
+}
+
 func usageInt(m map[string]any, key string) int {
 	if m == nil {
 		return 0
 	}
-	switch value := m[key].(type) {
-	case float64:
-		return int(value)
-	case int:
-		return value
-	case int64:
-		return int(value)
-	default:
-		return 0
-	}
+	val, _ := usageTokenCount(m[key])
+	return val
 }
 
 func usageFirstInt(m map[string]any, keys ...string) int {
@@ -1304,6 +1481,9 @@ func (u *usageAccumulator) applyUsage(usage map[string]any, upstreamProtocol str
 		return
 	}
 	u.usageVersion++
+	if upstreamProtocol == "openai" || upstreamProtocol == "codex" {
+		u.ImageUsage = imageAPIUsageFromMap(usage)
+	}
 
 	// 优先使用本次请求的实际上游协议，缺失时才回退到字段特征检测。
 	switch upstreamProtocol {
@@ -1423,16 +1603,16 @@ func (u *usageAccumulator) applyGeminiUsage(usage map[string]any) {
 
 // applyOpenAIChatUsage 处理OpenAI Chat Completions API格式
 func (u *usageAccumulator) applyOpenAIChatUsage(usage map[string]any) {
-	if val, ok := usage["prompt_tokens"].(float64); ok {
-		u.InputTokens = int(val)
+	if val, ok := usageTokenCount(usage["prompt_tokens"]); ok {
+		u.InputTokens = val
 	}
-	if val, ok := usage["completion_tokens"].(float64); ok {
-		u.OutputTokens = int(val)
+	if val, ok := usageTokenCount(usage["completion_tokens"]); ok {
+		u.OutputTokens = val
 	}
 	// OpenAI Chat Completions缓存字段: prompt_tokens_details.cached_tokens
 	if details, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-		if val, ok := details["cached_tokens"].(float64); ok {
-			u.CacheReadInputTokens = int(val)
+		if val, ok := usageTokenCount(details["cached_tokens"]); ok {
+			u.CacheReadInputTokens = val
 		}
 	}
 	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
@@ -1455,57 +1635,53 @@ func (u *usageAccumulator) applyOpenAIChatUsage(usage map[string]any) {
 // 重要：Anthropic SSE流中，message_start包含input_tokens，message_delta包含cumulative output_tokens
 // 某些中间代理（如anyrouter）会在message_delta中添加input_tokens:0，需要防御性处理
 func (u *usageAccumulator) applyAnthropicOrResponsesUsage(usage map[string]any) {
-	// input_tokens: 只有 > 0 时才覆盖（防止message_delta中的0覆盖message_start的正确值）
-	if val, ok := usage["input_tokens"].(float64); ok && int(val) > 0 {
-		u.InputTokens = int(val)
+	// 这些字段都是**累计快照**：每一帧给的是从流开始到此刻的总量。
+	// 正值一律采用最新快照（即使比上一个正值小——中转层会对先前统计做向下修正，
+	// 所以不能改成 max）；显式 0 只当占位符忽略，因为中转层习惯在较晚的帧里
+	// 把自己不掌握的字段补成 0，那会抹掉 message_start 里唯一正确的值。
+	if val, ok := usageTokenCount(usage["input_tokens"]); ok && val > 0 {
+		u.InputTokens = val
 	}
-	// output_tokens: 直接覆盖（cumulative语义，后续值包含之前的累计）
-	if val, ok := usage["output_tokens"].(float64); ok {
-		u.OutputTokens = int(val)
+	if val, ok := usageTokenCount(usage["output_tokens"]); ok && val > 0 {
+		u.OutputTokens = val
 	}
-
-	// Anthropic缓存字段
-	if val, ok := usage["cache_read_input_tokens"].(float64); ok {
-		u.CacheReadInputTokens = int(val)
-	}
-	hasAggregateCacheCreation := false
-	if val, ok := usage["cache_creation_input_tokens"].(float64); ok {
-		hasAggregateCacheCreation = true
-		u.CacheCreationInputTokens = int(val)
+	if val, ok := usageTokenCount(usage["cache_read_input_tokens"]); ok && val > 0 {
+		u.CacheReadInputTokens = val
 	}
 
-	// Anthropic缓存细分字段 (新增2025-12)
+	_, hasAggregateCacheCreation := usage["cache_creation_input_tokens"]
+	aggregateCacheCreation := usageInt(usage, "cache_creation_input_tokens")
+
+	// Anthropic 缓存细分字段 (新增2025-12) 是一个**原子快照**：任一 bucket 为正就
+	// 整组生效（含把另一个清零），aggregate 永远由两者重算。分开赋值会产生
+	// aggregate != 5m+1h 的自相矛盾状态，而 1h 是最贵的写价，直接算错钱。
 	hasDetailedCacheCreation := false
+	detailedCache5m := 0
+	detailedCache1h := 0
 	if cacheCreation, ok := usage["cache_creation"].(map[string]any); ok {
 		hasDetailedCacheCreation = true
-		if val, ok := cacheCreation["ephemeral_5m_input_tokens"].(float64); ok {
-			u.Cache5mInputTokens = int(val)
-		}
-		if val, ok := cacheCreation["ephemeral_1h_input_tokens"].(float64); ok {
-			u.Cache1hInputTokens = int(val)
-		}
-		// 更新兼容字段
-		u.CacheCreationInputTokens = u.Cache5mInputTokens + u.Cache1hInputTokens
+		detailedCache5m = usageInt(cacheCreation, "ephemeral_5m_input_tokens")
+		detailedCache1h = usageInt(cacheCreation, "ephemeral_1h_input_tokens")
 	}
-	if hasAggregateCacheCreation && !hasDetailedCacheCreation && u.CacheCreationInputTokens > 0 {
-		u.Cache5mInputTokens = u.CacheCreationInputTokens
+	if detailedCache5m > 0 || detailedCache1h > 0 {
+		u.setCacheCreationSnapshot(detailedCache5m, detailedCache1h)
+	} else if aggregateCacheCreation > 0 {
+		// 只有 aggregate、没有权威 split 时按 5m 计价，并清掉可能残留的旧 1h bucket。
+		u.setCacheCreationSnapshot(aggregateCacheCreation, 0)
 	}
 
 	// OpenAI Responses / Codex 缓存字段:
 	// input_tokens_details.cached_tokens      → 缓存读
 	// input_tokens_details.cache_write_tokens → 缓存建（写入）
 	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-		if val, ok := details["cached_tokens"].(float64); ok {
-			u.CacheReadInputTokens = int(val)
+		if val, ok := usageTokenCount(details["cached_tokens"]); ok && val > 0 {
+			u.CacheReadInputTokens = val
 		}
 		// 仅在尚未拿到 Anthropic 风格 cache_creation 字段时采用 cache_write_tokens
 		if !hasAggregateCacheCreation && !hasDetailedCacheCreation {
-			if val, ok := details["cache_write_tokens"].(float64); ok {
-				u.CacheCreationInputTokens = int(val)
-				if u.CacheCreationInputTokens > 0 {
-					// OpenAI cache write 无 5m/1h 细分，按 5m 写价（1.25x）计费
-					u.Cache5mInputTokens = u.CacheCreationInputTokens
-				}
+			if val, ok := usageTokenCount(details["cache_write_tokens"]); ok && val > 0 {
+				// OpenAI cache write 无 5m/1h 细分，按 5m 写价（1.25x）计费
+				u.setCacheCreationSnapshot(val, 0)
 			}
 		}
 	}
@@ -1524,6 +1700,14 @@ func (u *usageAccumulator) applyAnthropicOrResponsesUsage(usage map[string]any) 
 	// NewAPI 等网关在 Claude 风格 usage 外包一层 billing_usage.openai_usage，
 	// 真实 reasoning_tokens 只在 completion_tokens_details 里。
 	u.applyBillingUsageOpenAIReasoning(usage)
+}
+
+// setCacheCreationSnapshot 是缓存建立三元组的唯一写入口，保证 aggregate 恒等于 5m+1h。
+// 三个字段分开赋值必然出现互相矛盾的中间状态，而 1h 写价最贵，错一次就是钱。
+func (u *usageAccumulator) setCacheCreationSnapshot(cache5m, cache1h int) {
+	u.Cache5mInputTokens = cache5m
+	u.Cache1hInputTokens = cache1h
+	u.CacheCreationInputTokens = cache5m + cache1h
 }
 
 // applyBillingUsageOpenAIReasoning 从 NewAPI 风格 billing_usage.openai_usage 补齐推理 token。

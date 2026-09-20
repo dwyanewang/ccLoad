@@ -174,6 +174,7 @@ func ConvertCodexResponseToClaude(_ context.Context, modelName string, originalR
 		if reasoningTokens > 0 {
 			template, _ = sjson.SetBytes(template, "usage.thinking_tokens", reasoningTokens)
 		}
+		template = setClaudeReasoningUsage(template, responseData.Get("usage"))
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_delta", template, 2)
 		output = translatorcommon.AppendSSEEventBytes(output, "message_stop", []byte(`{"type":"message_stop"}`), 2)
@@ -419,6 +420,7 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	if reasoningTokens > 0 {
 		out, _ = sjson.SetBytes(out, "usage.thinking_tokens", reasoningTokens)
 	}
+	out = setClaudeReasoningUsage(out, responseData.Get("usage"))
 
 	hasToolCall := false
 	webSearchSeen := make(map[string]struct{})
@@ -857,6 +859,9 @@ func extractResponsesUsage(usage gjson.Result) (inputTokens, outputTokens, cache
 	cacheCreation := usage.Get("cache_creation_input_tokens")
 	if !cacheCreation.Exists() {
 		cacheCreation = usage.Get("input_tokens_details.cache_write_tokens")
+		if cacheCreation.Int() == 0 {
+			cacheCreation = usage.Get("input_tokens_details.cache_creation_tokens")
+		}
 	}
 	cacheCreationTokens = cacheCreation.Int()
 	// Responses-style (xAI/Codex): output_tokens_details.reasoning_tokens.
@@ -876,6 +881,30 @@ func extractResponsesUsage(usage gjson.Result) (inputTokens, outputTokens, cache
 	}
 
 	return inputTokens, outputTokens, cachedTokens, cacheCreationTokens, reasoningTokens
+}
+
+// setClaudeReasoningUsage maps Codex reasoning usage to Claude's thinking usage
+// field while rejecting invalid values and clamping to output tokens.
+func setClaudeReasoningUsage(out []byte, usage gjson.Result) []byte {
+	detail := usage.Get("output_tokens_details.reasoning_tokens")
+	if !detail.Exists() || detail.Type != gjson.Number {
+		return out
+	}
+	if strings.HasPrefix(detail.Raw, "-") || detail.Num < 0 {
+		return out
+	}
+	outputTokens := max(int64(0), usage.Get("output_tokens").Int())
+	var tokens int64
+	if detail.Num >= float64(outputTokens) {
+		tokens = outputTokens
+	} else {
+		tokens = detail.Int()
+	}
+	updated, errSetBytes := sjson.SetBytes(out, "usage.output_tokens_details.thinking_tokens", tokens)
+	if errSetBytes != nil {
+		return out
+	}
+	return updated
 }
 
 // buildReverseMapFromClaudeOriginalShortToOriginal builds a map[short]original from original Claude request tools.

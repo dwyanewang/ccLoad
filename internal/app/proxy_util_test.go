@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,18 @@ func TestWriteResponseWithHeaders_PreservesContentType(t *testing.T) {
 	}
 	if got := w.body.String(); got != "oops" {
 		t.Fatalf("expected body preserved, got %q", got)
+	}
+}
+
+func TestShouldValidateStrictJSONBodyHonorsDeclaredJSONAndMultipart(t *testing.T) {
+	if !shouldValidateStrictJSONBody("application/json", []byte("true")) {
+		t.Fatal("declared JSON scalar must be validated")
+	}
+	if !shouldValidateStrictJSONBody("application/vnd.example+json; charset=utf-8", []byte("null")) {
+		t.Fatal("+json media type must be validated")
+	}
+	if shouldValidateStrictJSONBody("multipart/form-data; boundary=abc", []byte(`{"looks":"json"}`)) {
+		t.Fatal("multipart body must not be treated as JSON")
 	}
 }
 
@@ -237,16 +250,6 @@ func TestBuildLogEntry_StreamDiagMsg(t *testing.T) {
 			t.Errorf("expected Message to include diag, got %q", entry.Message)
 		}
 	})
-}
-
-func TestAppendRetryStrategyToMessageUsesCompactDisplay(t *testing.T) {
-	t.Parallel()
-
-	got := appendRetryStrategyToMessage("ok", "strip_codex_encrypted_content,strip_codex_thinking")
-	want := "ok [strip_codex_encrypted_content,strip_codex_thinking]"
-	if got != want {
-		t.Fatalf("appendRetryStrategyToMessage()=%q, want %q", got, want)
-	}
 }
 
 func TestExtractThinkingEffortPrefersOutputConfigEffortOverThinkingType(t *testing.T) {
@@ -551,7 +554,9 @@ func TestResolveBillingServiceTier(t *testing.T) {
 		observed  string
 		want      string
 	}{
-		{name: "upstream downgrade", requested: "priority", observed: "default", want: "default"},
+		{name: "priority request is billing floor", requested: "priority", observed: "default", want: "priority"},
+		{name: "priority request ignores standard response", requested: "priority", observed: "standard", want: "priority"},
+		{name: "priority request ignores flex response", requested: "priority", observed: "flex", want: "priority"},
 		{name: "anthropic downgrade", requested: "fast", observed: "standard", want: "standard"},
 		{name: "codex auto is explicit fast tier", requested: "priority", observed: "auto", want: "auto"},
 		{name: "codex auto is retained without request tier", requested: "", observed: "auto", want: "auto"},
@@ -560,7 +565,7 @@ func TestResolveBillingServiceTier(t *testing.T) {
 		{name: "ultrafast response is billed at actual tier", requested: "priority", observed: "ultrafast", want: "ultrafast"},
 		{name: "ultrafast response is billed without request tier", requested: "", observed: "ultrafast", want: "ultrafast"},
 		{name: "missing response uses request", requested: "priority", observed: "", want: "priority"},
-		{name: "case and whitespace normalize", requested: " Priority ", observed: " DEFAULT ", want: "default"},
+		{name: "case and whitespace normalize", requested: " Priority ", observed: " DEFAULT ", want: "priority"},
 	}
 
 	for _, tt := range tests {
@@ -1579,4 +1584,126 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 			t.Fatalf("non-anthropic should not inject thinking, got %q", thinkingType(got))
 		}
 	})
+}
+
+func TestInjectAnyrouterClaudeCodeFallbackTools(t *testing.T) {
+	t.Parallel()
+
+	cfg := anyrouterAnthropicCfg()
+	nativeHeaders := http.Header{
+		"User-Agent":     {"claude-cli/2.1.236 (external, cli)"},
+		"X-App":          {"cli"},
+		"Anthropic-Beta": {"claude-code-20250219"},
+	}
+	toolNames := func(body []byte) []string {
+		tools := gjson.GetBytes(body, "tools")
+		if !tools.IsArray() {
+			return nil
+		}
+		names := make([]string, 0, jsonMemberCount(tools))
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			names = append(names, tool.Get("name").String())
+			return true
+		})
+		return names
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		headers http.Header
+		cfg     *model.Config
+		proto   protocol.Protocol
+		path    string
+		want    []string
+	}{
+		{
+			name: "empty tools",
+			body: `{"model":"claude-fable-5-1","tools":[]}`,
+			want: []string{"Edit", "Read", "Write"},
+		},
+		{
+			name: "missing tools",
+			body: `{"model":"claude-fable-5-1"}`,
+			want: []string{"Edit", "Read", "Write"},
+		},
+		{
+			name: "existing tools preserved",
+			body: `{"model":"claude-fable-5-1","tools":[{"name":"custom"}]}`,
+			want: []string{"custom"},
+		},
+		{
+			name: "null tools preserved",
+			body: `{"model":"claude-fable-5-1","tools":null}`,
+			want: nil,
+		},
+		{
+			name:    "non-native headers unchanged",
+			body:    `{"model":"claude-fable-5-1","tools":[]}`,
+			headers: http.Header{"User-Agent": {"curl/8.0"}},
+			want:    []string{},
+		},
+		{
+			name: "regular channel unchanged",
+			body: `{"model":"claude-fable-5-1","tools":[]}`,
+			cfg:  &model.Config{Name: "regular", URLs: model.ChannelURLs{{URL: "https://example.com"}}},
+			want: []string{},
+		},
+		{
+			name:  "non-anthropic unchanged",
+			body:  `{"model":"claude-fable-5-1","tools":[]}`,
+			proto: protocol.OpenAI,
+			want:  []string{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := tt.headers
+			if headers == nil {
+				headers = nativeHeaders
+			}
+			testCfg := tt.cfg
+			if testCfg == nil {
+				testCfg = cfg
+			}
+			proto := tt.proto
+			if proto == "" {
+				proto = protocol.Anthropic
+			}
+			path := tt.path
+			if path == "" {
+				path = "/v1/messages"
+			}
+			got := injectAnyrouterClaudeCodeFallbackTools(testCfg, proto, path, headers, []byte(tt.body))
+			if names := toolNames(got); !slices.Equal(names, tt.want) {
+				t.Fatalf("tool names = %v, want %v; body = %s", names, tt.want, got)
+			}
+		})
+	}
+
+	first := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, []byte(`{"model":"claude-fable-5-1","tools":[]}`))
+	tools := gjson.GetBytes(first, "tools")
+	expectedRequired := map[string][]string{
+		"Edit":  {"file_path", "old_string", "new_string"},
+		"Read":  {"file_path"},
+		"Write": {"file_path", "content"},
+	}
+	for _, tool := range tools.Array() {
+		name := tool.Get("name").String()
+		if tool.Get("input_schema.type").String() != "object" {
+			t.Fatalf("%s input_schema.type = %q, want object", name, tool.Get("input_schema.type").String())
+		}
+		required := make([]string, 0, jsonMemberCount(tool.Get("input_schema.required")))
+		tool.Get("input_schema.required").ForEach(func(_, value gjson.Result) bool {
+			required = append(required, value.String())
+			return true
+		})
+		if !slices.Equal(required, expectedRequired[name]) {
+			t.Fatalf("%s required = %v, want %v", name, required, expectedRequired[name])
+		}
+	}
+	second := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, first)
+	if string(second) != string(first) {
+		t.Fatalf("fallback injection is not idempotent:\nfirst:  %s\nsecond: %s", first, second)
+	}
 }

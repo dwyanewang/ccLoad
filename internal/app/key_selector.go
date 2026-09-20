@@ -42,7 +42,7 @@ func NewKeySelector() *KeySelector {
 }
 
 // SelectAvailableKey 返回 (keyIndex, apiKey, error)
-// 策略: sequential顺序尝试 | round_robin轮询选择
+// 优先选择最高可用优先级，同优先级轮询；key_strategy 仅保留为历史配置字段。
 // excludeKeys: 避免同一请求内重复尝试
 // 移除store依赖，apiKeys由调用方传入，避免重复查询
 func (ks *KeySelector) SelectAvailableKey(channelID int64, apiKeys []*model.APIKey, excludeKeys map[int]bool) (int, string, error) {
@@ -50,40 +50,34 @@ func (ks *KeySelector) SelectAvailableKey(channelID int64, apiKeys []*model.APIK
 		return -1, "", fmt.Errorf("no API keys configured for channel %d", channelID)
 	}
 
-	// 单Key场景:检查排除和冷却状态
+	// 先确定最高可用档位；计数器仍包含该档的全部候选 Key，
+	// 不因临时冷却或单次请求的排除集合改变轮询作用域。
+	now := time.Now()
+	var best *model.APIKey
+	for _, key := range apiKeys {
+		if key == nil || key.Disabled || excludeKeys[key.KeyIndex] || key.IsCoolingDown(now) {
+			continue
+		}
+		if best == nil || key.Priority > best.Priority {
+			best = key
+		}
+	}
+	if best == nil {
+		if len(apiKeys) == 1 && apiKeys[0] != nil {
+			return -1, "", fmt.Errorf("single key (index=%d) is disabled, in cooldown or already tried", apiKeys[0].KeyIndex)
+		}
+		return -1, "", fmt.Errorf("all API keys are in cooldown or already tried")
+	}
 	if len(apiKeys) == 1 {
-		keyIndex := apiKeys[0].KeyIndex
-		if apiKeys[0].Disabled {
-			return -1, "", fmt.Errorf("single key (index=%d) is disabled", keyIndex)
-		}
-		// [FIX] 使用真实 KeyIndex 检查排除集合，而非硬编码0
-		if excludeKeys != nil && excludeKeys[keyIndex] {
-			return -1, "", fmt.Errorf("single key (index=%d) already tried in this request", keyIndex)
-		}
-		// [INFO] 修复(2025-12-09): 检查冷却状态,防止单Key渠道冷却后仍被请求
-		// 原逻辑"不使用Key级别冷却(YAGNI原则)"是错误的,会导致冷却Key持续触发上游错误
-		if apiKeys[0].IsCoolingDown(time.Now()) {
-			return -1, "", fmt.Errorf("single key (index=%d) is in cooldown until %s",
-				keyIndex,
-				time.Unix(apiKeys[0].CooldownUntil, 0).Format("2006-01-02 15:04:05"))
-		}
-		return keyIndex, apiKeys[0].APIKey, nil
+		return best.KeyIndex, best.APIKey, nil
 	}
-
-	// 多Key场景:根据策略选择
-	strategy := apiKeys[0].KeyStrategy
-	if strategy == "" {
-		strategy = model.KeyStrategySequential
+	peers := make([]*model.APIKey, 0, len(apiKeys))
+	for _, key := range apiKeys {
+		if key != nil && key.Priority == best.Priority {
+			peers = append(peers, key)
+		}
 	}
-
-	switch strategy {
-	case model.KeyStrategyRoundRobin:
-		return ks.selectRoundRobin(channelID, apiKeys, excludeKeys)
-	case model.KeyStrategySequential:
-		return ks.selectSequential(apiKeys, excludeKeys)
-	default:
-		return ks.selectSequential(apiKeys, excludeKeys)
-	}
+	return ks.selectRoundRobin(channelID, peers, excludeKeys)
 }
 
 // SelectCooldownFallbackKey 在“全冷却兜底”路径中选择最早恢复的冷却Key。
@@ -107,11 +101,12 @@ func (ks *KeySelector) SelectCooldownFallbackKey(channelID int64, apiKeys []*mod
 			continue
 		}
 		if !apiKey.IsCoolingDown(now) {
-			return keyIndex, apiKey.APIKey, nil
+			return ks.SelectAvailableKey(channelID, apiKeys, excludeKeys)
 		}
 		if best == nil ||
 			apiKey.CooldownUntil < best.CooldownUntil ||
-			(apiKey.CooldownUntil == best.CooldownUntil && keyIndex < best.KeyIndex) {
+			(apiKey.CooldownUntil == best.CooldownUntil &&
+				(apiKey.Priority > best.Priority || (apiKey.Priority == best.Priority && keyIndex < best.KeyIndex))) {
 			best = apiKey
 		}
 	}
@@ -120,30 +115,6 @@ func (ks *KeySelector) SelectCooldownFallbackKey(channelID int64, apiKeys []*mod
 		return best.KeyIndex, best.APIKey, nil
 	}
 	return -1, "", fmt.Errorf("all API keys are already tried")
-}
-
-func (ks *KeySelector) selectSequential(apiKeys []*model.APIKey, excludeKeys map[int]bool) (int, string, error) {
-	now := time.Now()
-
-	for _, apiKey := range apiKeys {
-		keyIndex := apiKey.KeyIndex
-
-		if apiKey.Disabled {
-			continue
-		}
-
-		if excludeKeys != nil && excludeKeys[keyIndex] {
-			continue
-		}
-
-		if apiKey.IsCoolingDown(now) {
-			continue
-		}
-
-		return keyIndex, apiKey.APIKey, nil
-	}
-
-	return -1, "", fmt.Errorf("all API keys are in cooldown or already tried")
 }
 
 func newRRCounterScope(channelID int64, apiKeys []*model.APIKey) rrCounterScope {

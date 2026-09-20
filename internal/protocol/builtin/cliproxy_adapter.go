@@ -152,7 +152,7 @@ func cliproxyAnthropicResponseToGeminiNonStream(ctx context.Context, model strin
 }
 
 func cliproxyCodexRequestToGemini(model string, raw []byte, stream bool) ([]byte, error) {
-	if err := cliproxyValidateCodexRequest(raw); err != nil {
+	if err := cliproxyValidateCodexRequest(raw, false); err != nil {
 		return nil, err
 	}
 	return cliproxyJSONRequest("codex request to gemini", raw, openairespgemini.ConvertOpenAIResponsesRequestToGemini(model, raw, stream))
@@ -183,7 +183,7 @@ func cliproxyCodexResponseToGeminiNonStream(ctx context.Context, model string, o
 }
 
 func cliproxyCodexRequestToAnthropic(model string, raw []byte, stream bool) ([]byte, error) {
-	if err := cliproxyValidateCodexRequest(raw); err != nil {
+	if err := cliproxyValidateCodexRequest(raw, false); err != nil {
 		return nil, err
 	}
 	return cliproxyJSONRequest("codex request to anthropic", raw, oairespclaude.ConvertOpenAIResponsesRequestToClaude(model, raw, stream))
@@ -221,10 +221,14 @@ func cliproxyCodexResponseToAnthropicNonStream(ctx context.Context, model string
 }
 
 func cliproxyCodexRequestToOpenAI(model string, raw []byte, stream bool) ([]byte, error) {
-	if err := cliproxyValidateCodexRequest(raw); err != nil {
+	if err := cliproxyValidateCodexRequest(raw, true); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("codex request to openai", raw, openairesponses.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(model, raw, stream))
+	translated, err := openairesponses.ConvertOpenAIResponsesRequestToOpenAIChatCompletionsWithError(model, raw, stream)
+	if err != nil {
+		return nil, err
+	}
+	return cliproxyJSONRequest("codex request to openai", raw, translated)
 }
 
 func cliproxyOpenAIResponseToCodexStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -232,7 +236,11 @@ func cliproxyOpenAIResponseToCodexStream(ctx context.Context, model string, orig
 }
 
 func cliproxyOpenAIResponseToCodexNonStream(ctx context.Context, model string, original, translated, raw []byte) ([]byte, error) {
-	return cliproxyJSONResponse("openai response to codex", raw, openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(ctx, model, original, translated, raw, nil))
+	translatedResponse, err := openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStreamWithError(ctx, model, original, translated, raw, nil)
+	if err != nil {
+		return nil, err
+	}
+	return cliproxyJSONResponse("openai response to codex", raw, translatedResponse)
 }
 
 func cliproxyJSONRequest(label string, input []byte, output []byte) ([]byte, error) {
@@ -325,7 +333,7 @@ func cliproxyValidateAnthropicRequest(raw []byte) error {
 	return nil
 }
 
-func cliproxyValidateCodexRequest(raw []byte) error {
+func cliproxyValidateCodexRequest(raw []byte, allowToolSearch bool) error {
 	var request struct {
 		Input json.RawMessage `json:"input"`
 	}
@@ -374,6 +382,17 @@ func cliproxyValidateCodexRequest(raw []byte) error {
 				}
 			}
 		case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning", "web_search_call", "computer_call", "computer_call_output", "image_generation_call", "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output", "apply_patch_call", "apply_patch_call_output", "additional_tools":
+		case "compaction":
+			// Chat Completions has no equivalent for Codex's encrypted context
+			// control item. The OpenAI bridge drops it in the converter while
+			// preserving representable messages; other bridges still reject it.
+			if !allowToolSearch {
+				return fmt.Errorf("unsupported Codex input item type %q", itemType)
+			}
+		case "tool_search_call", "tool_search_output":
+			if !allowToolSearch {
+				return fmt.Errorf("unsupported Codex input item type %q for this provider", itemType)
+			}
 		default:
 			return fmt.Errorf("unsupported Codex input item type %q", itemType)
 		}
@@ -382,20 +401,16 @@ func cliproxyValidateCodexRequest(raw []byte) error {
 }
 
 func cliproxyCodexCompletedResponse(raw []byte) ([]byte, error) {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, fmt.Errorf("decode codex response: %w", err)
+	if !json.Valid(raw) || !gjson.ParseBytes(raw).IsObject() {
+		return nil, fmt.Errorf("decode codex response: invalid JSON object")
 	}
-	if _, wrapped := root["response"]; wrapped {
+	if gjson.GetBytes(raw, "response").Exists() {
 		return raw, nil
 	}
-	wrapped, err := json.Marshal(map[string]json.RawMessage{
-		"type":     json.RawMessage(`"response.completed"`),
-		"response": raw,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("wrap codex response: %w", err)
-	}
+	wrapped := make([]byte, 0, len(raw)+48)
+	wrapped = append(wrapped, `{"type":"response.completed","response":`...)
+	wrapped = append(wrapped, raw...)
+	wrapped = append(wrapped, '}')
 	return wrapped, nil
 }
 
@@ -417,8 +432,8 @@ func cliproxySSEDataEvent(rawEvent []byte) ([]byte, error) {
 		return nil, nil
 	}
 	payload := bytes.Join(dataLines, []byte{'\n'})
-	if string(payload) != "[DONE]" && !json.Valid(payload) {
-		return nil, fmt.Errorf("invalid codex SSE data: %s", strings.TrimSpace(string(payload)))
+	if !bytes.Equal(payload, []byte("[DONE]")) && !json.Valid(payload) {
+		return nil, fmt.Errorf("invalid codex SSE data: %s", payload)
 	}
 	payload = cliproxyNormalizeSSEPayload(eventType, payload)
 	out := make([]byte, 0, len(payload)+6)
@@ -519,7 +534,11 @@ func cliproxyTranslateOpenAIToCodexStream(ctx context.Context, model string, ori
 	if state.response {
 		return nil, nil
 	}
-	return cliproxyFrameStreamChunks(cliproxyStreamCodex, openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx, model, original, translated, data, &state.chat))
+	chunks, err := openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesWithError(ctx, model, original, translated, data, &state.chat)
+	if err != nil {
+		return nil, err
+	}
+	return cliproxyFrameStreamChunks(cliproxyStreamCodex, chunks)
 }
 
 func cliproxyTranslateOpenAIToAnthropicStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -633,11 +652,11 @@ func cliproxyFrameStreamChunks(target cliproxyStreamProtocol, chunks [][]byte) (
 			framed = append(framed, []byte("data: [DONE]\n\n"))
 			continue
 		}
-		if !json.Valid(chunk) {
-			return nil, fmt.Errorf("translator emitted invalid stream JSON: %s", chunk)
-		}
 		switch target {
 		case cliproxyStreamOpenAI, cliproxyStreamGemini:
+			if !json.Valid(chunk) {
+				return nil, fmt.Errorf("translator emitted invalid stream JSON: %s", chunk)
+			}
 			out := make([]byte, 0, len(chunk)+8)
 			out = append(out, "data: "...)
 			out = append(out, chunk...)

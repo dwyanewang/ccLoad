@@ -29,7 +29,20 @@ type codexPassiveUsageTask struct {
 	update    codexPassiveUsageUpdate
 }
 
-func (s *Server) persistCodexPassiveUsage(ctx context.Context, cfg *model.Config, resp *http.Response) {
+func (s *Server) persistCodexPassiveUsage(ctx context.Context, cfg *model.Config, resp *http.Response, upstreamModel string) {
+	s.observeCodexPassiveUsage(ctx, cfg, resp, upstreamModel, func(update codexPassiveUsageUpdate) {
+		s.enqueueCodexPassiveUsage(cfg.ID, update)
+	})
+}
+
+// 检测同步写日志，必须先保存响应体中的额度窗口，避免首次检测成本丢失。
+func (s *Server) persistDetectionCodexPassiveUsage(ctx context.Context, cfg *model.Config, resp *http.Response, upstreamModel string) {
+	s.observeCodexPassiveUsage(ctx, cfg, resp, upstreamModel, func(update codexPassiveUsageUpdate) {
+		s.persistCodexPassiveUsageUpdate(ctx, cfg, update)
+	})
+}
+
+func (s *Server) observeCodexPassiveUsage(ctx context.Context, cfg *model.Config, resp *http.Response, upstreamModel string, onUpdate func(codexPassiveUsageUpdate)) {
 	if s == nil || s.codexCredentials == nil || cfg == nil || !cfg.UsesCodexOAuth() || resp == nil {
 		return
 	}
@@ -37,7 +50,14 @@ func (s *Server) persistCodexPassiveUsage(ctx context.Context, cfg *model.Config
 	if !statusOK && resp.StatusCode != http.StatusTooManyRequests {
 		return
 	}
-	if update, ok := sampleCodexPassiveUsage(resp.Header, time.Now().UTC()); ok {
+	// Use the actual wire model, not the client alias or response model (reserve
+	// responses report the underlying normal model). SSE may omit its identity,
+	// so retain the HTTP identity for the entire response too.
+	identity := resp.Header.Get("X-Codex-Active-Limit")
+	if strings.TrimSpace(identity) == "" && strings.EqualFold(strings.TrimSpace(upstreamModel), "gpt-reserve") {
+		identity = "gpt-reserve"
+	}
+	if update, ok := sampleCodexPassiveUsage(resp.Header, time.Now().UTC(), identity); ok {
 		s.persistCodexPassiveUsageUpdate(ctx, cfg, update)
 	}
 	if resp.Body == nil {
@@ -45,9 +65,8 @@ func (s *Server) persistCodexPassiveUsage(ctx context.Context, cfg *model.Config
 	}
 	resp.Body = &codexPassiveUsageReadCloser{
 		ReadCloser: resp.Body,
-		onUpdate: func(update codexPassiveUsageUpdate) {
-			s.enqueueCodexPassiveUsage(cfg.ID, update)
-		},
+		onUpdate:   onUpdate,
+		identity:   identity,
 	}
 }
 
@@ -108,6 +127,7 @@ type codexPassiveUsageReadCloser struct {
 	pending  bytes.Buffer
 	done     bool
 	onUpdate func(codexPassiveUsageUpdate)
+	identity string
 }
 
 func (r *codexPassiveUsageReadCloser) Read(p []byte) (int, error) {
@@ -138,7 +158,7 @@ func (r *codexPassiveUsageReadCloser) observe(chunk []byte) {
 		if !ok {
 			break
 		}
-		update, sampled := sampleCodexPassiveUsageEvent(sseEventData(rawEvent), time.Now().UTC())
+		update, sampled := sampleCodexPassiveUsageEvent(sseEventData(rawEvent), time.Now().UTC(), r.identity)
 		if !sampled {
 			continue
 		}
@@ -172,12 +192,13 @@ type codexPassiveUsageSSERateLimit struct {
 
 type codexPassiveUsageSSEEvent struct {
 	Type                 string                                    `json:"type"`
+	MeteredLimitName     string                                    `json:"metered_limit_name"`
 	RateLimits           *codexPassiveUsageSSERateLimit            `json:"rate_limits"`
 	CodeReviewRateLimits *codexPassiveUsageSSERateLimit            `json:"code_review_rate_limits"`
 	AdditionalRateLimits map[string]*codexPassiveUsageSSERateLimit `json:"additional_rate_limits"`
 }
 
-func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time) (codexPassiveUsageUpdate, bool) {
+func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time, fallbackIdentity string) (codexPassiveUsageUpdate, bool) {
 	var event codexPassiveUsageSSEEvent
 	if json.Unmarshal(payload, &event) != nil || strings.TrimSpace(event.Type) != codexPassiveUsageSSEEventType {
 		return codexPassiveUsageUpdate{}, false
@@ -187,13 +208,22 @@ func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time) (codexPas
 		SampledAt:     sampledAt.UTC().Format(time.RFC3339Nano),
 		ReplaceScopes: make([]string, 0, 2+len(event.AdditionalRateLimits)),
 	}
-	if event.RateLimits != nil {
-		update.ReplaceScopes = append(update.ReplaceScopes, "codex")
+	// Explicit event identity wins; otherwise retain the response/request
+	// identity. Named additional limits remain authoritative for their scope.
+	scope := codexPassiveLimitScope(event.MeteredLimitName, fallbackIdentity)
+	for name, limit := range event.AdditionalRateLimits {
+		if limit != nil && strings.EqualFold(strings.TrimSpace(name), scope) {
+			scope = ""
+			break
+		}
+	}
+	if event.RateLimits != nil && scope != "" {
+		update.ReplaceScopes = append(update.ReplaceScopes, scope)
+		update.Windows = appendCodexPassiveEventRateLimit(update.Windows, event.RateLimits, scope, scope, sampledAt)
 	}
 	if event.CodeReviewRateLimits != nil {
 		update.ReplaceScopes = append(update.ReplaceScopes, "code_review")
 	}
-	update.Windows = appendCodexPassiveEventRateLimit(update.Windows, event.RateLimits, "codex", "codex", sampledAt)
 	update.Windows = appendCodexPassiveEventRateLimit(update.Windows, event.CodeReviewRateLimits, "code_review", "code_review", sampledAt)
 	additionalNames := make([]string, 0, len(event.AdditionalRateLimits))
 	for name := range event.AdditionalRateLimits {
@@ -214,6 +244,22 @@ func sampleCodexPassiveUsageEvent(payload []byte, sampledAt time.Time) (codexPas
 		return codexPassiveUsageUpdate{}, false
 	}
 	return update, true
+}
+
+// Missing event identities inherit the response identity; missing response
+// identities inherit an explicitly requested reserve model. Unknown identities
+// remain unassigned rather than clearing the main counter with another quota.
+func codexPassiveLimitScope(active, fallback string) string {
+	if strings.TrimSpace(active) == "" {
+		active = fallback
+	}
+	switch strings.ToLower(strings.TrimSpace(active)) {
+	case "", "premium", "codex":
+		return "codex"
+	case "gpt-reserve", "base_model_inference":
+		return "gpt-reserve"
+	}
+	return ""
 }
 
 func appendCodexPassiveEventRateLimit(
@@ -271,35 +317,38 @@ func appendCodexPassiveEventWindow(
 	})
 }
 
-func sampleCodexPassiveUsage(headers http.Header, sampledAt time.Time) (codexPassiveUsageUpdate, bool) {
+func sampleCodexPassiveUsage(headers http.Header, sampledAt time.Time, fallbackIdentity string) (codexPassiveUsageUpdate, bool) {
 	update := codexPassiveUsageUpdate{
 		Windows:   make([]codexauth.PassiveUsageWindow, 0, 4),
 		SampledAt: sampledAt.UTC().Format(time.RFC3339Nano),
 	}
-	// When Active-Limit points at an additional group, the generic x-codex
-	// fields are aliases for that group. Keep the explicitly named group as the
-	// canonical record instead of renaming and storing the alias a second time.
+	// Generic fields belong to the active limit, with the wire model as a
+	// fallback for reserve requests. Other additional limits require named fields.
+	active := headers.Get("X-Codex-Active-Limit")
+	scope := codexPassiveLimitScope(active, fallbackIdentity)
 	activeGroup := codexActiveHeaderGroup(headers)
-	if activeGroup != "" {
-		// The generic x-codex-* fields are aliases for the active additional
-		// group in this shape.  They are not a complete snapshot of the main
-		// Codex scope, so never mark "codex" for replacement here.  Doing so
-		// deletes the weekly Codex window when a Spark-only response arrives.
-		update.ReplaceScopes = []string{activeGroup}
-	} else {
-		genericWindowCount := len(update.Windows)
-		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "primary", sampledAt)
-		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", "codex", "codex", "secondary", sampledAt)
-		// Active-Limit values outside codex_<group> identify the main Codex
-		// scope. The generic header set is a complete snapshot of that scope:
-		// when a window (for example Pro secondary) is absent, remove the stale
-		// persisted window instead of keeping it in passive usage and cost state.
-		if len(update.Windows) > genericWindowCount {
-			update.ReplaceScopes = append(update.ReplaceScopes, "codex")
+	groups := codexAdditionalQuotaGroups(headers)
+	for _, group := range groups {
+		if strings.EqualFold(codexHeaderLimitName(headers, group), scope) {
+			// Named fields take precedence over the generic alias, including
+			// when the active identity uses the internal base_model_inference name.
+			scope, activeGroup = "", group
+			break
 		}
 	}
+	if scope != "" {
+		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", scope, scope, "primary", sampledAt)
+		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, "x-codex", scope, scope, "secondary", sampledAt)
+		// When a window (for example Pro secondary) is absent, remove the stale
+		// persisted window instead of keeping it in passive usage and cost state.
+		if len(update.Windows) > 0 {
+			update.ReplaceScopes = append(update.ReplaceScopes, scope)
+		}
+	} else if activeGroup != "" {
+		update.ReplaceScopes = append(update.ReplaceScopes, activeGroup)
+	}
 
-	for _, group := range codexAdditionalQuotaGroups(headers) {
+	for _, group := range groups {
 		base := codexQuotaHeaderPrefix + group
 		limitName := codexHeaderLimitName(headers, group)
 		update.Windows = appendCodexPassiveHeaderWindow(update.Windows, headers, base, group, limitName, "primary", sampledAt)
@@ -312,18 +361,22 @@ func sampleCodexPassiveUsage(headers http.Header, sampledAt time.Time) (codexPas
 }
 
 func codexActiveHeaderGroup(headers http.Header) string {
-	active := strings.ToLower(strings.TrimSpace(headers.Get("X-Codex-Active-Limit")))
-	const prefix = "codex_"
-	if !strings.HasPrefix(active, prefix) {
-		return ""
-	}
-	group := strings.TrimPrefix(active, prefix)
+	active := headers.Get("X-Codex-Active-Limit")
 	for _, candidate := range codexAdditionalQuotaGroups(headers) {
-		if candidate == group {
-			return group
+		if codexActiveLimitMatches(active, candidate, codexHeaderLimitName(headers, candidate)) {
+			return candidate
 		}
 	}
 	return ""
+}
+
+// Active-Limit may name a header group, its codex_ identifier, or the
+// group's explicit limit name. Never infer identity from usage or duration.
+func codexActiveLimitMatches(active, group, limitName string) bool {
+	active = strings.TrimSpace(active)
+	group = strings.TrimSpace(group)
+	return active != "" && group != "" && (strings.EqualFold(active, group) ||
+		strings.EqualFold(active, "codex_"+group) || strings.EqualFold(active, strings.TrimSpace(limitName)))
 }
 
 func codexHeaderLimitName(headers http.Header, group string) string {

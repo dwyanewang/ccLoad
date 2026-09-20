@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
@@ -395,6 +397,8 @@ func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWi
 		XAIEmail:                     metadata.xaiEmail,
 		XAISubscriptionTier:          metadata.xaiSubscriptionTier,
 		XAIEntitlementStatus:         metadata.xaiEntitlementStatus,
+		CodeBuddyEnterprise:          metadata.codeBuddyEnterprise,
+		CodeBuddyInternational:       metadata.codeBuddyInternational,
 	}
 
 	// 渠道级别冷却：使用批量查询结果（性能提升：N -> 1 次查询）
@@ -462,6 +466,8 @@ type channelOAuthMetadata struct {
 	xaiEmail                string
 	xaiSubscriptionTier     string
 	xaiEntitlementStatus    string
+	codeBuddyEnterprise     bool
+	codeBuddyInternational  bool
 }
 
 func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata {
@@ -474,6 +480,12 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 			return channelOAuthMetadata{}
 		}
 		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, antigravityauth.ChannelType)
+		if usage == nil && credential.Credits != nil {
+			usage = &oauthUsageSummary{Provider: antigravityauth.ChannelType, Windows: []oauthUsageWindow{}}
+		}
+		if usage != nil {
+			usage.Credits = credential.Credits.Clone()
+		}
 		usage = attachOAuthQuotaCostUsage(usage, credential.QuotaCostUsage)
 		return channelOAuthMetadata{
 			antigravityPaidTier: credential.PaidTier.DisplayName(),
@@ -519,6 +531,18 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 		}
 		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, zaiauth.ChannelType)
 		return channelOAuthMetadata{oauthUsage: usage}
+	}
+	if cfg.UsesCodeBuddyOAuth() {
+		credential, err := codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return channelOAuthMetadata{}
+		}
+		usage, _, _ := persistedOAuthUsage([]byte(credential.OAuthUsage), codebuddyauth.ChannelType)
+		return channelOAuthMetadata{
+			oauthUsage:             usage,
+			codeBuddyEnterprise:    credential.EnterpriseID != "",
+			codeBuddyInternational: credential.IsInternational(),
+		}
 	}
 	if cfg.UsesCursorOAuth() {
 		credential, err := cursorauth.ParseCredential([]byte(cfg.OAuthCredential))
@@ -699,6 +723,7 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 			KeyStrategy:     keyStrategy,
 			Disabled:        entry.ModelScopeEmpty,
 			CostMultiplier:  apiKeyCostMultiplier(entry),
+			Priority:        apiKeyPriority(entry),
 			CreatedAt:       model.JSONTime{Time: now},
 			UpdatedAt:       model.JSONTime{Time: now},
 		})
@@ -841,6 +866,12 @@ func channelKeysForAdmin(cfg *model.Config, storedKeys []*model.APIKey) ([]*mode
 // oauthSyntheticKeyFields 解析 OAuth 渠道凭证，返回合成 Key 行所需的原始凭证值与备注。
 func oauthSyntheticKeyFields(cfg *model.Config) (accessToken, note string, err error) {
 	switch {
+	case cfg.UsesCodeBuddyOAuth():
+		credential, err := codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			return "", "", err
+		}
+		return credential.AccessToken, "CodeBuddy OAuth AT", nil
 	case cfg.UsesCodexOAuth():
 		credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if err != nil {
@@ -1240,23 +1271,19 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			RespondErrorMsg(c, http.StatusConflict, "OAuth channel auth_type is read-only")
 			return
 		}
-		// 合成 Key 行最多一条，只用于回传倍率，永不落库；
-		// 其 api_key 必须是当前凭证掩码值，防止借合成行改写凭证，其余 Key 变更一律 409。
+		// 合成 Key 行最多一条，只用于回传倍率，永不落库（见下方 UpdateConfig 后的 OAuth 分支，
+		// 以及 ToConfig 只取 APIKeys[0].CostMultiplier）。
+		// 只校验形状不校验具体值：后台自动刷新会在编辑器打开期间轮换 AT，
+		// 比对当前掩码值会把正常保存误判成改写凭证（保存报 409）。
+		// 掩码不可逆，任何掩码形状的值都无法还原成可用凭证。
 		submittedKeys := req.normalizeAPIKeys()
 		if len(submittedKeys) > 1 {
 			RespondErrorMsg(c, http.StatusConflict, "OAuth channel accepts at most one synthetic API key row")
 			return
 		}
-		if len(submittedKeys) == 1 {
-			accessToken, _, parseErr := oauthSyntheticKeyFields(existing)
-			if parseErr != nil {
-				RespondError(c, http.StatusInternalServerError, parseErr)
-				return
-			}
-			if submittedKeys[0].APIKey != util.MaskAPIKey(accessToken) {
-				RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
-				return
-			}
+		if len(submittedKeys) == 1 && !util.IsMaskedAPIKey(submittedKeys[0].APIKey) {
+			RespondErrorMsg(c, http.StatusConflict, "OAuth channel API keys are read-only")
+			return
 		}
 		if _, submitted := rawReq["key_strategy"]; submitted {
 			RespondErrorMsg(c, http.StatusConflict, "OAuth channel key strategy is read-only")
@@ -1271,14 +1298,6 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			}
 		}
 	}
-	if existing.UsesCodexOAuth() {
-		credential, parseErr := codexauth.ParseCredential([]byte(existing.OAuthCredential))
-		if parseErr != nil {
-			RespondError(c, http.StatusInternalServerError, parseErr)
-			return
-		}
-		req.Models = filterCodexOAuthModelEntries(req.Models, credential.PlanType)
-	}
 	var oldKeys []*model.APIKey
 	if !existing.UsesOAuth() {
 		oldKeys, err = s.getAPIKeys(c.Request.Context(), id)
@@ -1287,7 +1306,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			return
 		}
 		submittedKeys := req.normalizeAPIKeys()
-		preserveOmittedAPIKeyAllowedModels(submittedKeys, oldKeys)
+		preserveOmittedAPIKeyMetadata(submittedKeys, oldKeys)
 		req.APIKeys = submittedKeys
 		req.APIKey = strings.Join(apiKeyStrings(submittedKeys), ",")
 	}
@@ -1301,6 +1320,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	managementChanged := false
 	if req.managementAccountSet {
 		// Sub2API login creates a real upstream session. Run it only after every
 		// local channel field has passed validation, so rejected edits have no
@@ -1315,10 +1335,12 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			respondChannelManagementError(c, resolveErr)
 			return
 		}
-		if _, _, mergeErr := mergeChannelManagementSettings(existing.OAuthCredential, resolvedManagement); mergeErr != nil {
+		_, nextManagement, mergeErr := mergeChannelManagementSettings(existing.OAuthCredential, resolvedManagement)
+		if mergeErr != nil {
 			RespondErrorMsg(c, http.StatusBadRequest, "invalid management account")
 			return
 		}
+		managementChanged = nextManagement != existing.OAuthCredential
 		req.ManagementAccount = resolvedManagement
 	}
 
@@ -1331,7 +1353,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	normalizeAPIKeyScopesForModels(newKeys, req.Models)
 	keyStrategy := strings.TrimSpace(req.KeyStrategy)
 	if keyStrategy == "" {
-		keyStrategy = model.KeyStrategySequential
+		keyStrategy = channelKeyStrategy(oldKeys)
 	}
 
 	// 比较Key数量和内容是否变化
@@ -1348,8 +1370,12 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	notesByIndex := make(map[int]string)
 	scopesByIndex := make(map[int]model.APIKeyModelScope)
 	multipliersByIndex := make(map[int]float64)
+	prioritiesByIndex := make(map[int]int)
 	if !keyChanged {
 		for i, oldKey := range oldKeys {
+			if newKeys[i].Priority != nil && *newKeys[i].Priority != oldKey.Priority {
+				prioritiesByIndex[oldKey.KeyIndex] = *newKeys[i].Priority
+			}
 			if oldKey.Note != newKeys[i].Note {
 				notesByIndex[oldKey.KeyIndex] = newKeys[i].Note
 			}
@@ -1444,6 +1470,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 				KeyStrategy:     keyStrategy,
 				Disabled:        wasDisabled || key.ModelScopeEmpty,
 				CostMultiplier:  apiKeyCostMultiplier(key),
+				Priority:        apiKeyPriority(key),
 				CreatedAt:       model.JSONTime{Time: now},
 				UpdatedAt:       model.JSONTime{Time: now},
 			})
@@ -1462,6 +1489,12 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		if noteChanged {
 			if err := s.store.UpdateAPIKeyNotes(c.Request.Context(), id, notesByIndex); err != nil {
 				log.Printf("[WARN] 批量更新API Key备注失败 (channel=%d): %v", id, err)
+			}
+		}
+		if len(prioritiesByIndex) > 0 {
+			if err := s.store.UpdateAPIKeyPriorities(c.Request.Context(), id, prioritiesByIndex); err != nil {
+				RespondError(c, http.StatusInternalServerError, fmt.Errorf("update API key priorities: %w", err))
+				return
 			}
 		}
 		if multiplierChanged {
@@ -1484,8 +1517,21 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		}
 	}
 
-	// 编辑保存后重置渠道、Key 和模型冷却状态。
-	s.clearAllChannelCooldowns(c.Request.Context(), id)
+	// 仅调整优先级不代表凭据已经恢复，保留禁用和冷却状态。
+	before, after := existing.Clone(), upd.Clone()
+	after.UpdatedAt = before.UpdatedAt
+	if !existing.UsesOAuth() {
+		// API Key 渠道的旧渠道倍率会被 ToConfig 归一为 1，实际计费只读取 Key 倍率。
+		after.CostMultiplier = before.CostMultiplier
+	}
+	priorityOnly := len(prioritiesByIndex) > 0 && !keyChanged && !strategyChanged &&
+		!noteChanged && !modelsChanged && !multiplierChanged && !managementChanged &&
+		reflect.DeepEqual(before, after)
+	if !priorityOnly {
+		s.clearAllChannelCooldowns(c.Request.Context(), id)
+	} else {
+		s.InvalidateAPIKeysCache(id)
+	}
 
 	// 渠道更新后刷新缓存，确保选择器立即生效
 	s.InvalidateChannelListCache()
@@ -1500,7 +1546,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	RespondJSON(c, http.StatusOK, upd)
 }
 
-func preserveOmittedAPIKeyAllowedModels(submitted []ChannelAPIKeyRequest, existing []*model.APIKey) {
+func preserveOmittedAPIKeyMetadata(submitted []ChannelAPIKeyRequest, existing []*model.APIKey) {
 	byValue := make(map[string]*model.APIKey, len(existing))
 	for _, key := range existing {
 		if key != nil {
@@ -1510,14 +1556,18 @@ func preserveOmittedAPIKeyAllowedModels(submitted []ChannelAPIKeyRequest, existi
 		}
 	}
 	for i := range submitted {
-		if submitted[i].allowedModelsSet {
-			continue
-		}
 		oldKey := byValue[submitted[i].APIKey]
 		if i < len(existing) && existing[i] != nil && existing[i].APIKey == submitted[i].APIKey {
 			oldKey = existing[i]
 		}
 		if oldKey != nil {
+			if submitted[i].Priority == nil {
+				priority := oldKey.Priority
+				submitted[i].Priority = &priority
+			}
+			if submitted[i].allowedModelsSet {
+				continue
+			}
 			submitted[i].AllowedModels = append([]string(nil), oldKey.AllowedModels...)
 			submitted[i].ModelScopeEmpty = oldKey.ModelScopeEmpty
 		}

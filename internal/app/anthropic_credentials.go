@@ -339,7 +339,7 @@ func (m *anthropicCredentialManager) updatePassiveUsage(
 	if update.FiveHour == nil && update.SevenDay == nil && update.SevenDayOverageIncluded == nil {
 		return false, nil
 	}
-	for {
+	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
@@ -384,23 +384,28 @@ func (m *anthropicCredentialManager) updatePassiveUsage(
 			}
 		}
 		updatedCredential.PassiveUsage = usage
-		updatedCredential.QuotaCostUsage = reconcileOAuthQuotaCostUsage(
-			current.QuotaCostUsage, anthropicPassiveUsageSummary(&updatedCredential), updateSampledAt,
+		// Response headers omit independent windows such as Sonnet's weekly quota.
+		updatedCredential.QuotaCostUsage = oauthcost.ReconcilePartial(
+			current.QuotaCostUsage, oauthQuotaSamples(anthropicPassiveUsageSummary(&updatedCredential)), updateSampledAt,
 		)
 		payload, err := updatedCredential.JSON()
 		if err != nil {
 			return false, err
 		}
-		updated, err := m.store.CompareAndSwapOAuthCredential(
+		updated, _, err := m.store.CompareAndSwapOAuthUsage(
 			ctx, currentCfg.ID, model.AuthTypeAnthropicOAuth, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {
 			return false, err
 		}
 		if !updated {
+			if err := waitOAuthCASRetry(ctx, attempt); err != nil {
+				return false, err
+			}
 			continue
 		}
-		m.cache(currentCfg.ID, &updatedCredential)
+		// Do not overwrite a credential cached by a concurrent token refresh.
+		m.invalidate(currentCfg.ID)
 		if m.invalidateConfig != nil {
 			m.invalidateConfig(currentCfg.ID)
 		}

@@ -405,6 +405,64 @@ func TestConvertClaudeRequestToOpenAI_MessageSystemRoleWrapsAsUserReminder(t *te
 	}
 }
 
+func TestConvertClaudeRequestToOpenAI_PreservesToolAdjacencyWithInterveningSystemMessage(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-5",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Execute tools"}]},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "tool_one", "input": {"a": 1}},
+					{"type": "tool_use", "id": "call_2", "name": "tool_two", "input": {"b": 2}}
+				]
+			},
+			{"role": "system", "content": "Context update between tool call and tool result"},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_2", "content": "result 2"},
+					{"type": "tool_result", "tool_use_id": "call_1", "content": "result 1"},
+					{"type": "text", "text": "Now summarize"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("gpt-5", []byte(inputJSON), false)
+	messages := gjson.GetBytes(result, "messages").Array()
+
+	// Expected roles order:
+	// 0: user ("Execute tools")
+	// 1: assistant (tool_calls [call_1, call_2])
+	// 2: tool (tool_call_id: call_1)
+	// 3: tool (tool_call_id: call_2)
+	// 4: user (<system-reminder>...)
+	// 5: user ("Now summarize")
+	roles := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		roles = append(roles, msg.Get("role").String())
+	}
+	wantRoles := []string{"user", "assistant", "tool", "tool", "user", "user"}
+	if fmt.Sprintf("%v", roles) != fmt.Sprintf("%v", wantRoles) {
+		t.Fatalf("unexpected roles: got %v, want %v", roles, wantRoles)
+	}
+
+	// Verify tool messages immediately follow assistant
+	if messages[2].Get("tool_call_id").String() != "call_1" {
+		t.Fatalf("expected tool message 0 to respond to call_1, got %q", messages[2].Get("tool_call_id").String())
+	}
+	if messages[3].Get("tool_call_id").String() != "call_2" {
+		t.Fatalf("expected tool message 1 to respond to call_2, got %q", messages[3].Get("tool_call_id").String())
+	}
+	if messages[4].Get("content.0.text").String() != "<system-reminder>\nContext update between tool call and tool result\n</system-reminder>" {
+		t.Fatalf("unexpected system reminder content: %q", messages[4].Get("content.0.text").String())
+	}
+	if messages[5].Get("content.0.text").String() != "Now summarize" {
+		t.Fatalf("unexpected user summary content: %q", messages[5].Get("content.0.text").String())
+	}
+}
+
 func TestConvertClaudeRequestToOpenAI_SystemMessageScenarios(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -643,110 +701,54 @@ func TestConvertClaudeRequestToOpenAI_ToolResultObjectContent(t *testing.T) {
 }
 
 func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T) {
-	inputJSON := `{
-		"model": "claude-3-opus",
-		"messages": [
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
-				]
-			},
-			{
-				"role": "user",
-				"content": [
-					{
-						"type": "tool_result",
-						"tool_use_id": "call_1",
-						"content": [
-							{"type": "text", "text": "tool ok"},
-							{
-								"type": "image",
-								"source": {
-									"type": "base64",
-									"media_type": "image/png",
-									"data": "iVBORw0KGgoAAAANSUhEUg=="
-								}
-							}
-						]
-					}
-				]
-			}
-		]
-	}`
-
-	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
-	messages := resultJSON.Get("messages").Array()
-
-	if len(messages) != 2 {
-		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"do_work","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"tool ok"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"}}]}]}]}`)
+	messages := gjson.GetBytes(ConvertClaudeRequestToOpenAI("test-model", input, false), "messages").Array()
+	if len(messages) != 2 || messages[1].Get("role").String() != "tool" {
+		t.Fatalf("unexpected messages: %v", messages)
 	}
-
-	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
-	}
-	if got := toolContent.Get("0.type").String(); got != "text" {
-		t.Fatalf("Expected first tool content type %q, got %q", "text", got)
-	}
-	if got := toolContent.Get("0.text").String(); got != "tool ok" {
-		t.Fatalf("Expected first tool content text %q, got %q", "tool ok", got)
-	}
-	if got := toolContent.Get("1.type").String(); got != "image_url" {
-		t.Fatalf("Expected second tool content type %q, got %q", "image_url", got)
-	}
-	if got := toolContent.Get("1.image_url.url").String(); got != "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" {
-		t.Fatalf("Unexpected image_url: %q", got)
+	content := messages[1].Get("content")
+	if !content.IsArray() || content.Get("0.text").String() != "tool ok" || content.Get("1.type").String() != "image_url" || content.Get("1.image_url.url").String() != "data:image/png;base64,aW1n" {
+		t.Fatalf("unexpected structured tool content: %s", content.Raw)
 	}
 }
 
 func TestConvertClaudeRequestToOpenAI_ToolResultURLImageOnly(t *testing.T) {
-	inputJSON := `{
-		"model": "claude-3-opus",
-		"messages": [
-			{
-				"role": "assistant",
-				"content": [
-					{"type": "tool_use", "id": "call_1", "name": "do_work", "input": {"a": 1}}
-				]
-			},
-			{
-				"role": "user",
-				"content": [
-					{
-						"type": "tool_result",
-						"tool_use_id": "call_1",
-						"content": {
-							"type": "image",
-							"source": {
-								"type": "url",
-								"url": "https://example.com/tool.png"
-							}
-						}
-					}
-				]
-			}
-		]
-	}`
-
-	result := ConvertClaudeRequestToOpenAI("test-model", []byte(inputJSON), false)
-	resultJSON := gjson.ParseBytes(result)
-	messages := resultJSON.Get("messages").Array()
-
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"do_work","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":{"type":"image","source":{"type":"url","url":"https://example.com/tool.png"}}}]}]}`)
+	messages := gjson.GetBytes(ConvertClaudeRequestToOpenAI("test-model", input, false), "messages").Array()
 	if len(messages) != 2 {
-		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+		t.Fatalf("unexpected messages: %v", messages)
 	}
+	content := messages[1].Get("content")
+	if !content.IsArray() || content.Get("0.type").String() != "image_url" || content.Get("0.image_url.url").String() != "https://example.com/tool.png" {
+		t.Fatalf("unexpected image-only tool content: %s", content.Raw)
+	}
+}
 
-	toolContent := messages[1].Get("content")
-	if !toolContent.IsArray() {
-		t.Fatalf("Expected tool content array, got %s", toolContent.Raw)
+func TestConvertClaudeRequestToOpenAI_ToolResultImageMergesIntoUserText(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"screenshot","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"}}]},{"type":"text","text":"What color?"}]}]}`)
+	messages := gjson.GetBytes(ConvertClaudeRequestToOpenAI("test-model", input, false), "messages").Array()
+	if len(messages) != 3 || messages[1].Get("role").String() != "tool" || messages[2].Get("role").String() != "user" {
+		t.Fatalf("unexpected messages: %v", messages)
 	}
-	if got := toolContent.Get("0.type").String(); got != "image_url" {
-		t.Fatalf("Expected tool content type %q, got %q", "image_url", got)
+	if got := messages[1].Get("content.0.image_url.url").String(); got != "data:image/png;base64,aW1n" {
+		t.Fatalf("tool image=%q", got)
 	}
-	if got := toolContent.Get("0.image_url.url").String(); got != "https://example.com/tool.png" {
-		t.Fatalf("Unexpected image_url: %q", got)
+	if got := messages[2].Get("content.0.text").String(); got != "What color?" {
+		t.Fatalf("user text=%q", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_MultipleToolResultsWithImages(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"shot1","input":{}},{"type":"tool_use","id":"call_2","name":"shot2","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"result 1"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1nMQ=="}}]},{"type":"tool_result","tool_use_id":"call_2","content":{"type":"image","source":{"type":"url","url":"https://example.com/2.png"}}}]}]}`)
+	messages := gjson.GetBytes(ConvertClaudeRequestToOpenAI("test-model", input, false), "messages").Array()
+	if len(messages) != 3 {
+		t.Fatalf("unexpected messages: %v", messages)
+	}
+	if got := messages[1].Get("content.1.image_url.url").String(); got != "data:image/png;base64,aW1nMQ==" {
+		t.Fatalf("first tool image=%q", got)
+	}
+	if got := messages[2].Get("content.0.image_url.url").String(); got != "https://example.com/2.png" {
+		t.Fatalf("second tool image=%q", got)
 	}
 }
 
@@ -920,5 +922,292 @@ func TestConvertClaudeRequestToOpenAI_StopSequences(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolWithoutInputSchemaDefaultsParameters(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-opus-5",
+		"tools": [
+			{
+				"type": "web_search_20250305",
+				"name": "web_search",
+				"max_uses": 8
+			},
+			{
+				"name": "no_schema_custom"
+			},
+			{
+				"name": "null_schema_custom",
+				"input_schema": null
+			}
+		],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("test-model", inputJSON, false)
+	outputJSON := gjson.ParseBytes(output)
+
+	for i, toolName := range []string{"web_search", "no_schema_custom", "null_schema_custom"} {
+		path := fmt.Sprintf("tools.%d.function", i)
+		if got := outputJSON.Get(path + ".name").String(); got != toolName {
+			t.Fatalf("tool %d name = %q, want %q", i, got, toolName)
+		}
+		params := outputJSON.Get(path + ".parameters")
+		if !params.Exists() {
+			t.Fatalf("tool %d function.parameters missing: %s", i, outputJSON.Get(path).Raw)
+		}
+		if got := params.Get("type").String(); got != "object" {
+			t.Fatalf("tool %d function.parameters.type = %q, want object", i, got)
+		}
+		if got := params.Get("properties"); !got.Exists() || !got.IsObject() {
+			t.Fatalf("tool %d function.parameters.properties missing or not object: %s", i, params.Raw)
+		}
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_StripsUnsupportedUnicodePropertyEscapePatterns(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.6",
+		"messages": [{"role": "user", "content": "hello"}],
+		"tools": [{
+			"name": "Artifact",
+			"description": "Render an HTML file to an Artifact",
+			"input_schema": {
+				"type": "object",
+				"properties": {
+					"field": {
+						"type": "string",
+						"description": "field to replace",
+						"pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$"
+					},
+					"asset_id": {
+						"type": "string",
+						"pattern": "^[0-9a-f]{32}$"
+					},
+					"lookahead_safe": {
+						"type": "string",
+						"pattern": "^(?!__.*__$).{1,200}$"
+					}
+				}
+			}
+		}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("gpt-5.6", inputJSON, false)
+	outputJSON := gjson.ParseBytes(output)
+
+	params := outputJSON.Get("tools.0.function.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected function.parameters in output: %s", output)
+	}
+
+	// Incompatible \p{...} pattern must be stripped
+	if params.Get("properties.field.pattern").Exists() {
+		t.Errorf("expected properties.field.pattern to be removed, got: %s", params.Get("properties.field.pattern").Raw)
+	}
+	if got := params.Get("properties.field.type").String(); got != "string" {
+		t.Errorf("expected properties.field.type == 'string', got %q", got)
+	}
+
+	// Valid patterns must remain intact
+	if got := params.Get("properties.asset_id.pattern").String(); got != "^[0-9a-f]{32}$" {
+		t.Errorf("expected properties.asset_id.pattern preserved, got %q", got)
+	}
+	if got := params.Get("properties.lookahead_safe.pattern").String(); got != "^(?!__.*__$).{1,200}$" {
+		t.Errorf("expected properties.lookahead_safe.pattern preserved, got %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_PreservesNonSchemaPatternKeys(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.6",
+		"messages": [{"role": "user", "content": "hello"}],
+		"tools": [{
+			"name": "config_tool",
+			"input_schema": {
+				"type": "object",
+				"properties": {
+					"regex_config": {
+						"type": "object",
+						"default": {
+							"pattern": "\\p{L}+"
+						},
+						"enum": [
+							{"pattern": "\\p{N}+"}
+						]
+					},
+					"real_schema": {
+						"type": "string",
+						"pattern": "\\p{L}+"
+					}
+				}
+			}
+		}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("gpt-5.6", inputJSON, false)
+	outputJSON := gjson.ParseBytes(output)
+
+	params := outputJSON.Get("tools.0.function.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected function.parameters in output: %s", output)
+	}
+
+	// Real schema pattern must be removed
+	if params.Get("properties.real_schema.pattern").Exists() {
+		t.Errorf("expected real_schema.pattern to be removed, got: %s", params.Get("properties.real_schema").Raw)
+	}
+
+	// User data under default and enum must be PRESERVED
+	if got := params.Get("properties.regex_config.default.pattern").String(); got != `\p{L}+` {
+		t.Errorf("expected default.pattern preserved, got %q", got)
+	}
+	if got := params.Get("properties.regex_config.enum.0.pattern").String(); got != `\p{N}+` {
+		t.Errorf("expected enum.0.pattern preserved, got %q", got)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_StripsPatternPropertiesIncompatibleKeys(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.6",
+		"messages": [{"role": "user", "content": "hello"}],
+		"tools": [{
+			"name": "pattern_tool",
+			"input_schema": {
+				"type": "object",
+				"patternProperties": {
+					"^\\\\p{L}+$": {
+						"type": "string"
+					},
+					"^[a-z]+$": {
+						"type": "number"
+					}
+				}
+			}
+		}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("gpt-5.6", inputJSON, false)
+	outputJSON := gjson.ParseBytes(output)
+
+	params := outputJSON.Get("tools.0.function.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected function.parameters in output: %s", output)
+	}
+
+	patternProps := params.Get("patternProperties").Map()
+	if _, exists := patternProps[`^\p{L}+$`]; exists {
+		t.Errorf("expected patternProperties key '^\\\\p{L}+$' to be removed, got: %s", params.Get("patternProperties").Raw)
+	}
+	if _, exists := patternProps[`^[a-z]+$`]; !exists {
+		t.Errorf("expected patternProperties key '^[a-z]+$' to be preserved, got: %s", params.Get("patternProperties").Raw)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultPreservesFunctionName(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3.8-flash",
+		"max_tokens": 64,
+		"tools": [
+			{
+				"name": "get_weather",
+				"description": "Get weather",
+				"input_schema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			},
+			{
+				"name": "get_time",
+				"description": "Get time",
+				"input_schema": {
+					"type": "object",
+					"properties": {"city": {"type": "string"}},
+					"required": ["city"]
+				}
+			}
+		],
+		"messages": [
+			{"role": "user", "content": "What's the weather and time in Jakarta?"},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "toolu_01ABC", "name": "get_weather", "input": {"city": "Jakarta"}},
+					{"type": "tool_use", "id": "toolu_02DEF", "name": "get_time", "input": {"city": "Jakarta"}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "toolu_01ABC", "content": "32C, humid"},
+					{"type": "tool_result", "tool_use_id": "toolu_02DEF", "content": "12:00 PM"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("gemini-3.8-flash", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	var toolMessages []gjson.Result
+	for _, msg := range messages {
+		if msg.Get("role").String() == "tool" {
+			toolMessages = append(toolMessages, msg)
+		}
+	}
+
+	if len(toolMessages) != 2 {
+		t.Fatalf("expected 2 tool messages, got %d. Output: %s", len(toolMessages), result)
+	}
+
+	if got := toolMessages[0].Get("tool_call_id").String(); got != "toolu_01ABC" {
+		t.Errorf("toolMessages[0].tool_call_id = %q, want %q", got, "toolu_01ABC")
+	}
+	if got := toolMessages[0].Get("name").String(); got != "get_weather" {
+		t.Errorf("toolMessages[0].name = %q, want %q", got, "get_weather")
+	}
+	if got := toolMessages[0].Get("content").String(); got != "32C, humid" {
+		t.Errorf("toolMessages[0].content = %q, want %q", got, "32C, humid")
+	}
+
+	if got := toolMessages[1].Get("tool_call_id").String(); got != "toolu_02DEF" {
+		t.Errorf("toolMessages[1].tool_call_id = %q, want %q", got, "toolu_02DEF")
+	}
+	if got := toolMessages[1].Get("name").String(); got != "get_time" {
+		t.Errorf("toolMessages[1].name = %q, want %q", got, "get_time")
+	}
+	if got := toolMessages[1].Get("content").String(); got != "12:00 PM" {
+		t.Errorf("toolMessages[1].content = %q, want %q", got, "12:00 PM")
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolResultUnknownIDNoName(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3.8-flash",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "orphan_call_1", "content": "result"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("gemini-3.8-flash", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	toolMsg := resultJSON.Get("messages.0")
+
+	if got := toolMsg.Get("role").String(); got != "tool" {
+		t.Fatalf("expected tool role, got %q", got)
+	}
+	if got := toolMsg.Get("tool_call_id").String(); got != "orphan_call_1" {
+		t.Errorf("tool_call_id = %q, want %q", got, "orphan_call_1")
+	}
+	if toolMsg.Get("name").Exists() {
+		t.Errorf("expected no name for unknown tool_use_id, got %q", toolMsg.Get("name").String())
 	}
 }

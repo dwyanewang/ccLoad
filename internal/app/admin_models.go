@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
@@ -551,7 +552,11 @@ func (s *Server) fetchModelsForChannel(
 	if cfg == nil {
 		return nil, fmt.Errorf("渠道不存在")
 	}
+	cfg = withAntigravityDefaultFallbackURLs(cfg)
 	cfg = s.withOAuthBaseURLOverride(cfg)
+	if cfg.UsesCodeBuddyOAuth() {
+		return sortOAuthFetchModels(s.fetchCodeBuddyOAuthModels(ctx, cfg, overrideProtocol))
+	}
 	if cfg.UsesXAIOAuth() {
 		return sortOAuthFetchModels(fetchXAIOAuthModels(cfg, overrideProtocol))
 	}
@@ -620,6 +625,45 @@ func sortOAuthFetchModels(response *FetchModelsResponse, err error) (*FetchModel
 	}
 	sortOAuthModelEntries(response.Models)
 	return response, nil
+}
+
+func (s *Server) fetchCodeBuddyOAuthModels(ctx context.Context, cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
+	if overrideProtocol != "" && util.NormalizeProtocol(overrideProtocol) != util.ProtocolOpenAI {
+		return nil, errors.New("CodeBuddy model discovery requires openai protocol")
+	}
+	if s.codeBuddyService == nil {
+		return nil, errors.New("CodeBuddy model discovery unavailable")
+	}
+	credential, err := codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil {
+		return nil, err
+	}
+	// Unsaved previews have no credential row to update; saved channels share the
+	// normal refresh/CAS lifecycle used by proxy requests.
+	if cfg.ID > 0 {
+		credential, err = s.codeBuddyCredentials.credential(ctx, cfg, false, "")
+		if err != nil {
+			return nil, err
+		}
+	}
+	service := *s.codeBuddyService
+	service.Client = s.getClientForChannel(cfg)
+	names, err := service.FetchModels(ctx, credential)
+	var apiErr *codebuddyauth.APIError
+	if cfg.ID > 0 && errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
+		credential, err = s.codeBuddyCredentials.credential(ctx, cfg, true, credential.AccessToken)
+		if err == nil {
+			names, err = service.FetchModels(ctx, credential)
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("CodeBuddy 模型目录获取失败: %w", err)
+	}
+	entries := make([]model.ModelEntry, len(names))
+	for i, name := range names {
+		entries[i] = model.ModelEntry{Model: name}
+	}
+	return &FetchModelsResponse{Models: entries, Protocol: util.ProtocolOpenAI, Source: "api"}, nil
 }
 
 func (s *Server) fetchZedOAuthModels(ctx context.Context, cfg *model.Config, overrideProtocol string) (*FetchModelsResponse, error) {
@@ -918,7 +962,7 @@ func (s *Server) fetchAntigravityModelsWithURLFallback(
 	for i := range cfg.URLs {
 		runtimeURLs[i] = cfg.URLs[i].RuntimeURL()
 	}
-	sortedURLs := orderURLsWithSelector(selector, cfg.ID, runtimeURLs)
+	sortedURLs := orderChannelAttemptURLs(selector, cfg, runtimeURLs)
 	sortedURLs = prioritizeDeclaredProtocolURLs(sortedURLs, cfg.URLs)
 
 	var lastErr error

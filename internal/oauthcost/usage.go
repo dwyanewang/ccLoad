@@ -36,6 +36,9 @@ const (
 	FamilySpark = "spark"
 	// FamilyCodex 覆盖 Codex 主额度窗口，但不覆盖单独计量的 Spark。
 	FamilyCodex = "codex"
+	// FamilyCodexReserve 是 Codex 的 gpt-reserve 窗口。
+	// 上游没有提供请求级归属，不能把普通 Codex 请求计入该窗口。
+	FamilyCodexReserve = "codex_reserve"
 )
 
 // Usage is persisted inside an OAuth credential. Costs come from positive
@@ -47,6 +50,10 @@ type Usage struct {
 }
 
 // Window is one persisted quota period and its accumulated standard cost.
+//
+// StartedAt 是周期起点，CountFromAt 是手动重置截止点；计数起点取两者较大值，
+// 见 CountFrom。周期切换时若要保留真实计数起点，StartedAt 会被一并前移到
+// CountFromAt 之前，所以 StartedAt 不总是名义周期起点。
 type Window struct {
 	Key                        string   `json:"key"`
 	Family                     string   `json:"family,omitempty"`
@@ -58,6 +65,46 @@ type Window struct {
 	SampledUpstreamUsedPercent *float64 `json:"sampled_upstream_used_percent,omitempty"`
 	SampledUpstreamAtUnixNano  int64    `json:"sampled_upstream_at_unix_nano,omitempty"`
 	StandardCostMicroUSD       int64    `json:"standard_cost_microusd"`
+
+	// AccountedFrom/AccountedUntil 是 StandardCostMicroUSD 已经计入的日志时间
+	// 区间（半开，Unix 秒）。不变式：区间非空时，累计值等于该区间内本族日志
+	// 成本之和——包括日志已被保留期清理掉的那部分，这正是边界变化时只能核对
+	// 对称差、不能全量重算的原因（日志保留期可以短于周/月额度周期）。
+	// 零值表示未知，存储层会按当前边界重算一次并写回，重算结果只取较大值。
+	AccountedFrom  int64 `json:"accounted_from,omitempty"`
+	AccountedUntil int64 `json:"accounted_until,omitempty"`
+
+	// LocallyAdvanced 标记这个周期是本地按截止时间滚出来的、还没被任何上游采样
+	// 确认。此时 StartedAt/ResetAt 都只是暂定值：真实重置可能漂移到旧截止点的
+	// 另一侧，采样确认时必须允许边界被改写（见 reconcileWindow）。
+	// 显式记录而不是从其他字段反推——否则 advanceWindow 的任何赋值调整都会
+	// 让这个判断静默失效，额度数字慢慢跑偏且没有任何编译或测试信号。
+	LocallyAdvanced bool `json:"locally_advanced,omitempty"`
+}
+
+// CountFrom 返回窗口的计数起点：周期起点与手动重置截止点中较晚的一个。
+func CountFrom(window *Window) int64 {
+	if window == nil {
+		return 0
+	}
+	return max(window.StartedAt, window.CountFromAt)
+}
+
+// Accounted 报告窗口是否带有可信的已计入区间。
+func Accounted(window *Window) bool {
+	return window != nil && window.AccountedUntil > window.AccountedFrom
+}
+
+// MarkAccounted 记录累计成本所覆盖的日志时间区间；空区间表示未知。
+func MarkAccounted(window *Window, from, until int64) {
+	if window == nil {
+		return
+	}
+	if from <= 0 || until <= from {
+		window.AccountedFrom, window.AccountedUntil = 0, 0
+		return
+	}
+	window.AccountedFrom, window.AccountedUntil = from, until
 }
 
 // Sample 是一次上游额度采样中的单个窗口状态。
@@ -100,9 +147,11 @@ func FamilyMatches(family, modelName string) bool {
 	case FamilySpark:
 		return strings.Contains(modelName, "spark")
 	case FamilyCodex:
-		// 保留旧日志中可能缺失模型名的累计语义；只有明确识别为 Spark
-		// 时才从主 Codex 窗口排除。
-		return !strings.Contains(modelName, "spark")
+		// Reserve and Spark consume independent quotas; response model names
+		// cannot determine this, so callers must use the actual request model.
+		return modelName != "gpt-reserve" && !strings.Contains(modelName, "spark")
+	case FamilyCodexReserve:
+		return modelName == "gpt-reserve"
 	default:
 		return false
 	}
@@ -110,7 +159,7 @@ func FamilyMatches(family, modelName string) bool {
 
 func validFamily(family string) bool {
 	switch family {
-	case FamilyAll, FamilyGemini, FamilyNonGemini, FamilySonnet, FamilyFable, FamilySpark, FamilyCodex:
+	case FamilyAll, FamilyGemini, FamilyNonGemini, FamilySonnet, FamilyFable, FamilySpark, FamilyCodex, FamilyCodexReserve:
 		return true
 	default:
 		return false
@@ -124,11 +173,23 @@ func WindowMatchesModel(window *Window, modelName string) bool {
 	if window == nil {
 		return false
 	}
+	return FamilyMatches(WindowModelFamily(window), modelName)
+}
+
+// WindowModelFamily resolves historical family values from the quota identity.
+func WindowModelFamily(window *Window) string {
+	if isCodexReserveKey(window.Key) {
+		return FamilyCodexReserve
+	}
 	family := window.Family
 	if family == FamilyAll && strings.EqualFold(strings.TrimSpace(strings.SplitN(window.Key, "|", 2)[0]), ProviderCodex) {
 		family = FamilyCodex
 	}
-	return FamilyMatches(family, modelName)
+	return family
+}
+
+func isCodexReserveKey(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(strings.SplitN(key, "|", 2)[0]), "gpt-reserve")
 }
 
 // Families 返回持久化窗口里出现过的模型族集合。
@@ -142,11 +203,12 @@ func Families(usage *Usage) []string {
 		if window == nil {
 			continue
 		}
-		if _, ok := seen[window.Family]; ok {
+		family := WindowModelFamily(window)
+		if _, ok := seen[family]; ok {
 			continue
 		}
-		seen[window.Family] = struct{}{}
-		families = append(families, window.Family)
+		seen[family] = struct{}{}
+		families = append(families, family)
 	}
 	return families
 }
@@ -217,6 +279,14 @@ func Validate(usage *Usage) error {
 		if window.StandardCostMicroUSD < 0 {
 			return errors.New("OAuth quota standard cost cannot be negative")
 		}
+		// 已计入区间只有两种合法状态：整体为零（未知）或半开区间 [from, until)。
+		// 半开状态 from>0 && until==0 会被 Accounted 判为未知、却又留着一个看似
+		// 可信的起点，后续对账按它做差集就会漏算，必须在入库前拦下。
+		if window.AccountedFrom < 0 || window.AccountedUntil < 0 ||
+			(window.AccountedFrom == 0) != (window.AccountedUntil == 0) ||
+			(window.AccountedUntil > 0 && window.AccountedUntil <= window.AccountedFrom) {
+			return errors.New("OAuth quota accounted range is invalid")
+		}
 	}
 	return nil
 }
@@ -237,41 +307,34 @@ func Find(usage *Usage, key string) *Window {
 // Reconcile aligns persisted counters with a complete upstream window
 // snapshot. A changed boundary starts at zero unless a manual count cutoff
 // still belongs to the sampled period. Windows missing from a complete
-// snapshot are retired.
+// snapshot are retired unless they were sampled after that snapshot. A usage
+// rollback is scoped to the sampled window, so a rolling 5-hour reset cannot
+// clear the independent weekly counter.
 func Reconcile(current *Usage, samples []Sample, observedAt time.Time) *Usage {
 	return reconcile(current, samples, observedAt, false)
 }
 
 // ReconcilePartial applies a partial upstream sample. It updates only windows
-// present in samples and never retires omitted siblings. A usage rollback is
-// scoped to the sampled quota family, so an independent Codex Spark reset
-// cannot clear the main Codex weekly window.
+// present in samples and retains omitted siblings: their absence is not proof
+// of an upstream reset, so their old cost remains until their own sample or
+// local boundary. Usage rollback uses the same per-window scope as Reconcile.
 func ReconcilePartial(current *Usage, samples []Sample, observedAt time.Time) *Usage {
 	return reconcile(current, samples, observedAt, true)
 }
 
 func reconcile(current *Usage, samples []Sample, observedAt time.Time, partial bool) *Usage {
-	var accountResetAt time.Time
-	resetAtByFamily := map[string]time.Time(nil)
-	if partial {
-		resetAtByFamily = sampledUpstreamResetTimes(current, samples, observedAt)
-		if len(resetAtByFamily) > 0 {
-			current = resetUpstreamFamilies(current, resetAtByFamily)
-		}
-	} else {
-		// Complete snapshots retain the historical account-level rollback
-		// contract used by active OAuth refreshes.
-		accountResetAt = sampledUpstreamResetAt(current, samples, observedAt)
-		if !accountResetAt.IsZero() {
-			current = resetUpstreamAccount(current, accountResetAt)
-		}
-	}
+	current, staleCodexLayout := reconcileCodexWeeklyKey(current, samples, observedAt)
 	next := &Usage{}
 	seen := make(map[string]struct{}, len(samples))
+	snapshotAtNano := sampleTimeUnixNano(observedAt)
 	for _, sample := range samples {
 		key := strings.TrimSpace(sample.Key)
 		if key == "" || sample.WindowSeconds <= 0 || sample.ResetAt.IsZero() {
 			continue
+		}
+		sample.Key = key
+		if isCodexReserveKey(key) {
+			sample.Family = FamilyCodexReserve
 		}
 		if !validFamily(sample.Family) {
 			continue
@@ -279,32 +342,43 @@ func reconcile(current *Usage, samples []Sample, observedAt time.Time, partial b
 		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[key] = struct{}{}
-		sample.Key = key
-		sample.UsedPercent = normalizedUsedPercent(sample.UsedPercent)
-		resetAt := accountResetAt
-		if partial {
-			family := quotaFamilyForKey(sample.Key, sample.Family)
-			resetAt = resetAtByFamily[family]
+		// Quota may have been sampled before an auxiliary metadata request.
+		// That later request's completion time cannot authorize deletions.
+		if sampledAtNano := sampleTimeUnixNano(sample.SampledAt); sampledAtNano > 0 &&
+			(snapshotAtNano == 0 || sampledAtNano < snapshotAtNano) {
+			snapshotAtNano = sampledAtNano
 		}
-		if window := reconcileWindow(Find(current, key), sample, observedAt, resetAt); window != nil {
+		if staleCodexLayout && isCodexMainWindowKey(key) {
+			continue
+		}
+		seen[key] = struct{}{}
+		sample.UsedPercent = normalizedUsedPercent(sample.UsedPercent)
+		if window := reconcileWindow(Find(current, key), sample, observedAt); window != nil {
 			next.Windows = append(next.Windows, window)
 		}
 	}
-	if (partial || !accountResetAt.IsZero()) && current != nil {
-		// Partial samples always retain omitted siblings. A complete sample
-		// retains omitted windows only when the account-level rollback reset them.
+	if !partial && !staleCodexLayout && len(next.Windows) == 0 {
+		// An empty/invalid snapshot has no authority to retire any window,
+		// including when only some of the current windows have newer samples.
+		return Clone(current)
+	}
+	if current != nil {
 		for _, window := range current.Windows {
 			if window == nil {
+				continue
+			}
+			// A complete snapshot cannot retire a sibling learned from a newer
+			// passive sample while that snapshot was waiting to be persisted.
+			newerSample := snapshotAtNano > 0 && window.SampledUpstreamAtUnixNano > snapshotAtNano
+			keepOmitted := partial || newerSample || (staleCodexLayout && isCodexMainWindowKey(window.Key))
+			if !keepOmitted {
 				continue
 			}
 			if _, ok := seen[window.Key]; ok {
 				continue
 			}
 			retained := cloneWindow(window)
-			if partial {
-				advanceWindow(retained, observedAt)
-			}
+			advanceWindow(retained, observedAt)
 			next.Windows = append(next.Windows, retained)
 		}
 	}
@@ -316,95 +390,65 @@ func reconcile(current *Usage, samples []Sample, observedAt time.Time, partial b
 	return next
 }
 
-// sampledUpstreamResetAt is retained as a small compatibility helper for
-// callers/tests that only need the earliest detected reset timestamp.
-func sampledUpstreamResetAt(current *Usage, samples []Sample, observedAt time.Time) time.Time {
-	resets := sampledUpstreamResetTimes(current, samples, observedAt)
-	var earliest time.Time
-	for _, resetAt := range resets {
-		if earliest.IsZero() || resetAt.Before(earliest) {
-			earliest = resetAt
-		}
-	}
-	return earliest
-}
-
-func sampledUpstreamResetTimes(current *Usage, samples []Sample, observedAt time.Time) map[string]time.Time {
-	seen := make(map[string]struct{}, len(samples))
-	resetAtByFamily := make(map[string]time.Time)
+// Codex can move its weekly quota between primary and secondary when the 5h
+// limit appears or disappears. Move that counter before reconciling periods;
+// neither the old 5h counter nor another quota group is a weekly cost source.
+// A late snapshot of the previous layout must not move or duplicate it again.
+func reconcileCodexWeeklyKey(current *Usage, samples []Sample, observedAt time.Time) (*Usage, bool) {
 	for _, sample := range samples {
 		key := strings.TrimSpace(sample.Key)
-		if key == "" || sample.WindowSeconds <= 0 || sample.ResetAt.IsZero() || !validFamily(sample.Family) {
+		if !isCodexMainWindowKey(key) || sample.WindowSeconds != weeklyWindowSeconds || sample.ResetAt.IsZero() ||
+			(sample.Family != FamilyAll && sample.Family != FamilyCodex) {
 			continue
 		}
-		if _, ok := seen[key]; ok {
+		target := Find(current, key)
+		if target != nil && target.WindowSeconds == weeklyWindowSeconds {
 			continue
 		}
-		seen[key] = struct{}{}
-		family := quotaFamilyForKey(key, sample.Family)
-		usedPercent := normalizedUsedPercent(sample.UsedPercent)
-		window := cloneWindow(Find(current, key))
-		if usedPercent == nil || window == nil || window.WindowSeconds != sample.WindowSeconds {
+		otherKey := "codex|primary"
+		if key == otherKey {
+			otherKey = "codex|secondary"
+		}
+		source := Find(current, otherKey)
+		if source == nil || source.WindowSeconds != weeklyWindowSeconds ||
+			(source.Family != FamilyAll && source.Family != FamilyCodex) {
 			continue
 		}
-		advanceWindow(window, observedAt)
-		sampledAt := firstNonZeroTime(sample.SampledAt, observedAt)
-		sampledAtUnixNano := sampleTimeUnixNano(sampledAt)
-		if window.SampledUpstreamAtUnixNano > 0 && sampledAtUnixNano <= window.SampledUpstreamAtUnixNano {
-			continue
+		for _, other := range samples {
+			if strings.TrimSpace(other.Key) == otherKey && other.WindowSeconds == weeklyWindowSeconds && !other.ResetAt.IsZero() {
+				// Two explicitly reported weekly windows are independent counters.
+				return current, false
+			}
 		}
-		if upstreamUsageRolledBack(window.SampledUpstreamUsedPercent, usedPercent) &&
-			(resetAtByFamily[family].IsZero() || sampledAt.Before(resetAtByFamily[family])) {
-			resetAtByFamily[family] = sampledAt
+		sampledAt := sampleTimeUnixNano(firstNonZeroTime(sample.SampledAt, observedAt))
+		for _, window := range []*Window{source, target} {
+			if window != nil && window.SampledUpstreamAtUnixNano > 0 &&
+				(sampledAt < window.SampledUpstreamAtUnixNano ||
+					(sampledAt == window.SampledUpstreamAtUnixNano && window.SampledUpstreamUsedPercent != nil)) {
+				return current, true
+			}
 		}
+		next := &Usage{Windows: make([]*Window, 0, len(current.Windows))}
+		for _, window := range current.Windows {
+			if window != nil && window.Key == key {
+				continue
+			}
+			window = cloneWindow(window)
+			if window != nil && window.Key == otherKey {
+				window.Key = key
+			}
+			next.Windows = append(next.Windows, window)
+		}
+		return next, false
 	}
-	return resetAtByFamily
+	return current, false
 }
 
-func quotaFamilyForKey(key, family string) string {
-	if family != FamilyAll {
-		return family
-	}
-	limitName := strings.ToLower(strings.TrimSpace(strings.SplitN(key, "|", 2)[0]))
-	switch {
-	case strings.Contains(limitName, "spark"):
-		return FamilySpark
-	case limitName == ProviderCodex:
-		return FamilyCodex
-	default:
-		return FamilyAll
-	}
+func isCodexMainWindowKey(key string) bool {
+	return key == "codex|primary" || key == "codex|secondary"
 }
 
-func quotaFamily(window *Window) string {
-	if window == nil {
-		return FamilyAll
-	}
-	return quotaFamilyForKey(window.Key, window.Family)
-}
-
-func resetUpstreamFamilies(current *Usage, resetAtByFamily map[string]time.Time) *Usage {
-	next := Clone(current)
-	if next == nil {
-		return nil
-	}
-	for _, window := range next.Windows {
-		if window == nil {
-			continue
-		}
-		resetAt, ok := resetAtByFamily[quotaFamily(window)]
-		if !ok {
-			continue
-		}
-		reset := resetUpstreamAccount(&Usage{Windows: []*Window{window}}, resetAt)
-		if reset != nil && len(reset.Windows) == 1 && reset.Windows[0] != nil {
-			*window = *reset.Windows[0]
-		}
-	}
-	return next
-}
-
-func reconcileWindow(current *Window, sample Sample, observedAt, upstreamResetAt time.Time) *Window {
+func reconcileWindow(current *Window, sample Sample, observedAt time.Time) *Window {
 	resetAt := sample.ResetAt.UTC()
 	next := newWindow(sample, observedAt, 0)
 	if isMonthlyWindow(sample.WindowSeconds) && current != nil && current.ResetDay > resetAt.Day() &&
@@ -414,23 +458,25 @@ func reconcileWindow(current *Window, sample Sample, observedAt, upstreamResetAt
 	if next == nil {
 		return nil
 	}
-	usageSampledAt := firstNonZeroTime(sample.SampledAt, observedAt)
-	if !upstreamResetAt.IsZero() {
-		if usageSampledAt.Before(upstreamResetAt) {
-			// 同一批合并结果可能夹带另一个槽位的旧样本。该额度族已在 upstreamResetAt
-			// 清零，旧样本既不能恢复旧边界，也不能重新建立旧百分比基线。
-			return cloneWindow(current)
-		}
-		// resetUpstreamFamilies 已统一清空该额度族；新样本只负责落定各自边界。
-		next.CountFromAt = upstreamResetAt.Unix()
-		return next
-	}
-	if current == nil || current.WindowSeconds != sample.WindowSeconds {
+	if current == nil {
 		return next
 	}
 	current = cloneWindow(current)
-	advanceWindow(current, observedAt)
+	usageSampledAt := firstNonZeroTime(sample.SampledAt, observedAt)
 	sampledAtUnixNano := sampleTimeUnixNano(usageSampledAt)
+	// Correct a same-period deadline before advancing, or the old deadline can
+	// destroy cost before the upstream period ends. Keep the accounting start
+	// and manual cutoff so already-counted logs remain in the counted interval.
+	if sample.UsedPercent != nil &&
+		(sampledAtUnixNano > current.SampledUpstreamAtUnixNano ||
+			(sampledAtUnixNano == current.SampledUpstreamAtUnixNano && current.SampledUpstreamUsedPercent == nil)) &&
+		current.WindowSeconds == sample.WindowSeconds && sample.ResetAt.After(observedAt) &&
+		next.ResetAt > current.StartedAt && sameQuotaPeriod(current, next) &&
+		!upstreamUsageRolledBack(current.SampledUpstreamUsedPercent, sample.UsedPercent) {
+		current.ResetAt = next.ResetAt
+		current.ResetDay = next.ResetDay
+	}
+	advanceWindow(current, observedAt)
 	usageSampleIsNewer := sample.UsedPercent != nil &&
 		(current.SampledUpstreamAtUnixNano == 0 || sampledAtUnixNano > current.SampledUpstreamAtUnixNano ||
 			(current.SampledUpstreamUsedPercent == nil && sampledAtUnixNano == current.SampledUpstreamAtUnixNano))
@@ -442,6 +488,9 @@ func reconcileWindow(current *Window, sample Sample, observedAt, upstreamResetAt
 		// 必须整条丢弃；只忽略百分比仍可能让旧边界清空新周期成本。
 		return current
 	}
+	if current.WindowSeconds != sample.WindowSeconds {
+		return next
+	}
 	if usageSampleIsNewer && upstreamUsageRolledBack(current.SampledUpstreamUsedPercent, sample.UsedPercent) {
 		// 上游可以在原 reset_at 到期前直接恢复额度。使用率在同一额度周期内只会
 		// 单调增加；只有超过 upstreamUsageRollbackEpsilon 的显著回退才会切断旧成本，
@@ -450,20 +499,34 @@ func reconcileWindow(current *Window, sample Sample, observedAt, upstreamResetAt
 		return next
 	}
 	if sameQuotaPeriod(current, next) {
-		// 边界一经确立就锚住，只更新采样权威的模型族：上游同一个周期会用两种精度
-		// 表达 reset 时间（Codex 响应头给绝对 reset-at，SSE rate_limits 事件只给
-		// resets_in_seconds，换算成 sampledAt+n 每次都不同），逐秒比较必然把同一
-		// 周期判成新周期并清空已累计成本。
+		// 同周期保留累计；有效新采样的 reset 边界已在本地滚动前校正。
+		// 无用量基线的边界快照仍不能覆盖已确认的重置时间。
 		current.Family = next.Family
 		if usageSampleIsNewer {
+			// A locally advanced period has no upstream baseline. Its start is
+			// provisional too: retaining it can exclude logs when the actual
+			// reset drifted across the old deadline. The storage transaction
+			// reconciles costs against the newly confirmed interval.
+			if current.LocallyAdvanced {
+				current.StartedAt = next.StartedAt
+				current.ResetAt = next.ResetAt
+				current.ResetDay = next.ResetDay
+			}
 			current.SampledUpstreamUsedPercent = cloneFloat64(sample.UsedPercent)
 			current.SampledUpstreamAtUnixNano = sampledAtUnixNano
+			// 采样确认了边界，暂定状态结束。
+			current.LocallyAdvanced = false
 		}
 		return current
 	}
 	if current.CountFromAt > 0 && current.CountFromAt < next.ResetAt && observedAt.Before(time.Unix(next.ResetAt, 0)) {
 		next.StandardCostMicroUSD = current.StandardCostMicroUSD
 		next.CountFromAt = current.CountFromAt
+		// 周期切换不得抬高计数起点，否则手动重置后已计入的日志会被排除。
+		next.StartedAt = min(next.StartedAt, current.StartedAt)
+		// 成本沿用，已计入区间必须一同沿用，否则存储层会按新边界全量重算，
+		// 把保留期外的历史成本抹掉。
+		next.AccountedFrom, next.AccountedUntil = current.AccountedFrom, current.AccountedUntil
 	}
 	return next
 }
@@ -487,9 +550,8 @@ func sampleTimeUnixNano(sampledAt time.Time) int64 {
 	return sampledAt.UnixNano()
 }
 
-// sameQuotaPeriod 判断两次采样是否落在同一个上游额度周期。真正的周期滚动会把
-// reset 时间整整推进一个窗口时长，而采样噪声只有秒级（相对剩余秒数换算、上游取整、
-// 时钟漂移），半个窗口的容差足以把两者区分开。
+// sameQuotaPeriod 用半窗口容差识别同周期的边界修正或采样抖动；它只决定
+// 是否保留累计，不决定采用哪个重置时间。整窗口推进仍视为周期切换。
 func sameQuotaPeriod(current, next *Window) bool {
 	delta := next.ResetAt - current.ResetAt
 	if delta < 0 {
@@ -519,6 +581,9 @@ func newWindow(sample Sample, observedAt time.Time, resetDay int) *Window {
 	}
 	window.StartedAt = periodStart(window, resetAt).Unix()
 	advanceWindow(window, observedAt)
+	// 全新窗口的零成本只是缺省值：该周期内可能已有日志落盘，
+	// 已计入区间必须标记为未知，交给存储层按当前边界重算一次。
+	window.AccountedFrom, window.AccountedUntil = 0, 0
 	return window
 }
 
@@ -530,7 +595,7 @@ func firstNonZeroTime(primary, fallback time.Time) time.Time {
 }
 
 // Reset starts new local counters immediately after an upstream manual reset.
-// costByFamily 给出各模型族自 resetAt 起的已落盘成本；缺失的族按零处理。
+// costByFamily 按 WindowModelFamily 给出各族自 resetAt 起的已落盘成本；缺失的族按零处理。
 // The next upstream quota sample reconciles the provisional boundaries.
 func Reset(current *Usage, resetAt time.Time, costByFamily map[string]int64) *Usage {
 	next := Clone(current)
@@ -546,20 +611,13 @@ func Reset(current *Usage, resetAt time.Time, costByFamily map[string]int64) *Us
 		window.CountFromAt = resetAt.Unix()
 		window.SampledUpstreamUsedPercent = nil
 		window.SampledUpstreamAtUnixNano = sampleTimeUnixNano(resetAt)
+		// 手动重置是已确认的计数起点，不是本地按截止时间猜出来的边界：
+		// 后续采样不得改写 StartedAt，否则会把重置后已计入的日志排除在外。
+		window.LocallyAdvanced = false
+		window.Family = WindowModelFamily(window)
 		window.StandardCostMicroUSD = costByFamily[window.Family]
-	}
-	return next
-}
-
-func resetUpstreamAccount(current *Usage, resetAt time.Time) *Usage {
-	next := Reset(current, resetAt, nil)
-	resetAt = resetAt.UTC()
-	for _, window := range next.Windows {
-		if window == nil {
-			continue
-		}
-		window.StartedAt = resetAt.Unix()
-		window.ResetAt = resetAt.Add(time.Duration(window.WindowSeconds) * time.Second).Unix()
+		// costByFamily 正是自计数起点起的已落盘成本，已计入区间随之确定。
+		MarkAccounted(window, CountFrom(window), window.ResetAt)
 	}
 	return next
 }
@@ -580,11 +638,7 @@ func AddStandardCost(usage *Usage, at time.Time, modelName string, costMicroUSD 
 			continue
 		}
 		advanceWindow(window, at)
-		countFromAt := window.StartedAt
-		if window.CountFromAt > countFromAt {
-			countFromAt = window.CountFromAt
-		}
-		if at.Before(time.Unix(countFromAt, 0)) || !at.Before(time.Unix(window.ResetAt, 0)) {
+		if at.Before(time.Unix(CountFrom(window), 0)) || !at.Before(time.Unix(window.ResetAt, 0)) {
 			continue
 		}
 		if window.StandardCostMicroUSD > math.MaxInt64-costMicroUSD {
@@ -620,6 +674,11 @@ func advanceWindow(window *Window, at time.Time) {
 	window.SampledUpstreamUsedPercent = nil
 	window.SampledUpstreamAtUnixNano = sampleTimeUnixNano(time.Unix(window.StartedAt, 0).UTC())
 	window.StandardCostMicroUSD = 0
+	// 本地按截止时间滚出的新周期，边界都是暂定值，等采样确认。
+	window.LocallyAdvanced = true
+	// 新周期的零成本是确定的：落在新周期内的日志都会先推进窗口再累计，
+	// 所以此刻整个新区间「已计入」且为零，后续日志由增量累计维持该不变式。
+	MarkAccounted(window, CountFrom(window), window.ResetAt)
 }
 
 // isMonthlyWindow 判断窗口是否按自然月推进——月长不固定，按秒推进会漂移。

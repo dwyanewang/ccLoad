@@ -912,16 +912,52 @@ func TestSanitizeAntigravityClaudeGeminiRequestSignatures_StripsDuplicateSignatu
 	for i := 0; i < 8; i++ {
 		sig := gjson.Get(outputStr, fmt.Sprintf("request.contents.0.parts.%d.thoughtSignature", i))
 		if i == 0 {
-			if got := sig.String(); got != signature.GeminiSkipThoughtSignatureValidator {
-				t.Fatalf("part %d: thoughtSignature=%q, want canonical bypass sentinel", i, got)
+			if sig.String() != signature.GeminiSkipThoughtSignatureValidator {
+				t.Fatalf("first call must retain only the canonical bypass signature: %s", output)
 			}
 		} else if sig.Exists() {
-			t.Fatalf("part %d: expected duplicate thoughtSignature fields to be stripped, got %s", i, sig.Raw)
+			t.Fatalf("part %d: expected all duplicate thoughtSignature fields to be stripped, got %s", i, sig.Raw)
 		}
 		fcSig := gjson.Get(outputStr, fmt.Sprintf("request.contents.0.parts.%d.functionCall.thoughtSignature", i))
 		if fcSig.Exists() {
 			t.Fatalf("part %d: expected functionCall thoughtSignature to be stripped, got %s", i, fcSig.Raw)
 		}
+	}
+}
+
+func TestSanitizeAntigravityClaudeGeminiRequestSignatures_LargeNumberDoesNotHaltKeyScan(t *testing.T) {
+	// A part with numbers outside float64 range should not break token scanning
+	inputJSON := []byte(`{
+		"project": "",
+		"model": "claude-sonnet-4-6",
+		"request": {
+			"contents": [
+				{
+					"role": "model",
+					"parts": [
+						{
+							"functionCall": {"args": {"n": 1e10000}},
+							"functionCall": {"thoughtSignature": "secret"},
+							"functionCall": {"name": "safe"}
+						}
+					]
+				}
+			]
+		}
+	}`)
+
+	output := SanitizeAntigravityClaudeGeminiRequestSignatures("claude-sonnet-4-6", inputJSON)
+	outputStr := string(output)
+
+	fcSig := gjson.Get(outputStr, "request.contents.0.parts.0.functionCall.thoughtSignature")
+	if fcSig.Exists() {
+		t.Fatalf("expected hidden thoughtSignature to be stripped despite large number, got %s", fcSig.Raw)
+	}
+	numericPayload := []byte(`{"request":{"contents":[{"role":"model","parts":[{"functionCall":{"name":"calc","args":{"n":1e10000},"thoughtSignature":"secret"}}]}]}}`)
+	numericOutput := SanitizeAntigravityClaudeGeminiRequestSignatures("claude-sonnet-4-6", numericPayload)
+	call := gjson.GetBytes(numericOutput, "request.contents.0.parts.0.functionCall")
+	if call.Get("args.n").Raw != "1e10000" || call.Get("thoughtSignature").Exists() {
+		t.Fatalf("signature cleanup must preserve large numeric arguments: %s", numericOutput)
 	}
 }
 
@@ -959,36 +995,6 @@ func TestSanitizeAntigravityClaudeGeminiRequestSignatures_StringValueNotTreatedA
 	}
 	if got := part.Get("thoughtSignature").String(); got != signature.GeminiSkipThoughtSignatureValidator {
 		t.Fatalf("thoughtSignature=%q, want canonical bypass sentinel", got)
-	}
-}
-
-func TestSanitizeAntigravityClaudeGeminiRequestSignatures_LargeNumberDoesNotHaltKeyScan(t *testing.T) {
-	// A part with numbers outside float64 range should not break token scanning
-	inputJSON := []byte(`{
-		"project": "",
-		"model": "claude-sonnet-4-6",
-		"request": {
-			"contents": [
-				{
-					"role": "model",
-					"parts": [
-						{
-							"functionCall": {"args": {"n": 1e10000}},
-							"functionCall": {"thoughtSignature": "secret"},
-							"functionCall": {"name": "safe"}
-						}
-					]
-				}
-			]
-		}
-	}`)
-
-	output := SanitizeAntigravityClaudeGeminiRequestSignatures("claude-sonnet-4-6", inputJSON)
-	outputStr := string(output)
-
-	fcSig := gjson.Get(outputStr, "request.contents.0.parts.0.functionCall.thoughtSignature")
-	if fcSig.Exists() {
-		t.Fatalf("expected hidden thoughtSignature to be stripped despite large number, got %s", fcSig.Raw)
 	}
 }
 
@@ -1176,5 +1182,130 @@ func TestConvertGeminiRequestToAntigravity_PreservesSiblingToolImageOnUserRole(t
 	}
 	if funcContent.Get("parts.1.inline_data").Exists() || funcContent.Get("parts.1.inlineData").Exists() {
 		t.Fatalf("sibling inline data should be absorbed into functionResponse.parts. Output: %s", out)
+	}
+}
+
+func TestNormalizeRoles_InvalidRoleWithoutFunctionResponseAlternates(t *testing.T) {
+	inputJSON := []byte(`{
+		"contents": [
+			{"role": "user", "parts": [{"text": "first"}]},
+			{"role": "invalid", "parts": [{"text": "second"}]}
+		]
+	}`)
+	out := ConvertGeminiRequestToAntigravity("gemini-3-flash", inputJSON, false)
+	contents := gjson.GetBytes(out, "request.contents").Array()
+	if len(contents) != 2 {
+		t.Fatalf("expected 2 contents, got %d", len(contents))
+	}
+	if got := contents[1].Get("role").String(); got != "model" {
+		t.Fatalf("text-only invalid role following user should normalize to model, got %q", got)
+	}
+}
+
+func TestNormalizeRoles_InvalidRoleWithFunctionResponseNormalizesToUser(t *testing.T) {
+	inputJSON := []byte(`{
+		"contents": [
+			{"role": "model", "parts": [{"functionCall": {"name": "test", "args": {}}}]},
+			{"role": "user", "parts": [{"text": "intervening user message"}]},
+			{"role": "invalid", "parts": [{"functionResponse": {"name": "test", "response": {}}}]}
+		]
+	}`)
+	out := ConvertGeminiRequestToAntigravity("gemini-3-flash", inputJSON, false)
+	// Role functionResponse should NEVER be normalized to model
+	for _, content := range gjson.GetBytes(out, "request.contents").Array() {
+		if content.Get("parts.0.functionResponse").Exists() {
+			if got := content.Get("role").String(); got != "user" && got != "function" {
+				t.Fatalf("functionResponse role should be user or function, got %q", got)
+			}
+		}
+	}
+}
+
+func TestConvertGeminiRequestToAntigravity_TranslatesResponseJsonSchemaToResponseSchema(t *testing.T) {
+	tests := []struct {
+		name      string
+		inputJSON string
+	}{
+		{
+			name: "camelCase responseJsonSchema",
+			inputJSON: `{
+				"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+				"generationConfig": {
+					"responseMimeType": "application/json",
+					"responseJsonSchema": {
+						"type": "OBJECT",
+						"properties": {"message": {"type": "STRING"}},
+						"required": ["message"]
+					}
+				}
+			}`,
+		},
+		{
+			name: "snake_case response_json_schema",
+			inputJSON: `{
+				"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+				"generationConfig": {
+					"responseMimeType": "application/json",
+					"response_json_schema": {
+						"type": "OBJECT",
+						"properties": {"message": {"type": "STRING"}},
+						"required": ["message"]
+					}
+				}
+			}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertGeminiRequestToAntigravity("gemini-3-flash", []byte(tt.inputJSON), false)
+
+			schema := gjson.GetBytes(out, "request.generationConfig.responseSchema")
+			if !schema.Exists() {
+				t.Fatalf("request.generationConfig.responseSchema missing. Output: %s", out)
+			}
+			if got := schema.Get("properties.message.type").String(); got != "STRING" {
+				t.Fatalf("responseSchema.properties.message.type = %q, want STRING. Output: %s", got, out)
+			}
+			if gjson.GetBytes(out, "request.generationConfig.responseJsonSchema").Exists() {
+				t.Fatalf("request.generationConfig.responseJsonSchema should have been removed. Output: %s", out)
+			}
+			if gjson.GetBytes(out, "request.generationConfig.response_json_schema").Exists() {
+				t.Fatalf("request.generationConfig.response_json_schema should have been removed. Output: %s", out)
+			}
+		})
+	}
+}
+
+func TestConvertGeminiRequestToAntigravity_PreservesExistingResponseSchema(t *testing.T) {
+	inputJSON := []byte(`{
+		"contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+		"generationConfig": {
+			"responseMimeType": "application/json",
+			"responseSchema": {
+				"type": "OBJECT",
+				"properties": {"name": {"type": "STRING"}},
+				"required": ["name"]
+			},
+			"responseJsonSchema": {
+				"type": "OBJECT",
+				"properties": {"stale": {"type": "STRING"}}
+			}
+		}
+	}`)
+	out := ConvertGeminiRequestToAntigravity("gemini-3-flash", inputJSON, false)
+
+	schema := gjson.GetBytes(out, "request.generationConfig.responseSchema")
+	if !schema.Exists() {
+		t.Fatalf("request.generationConfig.responseSchema missing. Output: %s", out)
+	}
+	if got := schema.Get("properties.name.type").String(); got != "STRING" {
+		t.Fatalf("responseSchema.properties.name.type = %q, want STRING. Output: %s", got, out)
+	}
+	if schema.Get("properties.stale").Exists() {
+		t.Fatalf("stale properties survived. Output: %s", out)
+	}
+	if gjson.GetBytes(out, "request.generationConfig.responseJsonSchema").Exists() {
+		t.Fatalf("request.generationConfig.responseJsonSchema should have been removed. Output: %s", out)
 	}
 }

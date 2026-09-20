@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/util"
 
 	"github.com/gin-gonic/gin"
 )
@@ -284,7 +285,7 @@ func TestAdminSettingContractValidation(t *testing.T) {
 		{name: "channel stats unknown", key: "channel_stats_range", value: "forever", wantCode: http.StatusBadRequest},
 		{name: "duration maximum", key: "stream_timeout", value: strconv.FormatInt(maxSettingDurationSeconds, 10), wantCode: http.StatusOK},
 		{name: "duration overflow", key: "stream_timeout", value: strconv.FormatInt(maxSettingDurationSeconds+1, 10), wantCode: http.StatusBadRequest},
-		{name: "channel interval overflow", key: "channel_check_interval_hours", value: strconv.FormatInt(maxSettingDurationHours+1, 10), wantCode: http.StatusBadRequest},
+		{name: "channel interval overflow", key: "model_catalog_sync_interval_hours", value: strconv.FormatInt(maxSettingDurationHours+1, 10), wantCode: http.StatusBadRequest},
 		{name: "auto update overflow", key: autoUpdateIntervalSettingKey, value: strconv.FormatInt(maxSettingDurationHours+1, 10), wantCode: http.StatusBadRequest},
 		{name: "websocket ttl default", key: responsesWebsocketSessionTTLSetting, value: "0", wantCode: http.StatusOK},
 		{name: "websocket ttl overflow", key: responsesWebsocketSessionTTLSetting, value: strconv.FormatInt(maxSettingDurationMinutes+1, 10), wantCode: http.StatusBadRequest},
@@ -328,6 +329,59 @@ func TestAdminSettingContractValidation(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+func TestAdminCustomPricingSettingHotReloadsAndResets(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	t.Cleanup(func() { _ = util.InstallCustomModelPricing(nil) })
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatalf("LoadDefaults failed: %v", err)
+	}
+	restarted := make(chan struct{}, 1)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+
+	value := `{"custom-admin-model":{"input_price":2,"output_price":4}}`
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelCustomPricingSettingKey, map[string]string{"value": value}))
+	c.Params = gin.Params{{Key: "key", Value: modelCustomPricingSettingKey}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "重启") {
+		t.Fatalf("hot pricing update status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := util.CalculateCostDetailed("custom-admin-model", 1_000_000, 0, 0, 0, 0); got != 2 {
+		t.Fatalf("hot pricing cost=%v, want 2", got)
+	}
+	persisted, err := store.GetSetting(context.Background(), modelCustomPricingSettingKey)
+	if err != nil || persisted.Value != value {
+		t.Fatalf("persisted custom pricing=%#v err=%v", persisted, err)
+	}
+	select {
+	case <-restarted:
+		t.Fatal("custom pricing update unexpectedly triggered restart")
+	default:
+	}
+
+	invalid := `{"custom-admin-model":{"unknown":1}}`
+	c, w = newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelCustomPricingSettingKey, map[string]string{"value": invalid}))
+	c.Params = gin.Params{{Key: "key", Value: modelCustomPricingSettingKey}}
+	server.AdminUpdateSetting(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid pricing status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := util.CalculateCostDetailed("custom-admin-model", 1_000_000, 0, 0, 0, 0); got != 2 {
+		t.Fatalf("invalid update changed runtime price=%v, want 2", got)
+	}
+
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/"+modelCustomPricingSettingKey+"/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: modelCustomPricingSettingKey}}
+	server.AdminResetSetting(c)
+	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), "重启") {
+		t.Fatalf("pricing reset status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := util.CalculateCostDetailed("custom-admin-model", 1_000_000, 0, 0, 0, 0); got != 0 {
+		t.Fatalf("reset custom pricing cost=%v, want 0", got)
 	}
 }
 
@@ -547,22 +601,22 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminGetSetting_returns_latest_db_value_before_restart", func(t *testing.T) {
-		if err := store.UpdateSetting(context.Background(), "channel_check_interval_hours", "1"); err != nil {
+		if err := store.UpdateSetting(context.Background(), "model_catalog_sync_interval_hours", "1"); err != nil {
 			t.Fatalf("failed to seed setting in db: %v", err)
 		}
 
-		seed, err := store.GetSetting(context.Background(), "channel_check_interval_hours")
+		seed, err := store.GetSetting(context.Background(), "model_catalog_sync_interval_hours")
 		if err != nil {
 			t.Fatalf("failed to read seeded setting: %v", err)
 		}
 		seed.Value = "1"
 
 		server.configService.mu.Lock()
-		server.configService.cache["channel_check_interval_hours"] = seed
+		server.configService.cache["model_catalog_sync_interval_hours"] = seed
 		server.configService.mu.Unlock()
 
-		updateCtx, updateW := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/channel_check_interval_hours", []byte(`{"value":"0"}`)))
-		updateCtx.Params = gin.Params{{Key: "key", Value: "channel_check_interval_hours"}}
+		updateCtx, updateW := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/model_catalog_sync_interval_hours", []byte(`{"value":"0"}`)))
+		updateCtx.Params = gin.Params{{Key: "key", Value: "model_catalog_sync_interval_hours"}}
 
 		server.AdminUpdateSetting(updateCtx)
 
@@ -576,8 +630,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 			t.Fatal("expected restart triggered")
 		}
 
-		getCtx, getW := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/channel_check_interval_hours", nil))
-		getCtx.Params = gin.Params{{Key: "key", Value: "channel_check_interval_hours"}}
+		getCtx, getW := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/model_catalog_sync_interval_hours", nil))
+		getCtx.Params = gin.Params{{Key: "key", Value: "model_catalog_sync_interval_hours"}}
 
 		server.AdminGetSetting(getCtx)
 

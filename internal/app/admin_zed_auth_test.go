@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -19,11 +20,40 @@ import (
 )
 
 func TestZedOAuthManagerCompletesNativeLogin(t *testing.T) {
+	testZedOAuthManagerCompletesNativeLogin(t, "9d4b8c17-12ae-4091-96bc-1a79ce2de601")
+}
+
+func TestZedOAuthManagerCompletesNativeLoginWithoutSystemID(t *testing.T) {
+	isolateZedSystemIDEnvironment(t)
+	testZedOAuthManagerCompletesNativeLogin(t, "")
+}
+
+// isolateZedSystemIDEnvironment 把 Zed system_id 的所有发现来源替换成空临时目录,
+// 同时 unset CCLOAD_ZED_SYSTEM_ID。t.Setenv 无法 unset,手搓 save/restore 是必要的。
+func isolateZedSystemIDEnvironment(t *testing.T) {
+	t.Helper()
+	// Isolate system identity discovery from the developer's local Zed database.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("LOCALAPPDATA", t.TempDir())
+	previousSystemID, hadSystemID := os.LookupEnv(zedauth.SystemIDEnv)
+	if err := os.Unsetenv(zedauth.SystemIDEnv); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if hadSystemID {
+			_ = os.Setenv(zedauth.SystemIDEnv, previousSystemID)
+		} else {
+			_ = os.Unsetenv(zedauth.SystemIDEnv)
+		}
+	})
+}
+
+func testZedOAuthManagerCompletesNativeLogin(t *testing.T, systemID string) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
-	const systemID = "9d4b8c17-12ae-4091-96bc-1a79ce2de601"
 	expiresAt := time.Now().Add(time.Hour).Unix()
-	jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, expiresAt))) + ".sig"
+	jwt := "e30." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, expiresAt)) + ".sig"
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/client/llm_tokens":
@@ -171,8 +201,8 @@ func TestZedRejectedOldTokenDoesNotRefreshNewWinner(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	expiresAt := time.Now().Add(time.Hour).Unix()
-	oldToken := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, expiresAt))) + ".old"
-	newToken := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, expiresAt))) + ".new"
+	oldToken := "e30." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, expiresAt)) + ".old"
+	newToken := "e30." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, expiresAt)) + ".new"
 	mintCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/client/llm_tokens" {

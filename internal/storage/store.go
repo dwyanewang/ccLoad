@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/util"
 )
 
@@ -18,6 +19,9 @@ type Store interface {
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
 	CompareAndSwapOAuthCredential(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
+	// CompareAndSwapOAuthUsage also reconciles changed cost windows with durable
+	// logs in the same transaction and returns the actually persisted counters.
+	CompareAndSwapOAuthUsage(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, *oauthcost.Usage, error)
 	CompareAndSwapChannelManagement(ctx context.Context, channelID int64, expectedEnvelope, nextEnvelope string) (bool, error)
 	ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error
 	DisableOAuthChannelIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string) (bool, error)
@@ -46,6 +50,7 @@ type Store interface {
 	CreateAPIKeysBatch(ctx context.Context, keys []*model.APIKey) error
 	UpdateAPIKeysStrategy(ctx context.Context, channelID int64, strategy string) error
 	UpdateAPIKeyNotes(ctx context.Context, channelID int64, notesByIndex map[int]string) error
+	UpdateAPIKeyPriorities(ctx context.Context, channelID int64, prioritiesByIndex map[int]int) error
 	UpdateAPIKeyCostMultipliers(ctx context.Context, channelID int64, multipliersByIndex map[int]float64) error
 	UpdateAPIKeyModelScopes(ctx context.Context, channelID int64, scopesByIndex map[int]model.APIKeyModelScope) error
 	SetAPIKeyDisabled(ctx context.Context, channelID int64, keyIndex int, disabled bool) error

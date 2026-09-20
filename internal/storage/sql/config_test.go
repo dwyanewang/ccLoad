@@ -31,7 +31,10 @@ func TestConfig_CreateAndGet(t *testing.T) {
 
 	// 创建渠道
 	cfg := &model.Config{
-		Name: "test-channel",
+		Name:                          `test-channel "with quotes"`,
+		ScheduledCheckEnabled:         true,
+		ScheduledCheckIntervalMinutes: 37,
+		ScheduledCheckStartTime:       "08:30",
 		URLs: model.ChannelURLs{
 			{URL: "https://api.openai.com", Protocols: []string{"openai", "codex"}},
 			{URL: "https://api.openai.com/v1/responses", Exact: true, Protocols: []string{"codex"}},
@@ -46,8 +49,8 @@ func TestConfig_CreateAndGet(t *testing.T) {
 		RPMLimit:                60,
 		MaxConcurrency:          3,
 		ModelEntries: []model.ModelEntry{
-			{Model: "gpt-4"},
-			{Model: "gpt-3.5-turbo"},
+			{Model: "model, with, commas"},
+			{Model: `model"with"quotes`},
 		},
 		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
 			Enabled: true, Name: "Rate limit", Priority: 0, StatusCodes: []int{429},
@@ -61,14 +64,17 @@ func TestConfig_CreateAndGet(t *testing.T) {
 	if created.ID == 0 {
 		t.Error("expected non-zero ID")
 	}
+	if created.ScheduledCheckIntervalMinutes != 37 || created.ScheduledCheckStartTime != "08:30" {
+		t.Fatalf("schedule not persisted: %+v", created)
+	}
 
 	// 获取渠道
 	got, err := store.GetConfig(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("get config: %v", err)
 	}
-	if got.Name != "test-channel" {
-		t.Errorf("name: got %q, want %q", got.Name, "test-channel")
+	if got.Name != cfg.Name {
+		t.Errorf("name: got %q, want %q", got.Name, cfg.Name)
 	}
 	if urls := got.GetURLs(); len(urls) != 2 || urls[0] != "https://api.openai.com" || urls[1] != "https://api.openai.com/v1/responses#" {
 		t.Errorf("urls: got %v", urls)
@@ -100,8 +106,13 @@ func TestConfig_CreateAndGet(t *testing.T) {
 	if got.MaxConcurrency != 3 {
 		t.Errorf("max_concurrency: got %d, want 3", got.MaxConcurrency)
 	}
-	if len(got.ModelEntries) != 2 {
-		t.Errorf("model entries count: got %d, want 2", len(got.ModelEntries))
+	if len(got.ModelEntries) != len(cfg.ModelEntries) {
+		t.Fatalf("model entries count: got %d, want %d", len(got.ModelEntries), len(cfg.ModelEntries))
+	}
+	for i, entry := range got.ModelEntries {
+		if entry.Model != cfg.ModelEntries[i].Model {
+			t.Errorf("model entry %d: got %q, want %q", i, entry.Model, cfg.ModelEntries[i].Model)
+		}
 	}
 	if got.CooldownDetectionRules == nil || len(got.CooldownDetectionRules.Rules) != 1 {
 		t.Fatalf("cooldown detection rules = %#v, want one persisted rule", got.CooldownDetectionRules)

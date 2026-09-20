@@ -108,6 +108,9 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("CreateAPIKeysBatch: %v", err)
 	}
+	if err := hybrid.UpdateAPIKeyPriorities(ctx, created.ID, map[int]int{0: -9}); err != nil {
+		t.Fatal(err)
+	}
 	if err := hybrid.SetAPIKeyDisabled(ctx, created.ID, 0, true); err != nil {
 		t.Fatalf("SetAPIKeyDisabled: %v", err)
 	}
@@ -130,7 +133,7 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 		// The model cooldown replicates as its own queued entity, so waiting on
 		// the channel state alone can observe a queue that is still draining.
 		return cfgErr == nil && cfg.Name == "final" &&
-			keysErr == nil && len(keys) == 1 && keys[0].Disabled &&
+			keysErr == nil && len(keys) == 1 && keys[0].Disabled && keys[0].Priority == -9 &&
 			disabledErr == nil && len(disabled[created.ID]) == 1 &&
 			hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
@@ -210,9 +213,37 @@ func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing
 	if cost, ok := readCost(sqlite); !ok || cost != 2_250_000 {
 		t.Fatalf("SQLite quota cost = (%d, %t), want 2250000", cost, ok)
 	}
+	cfg, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetAt := now.Add(2 * 24 * time.Hour)
+	credential.QuotaCostUsage = oauthcost.Reconcile(credential.QuotaCostUsage, []oauthcost.Sample{{
+		Key: "codex|secondary", WindowSeconds: 604800, ResetAt: resetAt,
+	}}, now)
+	payload, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, costs, err := hybrid.CompareAndSwapOAuthUsage(ctx, created.ID, model.AuthTypeCodexOAuth, cfg.OAuthCredential, payload)
+	if err != nil || !updated || oauthcost.Find(costs, "codex|secondary").StandardCostMicroUSD != 2_250_000 {
+		t.Fatalf("quota window reconciliation = %t, %+v, %v", updated, costs, err)
+	}
 	waitForCondition(t, 3*time.Second, func() bool {
 		cost, ok := readCost(primary)
 		if !ok || cost != 2_250_000 {
+			return false
+		}
+		cfg, getErr := primary.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			return false
+		}
+		credential, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil || oauthcost.Find(credential.QuotaCostUsage, "codex|secondary").ResetAt != resetAt.Unix() {
 			return false
 		}
 		logs, listErr := primary.ListLogs(ctx, now.Add(-time.Minute), 10, 0, nil)

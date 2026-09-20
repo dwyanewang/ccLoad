@@ -39,6 +39,7 @@ type testAgentHandler struct {
 	deleteRelease chan struct{}
 	getRunStarted chan struct{}
 	getRunRelease chan struct{}
+	getRunStopped chan struct{}
 }
 
 type testCursorHandler struct {
@@ -175,7 +176,11 @@ func (h *testAgentHandler) GetRun(
 	snapshot := h.runSnapshot
 	started := h.getRunStarted
 	release := h.getRunRelease
+	stopped := h.getRunStopped
 	h.mu.Unlock()
+	if stopped != nil {
+		defer close(stopped)
+	}
 	if started != nil {
 		close(started)
 	}
@@ -230,7 +235,7 @@ func TestSDKRunnerStartMakesBridgeReadyWithoutModelRequest(t *testing.T) {
 	}
 }
 
-func TestSDKRunnerCreateAgentLocalDeadlineNamesOperationAndProxyDiagnostic(t *testing.T) {
+func TestSDKRunnerCreateAgentDeadlineNamesOperationAndProxyDiagnostic(t *testing.T) {
 	for _, key := range []string{
 		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 		"http_proxy", "https_proxy", "all_proxy",
@@ -249,11 +254,19 @@ func TestSDKRunnerCreateAgentLocalDeadlineNamesOperationAndProxyDiagnostic(t *te
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
-	if err == nil || !strings.Contains(err.Error(), "CreateAgent exceeded its local deadline after") ||
-		!strings.Contains(err.Error(), "operation limit=30s") ||
+	if err == nil ||
+		(!strings.Contains(err.Error(), "CreateAgent exceeded its local deadline after") &&
+			!strings.Contains(err.Error(), "CreateAgent returned deadline_exceeded after")) ||
 		!strings.Contains(err.Error(), "inherited HTTP_PROXY/HTTPS_PROXY/ALL_PROXY") ||
 		!strings.Contains(err.Error(), "returned no detail beyond deadline_exceeded") {
 		t.Fatalf("Run() error = %v", err)
+	}
+	if strings.Contains(err.Error(), "CreateAgent exceeded its local deadline after") {
+		if !strings.Contains(err.Error(), "operation limit=30s") {
+			t.Fatalf("local deadline diagnostic omitted operation limit: %v", err)
+		}
+	} else if strings.Contains(err.Error(), "operation limit=") {
+		t.Fatalf("remote deadline diagnostic claimed a local operation limit: %v", err)
 	}
 	if strings.Contains(err.Error(), "user:secret") || strings.Contains(err.Error(), "proxy.example") {
 		t.Fatalf("Run() leaked proxy value: %v", err)
@@ -900,7 +913,8 @@ func TestSDKRunnerSendFailureReturnsBeforeAgentCleanup(t *testing.T) {
 func TestSDKRunnerCallerCancellationInterruptsUsageFallback(t *testing.T) {
 	getRunStarted := make(chan struct{})
 	getRunRelease := make(chan struct{})
-	handler := &testAgentHandler{getRunStarted: getRunStarted, getRunRelease: getRunRelease}
+	getRunStopped := make(chan struct{})
+	handler := &testAgentHandler{getRunStarted: getRunStarted, getRunRelease: getRunRelease, getRunStopped: getRunStopped}
 	handler.sendFn = func(_ context.Context, stream *connect.ServerStream[sdkv1.RunStreamMessage]) error {
 		if err := stream.Send(runResult("agent-1", "run-1", sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_FINISHED, "done")); err != nil {
 			return err
@@ -908,7 +922,9 @@ func TestSDKRunnerCallerCancellationInterruptsUsageFallback(t *testing.T) {
 		return stream.Send(runDone("agent-1", "run-1"))
 	}
 	runner := newTestSDKRunner(t, handler)
+	t.Cleanup(func() { close(getRunRelease) })
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	events, err := runner.Run(ctx, &Credential{APIKey: "key-1"}, Request{Model: "model-1", Prompt: "hello"})
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -929,6 +945,11 @@ func TestSDKRunnerCallerCancellationInterruptsUsageFallback(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("GetRun fallback ignored caller cancellation")
+	}
+	select {
+	case <-getRunStopped:
+	case <-time.After(time.Second):
+		t.Fatal("GetRun RPC kept running after caller cancellation")
 	}
 }
 
@@ -1047,6 +1068,19 @@ func TestSDKRunStateRequiresTerminalSequenceAndRejectsDivergence(t *testing.T) {
 	}
 	if err := state.finalError(nil); err == nil || !strings.Contains(err.Error(), "before done") {
 		t.Fatalf("missing done error = %v", err)
+	}
+}
+
+func TestSDKRunStateEmitsPingForRunningStatus(t *testing.T) {
+	state := &sdkRunState{agentID: "agent-1"}
+	events, err := state.consume(sdkMessage(t, "status", map[string]any{
+		"agent_id": "agent-1", "run_id": "run-1", "status": "RUNNING", "offset": float64(1),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || !events[0].Ping || events[0].Delta != "" || events[0].Done || events[0].Err != nil {
+		t.Fatalf("running status events = %#v", events)
 	}
 }
 

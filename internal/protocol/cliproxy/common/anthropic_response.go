@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 const maxAnthropicResponseSize = 50 * 1024 * 1024
@@ -22,14 +24,17 @@ func NormalizeAnthropicResponse(raw []byte) ([]byte, error) {
 	}
 
 	if json.Valid(raw) {
-		message, err := decodeJSONObject(raw)
+		message, err := decodeValidatedJSONObject(raw)
 		if err != nil {
 			return nil, err
 		}
 		if err := validateAnthropicMessage(message); err != nil {
 			return nil, err
 		}
-		return json.Marshal(message)
+		// Validation must not turn the original response object into a map and
+		// marshal it again: that needlessly reorders its fields. The translators
+		// consume the validated JSON directly and preserve its raw members.
+		return raw, nil
 	}
 
 	payloads, err := anthropicSSEPayloads(raw)
@@ -46,17 +51,63 @@ func NormalizeAnthropicResponse(raw []byte) ([]byte, error) {
 	return json.Marshal(message)
 }
 
+// decodeJSONObject decodes upstream-produced JSON leniently. Duplicate members
+// resolve to the first one, matching the gjson readers used by the translators.
+// Trailing data is still rejected — that is malformed framing, not a quirk.
 func decodeJSONObject(raw []byte) (map[string]any, error) {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value map[string]any
-	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("decode anthropic response: %w", err)
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("decode anthropic response: invalid JSON")
 	}
-	if value == nil {
+	return decodeValidatedJSONObject(raw)
+}
+
+// decodeValidatedJSONObject is decodeJSONObject for callers that already ran
+// json.Valid on the same bytes. gjson.ParseBytes does not report syntax errors,
+// so the guard cannot be dropped outright — but it also must not run twice on a
+// 50 MiB response just because the caller was thorough.
+func decodeValidatedJSONObject(raw []byte) (map[string]any, error) {
+	root := gjson.ParseBytes(raw)
+	if !root.IsObject() {
 		return nil, fmt.Errorf("anthropic response must be an object")
 	}
-	return value, nil
+	return jsonObjectFirstWins(root), nil
+}
+
+func jsonObjectFirstWins(value gjson.Result) map[string]any {
+	object := make(map[string]any)
+	value.ForEach(func(key, member gjson.Result) bool {
+		if _, exists := object[key.String()]; !exists {
+			object[key.String()] = jsonValueFirstWins(member)
+		}
+		return true
+	})
+	return object
+}
+
+func jsonValueFirstWins(value gjson.Result) any {
+	switch {
+	case value.IsObject():
+		return jsonObjectFirstWins(value)
+	case value.IsArray():
+		items := value.Array()
+		array := make([]any, 0, len(items))
+		for _, item := range items {
+			array = append(array, jsonValueFirstWins(item))
+		}
+		return array
+	}
+	switch value.Type {
+	case gjson.String:
+		return value.String()
+	case gjson.Number:
+		return json.Number(value.Raw)
+	case gjson.True:
+		return true
+	case gjson.False:
+		return false
+	default:
+		return nil
+	}
 }
 
 func validateAnthropicMessage(message map[string]any) error {
@@ -138,7 +189,7 @@ func aggregateAnthropicSSE(payloads [][]byte) (map[string]any, error) {
 		if !json.Valid(payload) {
 			return nil, fmt.Errorf("invalid anthropic SSE data: %s", strings.TrimSpace(string(payload)))
 		}
-		event, err := decodeJSONObject(payload)
+		event, err := decodeValidatedJSONObject(payload)
 		if err != nil {
 			return nil, err
 		}

@@ -8,6 +8,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
@@ -26,10 +27,6 @@ type channelEditorModelStats struct {
 type channelEditorURLStats struct {
 	Available bool      `json:"available"`
 	Items     []URLStat `json:"items"`
-}
-
-type channelEditorFeatures struct {
-	ScheduledCheckEnabled bool `json:"scheduled_check_enabled"`
 }
 
 // channelManagementEditorView is returned only by the authenticated channel
@@ -52,7 +49,6 @@ type channelEditorData struct {
 	OAuthCredentialInfo *codexauth.IDTokenInfo       `json:"oauth_credential_info,omitempty"`
 	ModelStats          channelEditorModelStats      `json:"model_stats"`
 	URLStats            channelEditorURLStats        `json:"url_stats"`
-	Features            channelEditorFeatures        `json:"features"`
 }
 
 // HandleChannelEditor 聚合编辑器首次打开所需的数据，避免前端拼装多个快照。
@@ -118,6 +114,12 @@ func (s *Server) HandleChannelEditor(c *gin.Context) {
 			return
 		}
 		oauthCredential = append(json.RawMessage(nil), cfg.OAuthCredential...)
+	} else if cfg.UsesCodeBuddyOAuth() {
+		if _, parseErr := codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential)); parseErr != nil {
+			RespondError(c, http.StatusInternalServerError, parseErr)
+			return
+		}
+		oauthCredential = append(json.RawMessage(nil), cfg.OAuthCredential...)
 	} else if cfg.UsesZedOAuth() {
 		_, parseErr := zedauth.ParseCredential([]byte(cfg.OAuthCredential))
 		if parseErr != nil {
@@ -170,14 +172,6 @@ func (s *Server) HandleChannelEditor(c *gin.Context) {
 		}
 	}
 
-	scheduledCheckEnabled := false
-	if s.configService != nil {
-		hours := normalizeChannelCheckIntervalHours(
-			s.configService.GetFloat("channel_check_interval_hours", defaultChannelCheckIntervalHours),
-		)
-		scheduledCheckEnabled = hours > 0
-	}
-
 	RespondJSON(c, http.StatusOK, channelEditorData{
 		Channel:             detail,
 		Keys:                apiKeys,
@@ -186,8 +180,5 @@ func (s *Server) HandleChannelEditor(c *gin.Context) {
 		OAuthCredentialInfo: oauthCredentialInfo,
 		ModelStats:          modelStats,
 		URLStats:            urlStats,
-		Features: channelEditorFeatures{
-			ScheduledCheckEnabled: scheduledCheckEnabled,
-		},
 	})
 }

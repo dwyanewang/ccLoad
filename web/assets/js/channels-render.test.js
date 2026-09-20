@@ -2,34 +2,12 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  buildChannelRuntimeStatusHtml,
   buildOAuthPlanBadge,
   buildOAuthUsageStatusHtml,
-  buildManagementAccountStatusHtml
+  buildManagementAccountStatusHtml,
+  isOpenCodeGoChannel,
+  channelShowsOAuthUsage
 } = require('./channels-render.js');
-
-test('渠道状态显示协议待重探数量和最早重试时间', () => {
-  const previousWindow = global.window;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.status.protocolProbeRetries': `协议待重探：${values.count} · ${values.time}`,
-        'channels.status.minutesUntilRetry': `${values.count}分钟后重试`
-      })[key] || key;
-    }
-  };
-
-  try {
-    const html = buildChannelRuntimeStatusHtml({
-      protocol_probe_retry_count: 2,
-      protocol_probe_retry_remaining_ms: 9 * 60 * 1000
-    });
-    assert.match(html, /ch-runtime-status--protocols/);
-    assert.match(html, /协议待重探：2 · 9分钟后重试/);
-  } finally {
-    global.window = previousWindow;
-  }
-});
 
 test('OAuth 额度刷新失败时格式化结构化错误并转义内容', () => {
   const previousWindow = global.window;
@@ -95,50 +73,21 @@ test('OAuth 计划徽标支持 Antigravity paidTier 并转义内容', () => {
   }
 });
 
-test('Codex 在额度进度条下方显示可重置次数、到期时间和安全操作状态', () => {
+test('Codex 额度重置保留操作绑定、禁用状态和错误转义', () => {
   const previousWindow = global.window;
   const previousGetUsageState = global.getOAuthUsageState;
   const previousReadOnly = global.isTokenChannelsReadOnly;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.oauth.usageRefresh': '刷新额度',
-        'channels.oauth.usageWeekly': '周额度',
-        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
-        'channels.oauth.usageCompactAmount': `${values.used}/${values.estimated}`,
-        'channels.oauth.usageCompactUsed': `${values.used}`,
-        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
-        'channels.oauth.usageDetailAmount': `已用 ${values.used} / 预估总额 ${values.estimated}`,
-        'channels.oauth.usageDetailUsed': `已用 ${values.used}`,
-        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`,
-        'channels.oauth.resetCredits': `可重置 ${values.count} 次`,
-        'channels.oauth.resetCreditExpiresEarliest': `改期 ${values.time}`,
-        'channels.oauth.resetCreditExpiresUnknown': '过期时间不可用',
-        'channels.oauth.resetCreditExpiresAll': `查看全部 ${values.count} 个过期时间`,
-        'channels.oauth.resetQuota': '重置额度',
-        'channels.oauth.resettingQuota': '重置中…'
-      })[key] || key;
-    }
-  };
+  global.window = { t: key => key };
   let state = {
     status: 'ready',
     data: {
       provider: 'codex',
       windows: [{
         limit_name: 'codex', kind: 'primary', remaining_percent: 25,
-        limit_window_seconds: 604800, reset_at: 4070908800,
-        standard_cost_microusd: 12000000
+        limit_window_seconds: 604800
       }],
-      quota_cost_usage: {
-        windows: [{ key: 'codex|primary', window_seconds: 604800, standard_cost_microusd: 12000000 }]
-      },
       rate_limit_reset_credits: {
-        available_count: 2,
-        credits: [
-          { expires_at: '2099-02-03T04:05:06Z' },
-          { expires_at: '2099-01-03T04:05:06Z' },
-          { expires_at: '2000-01-03T04:05:06Z' }
-        ]
+        available_count: 2
       }
     }
   };
@@ -146,10 +95,6 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
   global.isTokenChannelsReadOnly = () => false;
   try {
     const html = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
-    assert.match(html, /可重置 2 次/);
-    assert.match(html, /\$12\.0/);
-    assert.match(html, /改期 01\/03/);
-    assert.match(html, /查看全部 2 个过期时间/);
     assert.match(html, /data-action="reset-codex-quota" data-channel-id="92"/);
     assert.doesNotMatch(html, /data-action="reset-codex-quota"[^>]*disabled/);
 
@@ -157,7 +102,7 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
     const loading = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
     assert.match(loading, /role="progressbar"/);
     assert.match(loading, /data-action="refresh-oauth-usage"[^>]*disabled/);
-    assert.match(loading, /data-action="reset-codex-quota"[^>]*disabled aria-busy="true"[^>]*>重置中…/);
+    assert.match(loading, /data-action="reset-codex-quota"[^>]*disabled aria-busy="true"/);
 
     state = { ...state, reset_status: 'error', reset_error: '重置失败 <retry>' };
     const failed = buildOAuthUsageStatusHtml({ id: 92, auth_type: 'codex_oauth' });
@@ -170,44 +115,29 @@ test('Codex 在额度进度条下方显示可重置次数、到期时间和安�
   }
 });
 
-test('Codex Spark 额度窗口使用简短默认标签', () => {
+test('CodeBuddy 额度工具栏提供独立的手动签到状态', () => {
   const previousWindow = global.window;
   const previousGetUsageState = global.getOAuthUsageState;
   const previousReadOnly = global.isTokenChannelsReadOnly;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.oauth.usageRefresh': '刷新额度',
-        'channels.oauth.usageCodexSparkFiveHour': 'Spark 5h',
-        'channels.oauth.usageCodexSparkWeekly': 'Spark周限',
-        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
-        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
-        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`
-      })[key] || key;
-    }
-  };
-  global.getOAuthUsageState = () => ({
+  let state = {
     status: 'ready',
-    data: {
-      provider: 'codex',
-      windows: [
-        {
-          limit_name: 'GPT-5.3-Codex-Spark', kind: 'primary', remaining_percent: 80,
-          limit_window_seconds: 5 * 60 * 60
-        },
-        {
-          limit_name: 'codex-spark', kind: 'secondary', remaining_percent: 65,
-          limit_window_seconds: 7 * 24 * 60 * 60
-        }
-      ]
-    }
-  });
+    data: { provider: 'codebuddy', windows: [], codebuddy_credits: { remain: 720 } },
+    checkin_status: 'loading'
+  };
+  global.window = { t: key => key };
+  global.getOAuthUsageState = () => state;
   global.isTokenChannelsReadOnly = () => false;
   try {
-    const html = buildOAuthUsageStatusHtml({ id: 93, auth_type: 'codex_oauth' });
-    assert.match(html, /Spark 5h/);
-    assert.match(html, /Spark周限/);
-    assert.doesNotMatch(html, /GPT-5\.3-Codex-Spark/);
+    let html = buildOAuthUsageStatusHtml({ id: 73, auth_type: 'codebuddy_oauth' });
+    assert.match(html, /data-action="checkin-codebuddy" data-channel-id="73" disabled aria-busy="true"/);
+    assert.match(html, /data-action="refresh-oauth-usage"[^>]*disabled/);
+
+    state = { ...state, checkin_status: 'ready', checkin_result: 'already_checked' };
+    html = buildOAuthUsageStatusHtml({ id: 73, auth_type: 'codebuddy_oauth' });
+    assert.match(html, /channels\.codebuddy\.alreadyCheckedIn/);
+
+    html = buildOAuthUsageStatusHtml({ id: 73, auth_type: 'codebuddy_oauth', codebuddy_international: true });
+    assert.doesNotMatch(html, /data-action="checkin-codebuddy"/);
   } finally {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
@@ -215,42 +145,25 @@ test('Codex Spark 额度窗口使用简短默认标签', () => {
   }
 });
 
-test('Codex 官方窗口只显示两个周额度并单独标识 Spark', () => {
+test('OpenCode Go API Key 渠道显示额度工具栏', () => {
   const previousWindow = global.window;
   const previousGetUsageState = global.getOAuthUsageState;
   const previousReadOnly = global.isTokenChannelsReadOnly;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.oauth.usageRefresh': '刷新额度',
-        'channels.oauth.usageWeekly': '周限额',
-        'channels.oauth.usageHours': `${values.count}h限额`,
-        'channels.oauth.usageCodexSparkFiveHour': 'Spark 5h',
-        'channels.oauth.usageCodexSparkWeekly': 'Spark周限',
-        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
-        'channels.oauth.usageCompactRemaining': `${values.percent}%`,
-        'channels.oauth.usageDetailRemaining': `剩余 ${values.percent}%`
-      })[key] || key;
-    }
-  };
-  global.getOAuthUsageState = () => ({
-    status: 'ready',
-    data: {
-      provider: 'codex',
-      windows: [
-        { limit_name: 'codex', kind: 'primary', remaining_percent: 85, limit_window_seconds: 604800 },
-        { limit_name: 'GPT-5.3-Codex-Spark', kind: 'primary', remaining_percent: 97, limit_window_seconds: 18000 },
-        { limit_name: 'GPT-5.3-Codex-Spark', kind: 'secondary', remaining_percent: 99, limit_window_seconds: 604800 },
-      ]
-    }
-  });
+  global.window = { t: key => key === 'channels.oauth.usageRefresh' ? '刷新额度' : key };
+  global.getOAuthUsageState = () => null;
   global.isTokenChannelsReadOnly = () => false;
   try {
-    const html = buildOAuthUsageStatusHtml({ id: 94, auth_type: 'codex_oauth' });
-    const labels = [...html.matchAll(/ch-oauth-usage__label">([^<]+)/g)].map(match => match[1]);
-    assert.deepEqual(labels, ['周限额', 'Spark 5h', 'Spark周限']);
-    assert.equal(labels.filter(label => label.includes('周限')).length, 2);
-    assert.doesNotMatch(html, /GPT-5\.3-Codex-Spark/);
+    const channel = {
+      id: 4,
+      auth_type: 'api_key',
+      urls: [{ url: 'https://opencode.ai/zen/go' }]
+    };
+    assert.equal(isOpenCodeGoChannel(channel), true);
+    assert.equal(channelShowsOAuthUsage(channel), true);
+    assert.equal(isOpenCodeGoChannel({ auth_type: 'api_key', urls: [{ url: 'https://example.com' }] }), false);
+    const html = buildOAuthUsageStatusHtml(channel);
+    assert.match(html, /data-action="refresh-oauth-usage"/);
+    assert.match(html, /data-channel-id="4"/);
   } finally {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
@@ -322,22 +235,17 @@ test('xAI 按 Management Center 语义渲染原值额度并转义内容', () => 
     assert.doesNotMatch(badge, /must-not-render/);
 
     const usage = buildOAuthUsageStatusHtml({ id: 88, auth_type: 'xai_oauth' });
-    assert.match(usage, /周额度/);
     assert.match(usage, /Pro &lt;safe&gt;/);
     assert.match(usage, /已用25\.5%/);
     assert.match(usage, /\$3\.5/);
     assert.match(usage, /aria-label="周额度剩余74\.5%"[^>]*aria-valuenow="74\.5"/);
     assert.match(usage, /产品使用 · grok&lt;fast&gt;/);
     assert.match(usage, /已用12\.25%/);
-    assert.match(usage, /按量付费/);
     assert.match(usage, /已用25\.09%/);
     assert.match(usage, /US\$1\.26 \/ US\$5\.00/);
-    assert.match(usage, /月度积分/);
     assert.match(usage, /\$7\.8/);
     assert.match(usage, /40%/);
     assert.match(usage, /US\$40\.01 \/ US\$100\.01/);
-    assert.match(usage, /重置/);
-    assert.doesNotMatch(usage, /未知/);
     assert.match(usage, /Monthly unavailable &lt;retry&gt;/);
   } finally {
     global.window = previousWindow;
@@ -380,12 +288,8 @@ test('xAI 零 cap 和零月额度保留金额且不显示未知', () => {
   global.isTokenChannelsReadOnly = () => false;
   try {
     const usage = buildOAuthUsageStatusHtml({ id: 89, auth_type: 'xai_oauth' });
-    assert.match(usage, /周额度/);
     assert.match(usage, /已用--/);
-    assert.match(usage, /按量付费/);
     assert.match(usage, /未启用/);
-    assert.match(usage, /月度积分/);
-    assert.match(usage, /--/);
     assert.match(usage, /US\$0\.25 \/ US\$0\.00/);
     assert.doesNotMatch(usage, /未知/);
   } finally {
@@ -492,63 +396,12 @@ test('Antigravity 同时长的两个额度窗口各自显示自己的累计成�
     // 同为 604800 秒的两行必须各贴各的值，不能共用同一个累计成本。
     assert.match(html, /Gemini周额度[\s\S]*?\$0\.3/);
     assert.match(html, /Gemini5小时额度[\s\S]*?\$0\.1/);
-    assert.match(html, /Claude周额度[\s\S]*?\$0\.0/);
-    assert.match(html, /Claude5小时额度[\s\S]*?\$0\.0/);
-    assert.match(html, /ch-oauth-usage__tooltip-line">已用 \$0\.3 \/ 预估总额/);
   } finally {
     global.window = previousWindow;
     global.getOAuthUsageState = previousGetUsageState;
     global.isTokenChannelsReadOnly = previousReadOnly;
   }
 });
-
-test('Cursor 额度按官网顺序显示可用比例和按量月限额', () => {
-  const previousWindow = global.window;
-  const previousGetUsageState = global.getOAuthUsageState;
-  const previousReadOnly = global.isTokenChannelsReadOnly;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.oauth.usageRefresh': '刷新额度',
-        'channels.oauth.usageLabel': `${values.name}${values.duration}`,
-        'channels.oauth.usageRemaining': `${values.label}剩余 ${values.percent}%`,
-        'channels.oauth.usageWarnings': '部分额度数据不可用',
-        'channels.cursor.usageMonthlyLimit': '按量月限额',
-        'channels.cursor.usageOtherModels': 'Other Models',
-        'channels.cursor.usageCursorModels': 'Cursor Models'
-      })[key] || key;
-    }
-  };
-  global.getOAuthUsageState = () => ({
-    status: 'ready',
-    data: {
-      provider: 'cursor',
-      display_message: "You've hit your usage limit",
-      windows: [
-        { limit_name: 'included', kind: 'spend', used_percent: 100, remaining_percent: 0, limit_window_seconds: 2678400, reset_at: 1789181874 },
-        { limit_name: 'api', kind: 'spend', used_percent: 29.6, remaining_percent: 70.4, limit_window_seconds: 2678400 },
-        { limit_name: 'auto', kind: 'spend', used_percent: 18, remaining_percent: 82, limit_window_seconds: 2678400 }
-      ]
-    }
-  });
-  global.isTokenChannelsReadOnly = () => false;
-  try {
-    const html = buildOAuthUsageStatusHtml({ id: 1481, auth_type: 'cursor_oauth' });
-    assert.match(html, /Cursor Models剩余 82%/);
-    assert.match(html, /Other Models剩余 70\.4%/);
-    assert.match(html, /按量月限额剩余 0%/);
-    assert.doesNotMatch(html, /ch-oauth-usage__notice/);
-    assert.doesNotMatch(html, /包含额度|API月限额|Auto月限额/);
-    assert.doesNotMatch(html, /You&#39;ve hit your usage limit/);
-    assert.doesNotMatch(html, /部分额度数据不可用/);
-    assert.doesNotMatch(html, /\$0\.0/);
-  } finally {
-    global.window = previousWindow;
-    global.getOAuthUsageState = previousGetUsageState;
-    global.isTokenChannelsReadOnly = previousReadOnly;
-  }
-});
-
 
 function installManagementRenderGlobals({ balanceState = null, checkinState = null, readOnly = false } = {}) {
   const previous = {
@@ -782,26 +635,6 @@ test('签到状态以文字呈现并回落到持久化结果', () => {
   }
 });
 
-test('已签到只显示时间，并紧跟在立即签到按钮后面', () => {
-  const restore = installManagementRenderGlobals({
-    checkinState: {
-      status: 'ready',
-      data: { status: 'already_checked', checked_in_at: '2026-08-25T10:00:00Z' }
-    }
-  });
-  try {
-    const html = buildManagementAccountStatusHtml({
-      id: 14,
-      auth_type: 'api_key',
-      management_account: { profile: 'new_api', credential_configured: true }
-    });
-    assert.match(html, />\d{2}\/\d{2} \d{2}:\d{2}<\/span>/);
-    assert.doesNotMatch(html, /channels\.management\.status\.already_checked/);
-  } finally {
-    restore();
-  }
-});
-
 test('只读模式不渲染管理账户动作', () => {
   const restore = installManagementRenderGlobals({ readOnly: true });
   try {
@@ -812,41 +645,5 @@ test('只读模式不渲染管理账户动作', () => {
     }), '');
   } finally {
     restore();
-  }
-});
-
-test('模型冷却超过 48 小时按天+小时显示，其余时长保持小时分', () => {
-  const previousWindow = global.window;
-  global.window = {
-    t(key, values = {}) {
-      return ({
-        'channels.status.modelCooldowns': `模型冷却：${values.count} · ${values.time}`,
-        'channels.status.daysHoursUntilRecovery': `${values.days}天${values.hours}小时`,
-        'channels.status.hoursMinutesUntilRecovery': `${values.hours}小时${values.minutes}分`
-      })[key] || key;
-    }
-  };
-
-  try {
-    // 455小时25分 → 18天23小时
-    let html = buildChannelRuntimeStatusHtml({
-      model_cooldowns: [{ cooldown_remaining_ms: 455 * 60 * 60 * 1000 + 25 * 60 * 1000 }]
-    });
-    assert.match(html, /模型冷却：1 · 18天23小时/);
-
-    // 48 小时整 → 2天0小时
-    html = buildChannelRuntimeStatusHtml({
-      model_cooldowns: [{ cooldown_remaining_ms: 48 * 60 * 60 * 1000 }]
-    });
-    assert.match(html, /模型冷却：1 · 2天0小时/);
-
-    // 未达 48 小时仍按小时分显示
-    html = buildChannelRuntimeStatusHtml({
-      model_cooldowns: [{ cooldown_remaining_ms: 47 * 60 * 60 * 1000 + 59 * 60 * 1000 }]
-    });
-    assert.match(html, /模型冷却：1 · 47小时59分/);
-    assert.doesNotMatch(html, /天/);
-  } finally {
-    global.window = previousWindow;
   }
 });

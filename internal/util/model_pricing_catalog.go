@@ -3,6 +3,7 @@ package util
 import (
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -18,6 +19,15 @@ type ModelPricing struct {
 	CacheReadPrice     float64 // 显式缓存读取价格（$/1M tokens）
 	CacheReadPriceHigh float64 // 高上下文显式缓存读取价格（$/1M tokens）
 	HasCacheReadPrice  bool    // 是否使用显式缓存读取价格；false 时按模型系列倍率回退计算
+	// HasCacheReadPriceHigh 区分高上下文缓存读取价「未配置」与「显式为 0」。
+	HasCacheReadPriceHigh bool
+	CacheWritePrice       float64 // 显式 5 分钟缓存创建价格（$/1M tokens）
+	// 高上下文（超过长上下文阈值）缓存创建价格（$/1M tokens）。
+	// HasCacheWritePriceHigh=false 时沿用基础缓存创建价，1 小时档恒为「生效输入价 × 2」。
+	CacheWritePriceHigh float64
+	HasCacheWritePrice  bool // 是否使用显式 5 分钟缓存创建价格；false 时按缓存时长倍率回退计算
+	// HasCacheWritePriceHigh 区分高上下文缓存创建价「未配置」与「显式为 0」。
+	HasCacheWritePriceHigh bool
 
 	// 缓存读取 token 是否参与高/低档选择。
 	// OpenAI context tiers、MiMo / Grok 等系列按「input + cache_read」总量分档，需置 true；
@@ -25,13 +35,19 @@ type ModelPricing struct {
 	CacheReadCountsTowardTier bool
 
 	// 长上下文定价（>200k tokens，Claude/Gemini/xAI）
-	// 如果为0，表示无分段定价，使用InputPrice/OutputPrice
-	InputPriceHigh  float64 // 高上下文输入价格（$/1M tokens, >200k context）
-	OutputPriceHigh float64 // 高上下文输出价格（$/1M tokens, >200k context）
+	// 正数或 HasInputPriceHigh=true 时启用分档，允许显式配置免费输入。
+	InputPriceHigh    float64 // 高上下文输入价格（$/1M tokens, >200k context）
+	OutputPriceHigh   float64 // 高上下文输出价格（$/1M tokens, >200k context）
+	HasInputPriceHigh bool    // 区分高上下文输入价未配置与显式为 0
 
 	// 固定按次计费（图像生成等非token计费模型）
 	// 如果 > 0，当token成本为0时使用此值作为每次请求成本
 	FixedCostPerRequest float64
+
+	// Responses image_generation 工具的 token 单价和按质量/尺寸的 fallback 费用。
+	// 这些字段只在对应模型实际使用图像工具时参与计费，只由系统目录维护。
+	ImageGeneration         *ImageGenerationPricing
+	ImageGenerationFallback ImageGenerationFallbackPricing
 }
 
 // TokenPricingTier 按输入 token 数选择整次请求的 token 单价。
@@ -44,20 +60,19 @@ type TokenPricingTier struct {
 	HasCacheReadPrice bool
 }
 
+// ImageGenerationPricing 是 Responses image_generation 工具的 token 单价。
+type ImageGenerationPricing struct {
+	TextInputPrice   float64
+	TextCachedPrice  float64
+	ImageInputPrice  float64
+	ImageCachedPrice float64
+	ImageOutputPrice float64
+}
+
+// ImageGenerationFallbackPricing 是按质量和尺寸索引的固定图像费用（$/image）。
+type ImageGenerationFallbackPricing map[string]map[string]float64
+
 var (
-	gpt56SolTiers = []TokenPricingTier{
-		{MaxInputTokens: 272_000, InputPrice: 5.00, OutputPrice: 30.00, CacheReadPrice: 0.50, HasCacheReadPrice: true},
-		{InputPrice: 10.00, OutputPrice: 45.00, CacheReadPrice: 1.00, HasCacheReadPrice: true},
-	}
-	// Terra/Luna 应用 OpenAI 2026-07-31 调价；长上下文倍率保持不变。
-	gpt56TerraTiers = []TokenPricingTier{
-		{MaxInputTokens: 272_000, InputPrice: 2.00, OutputPrice: 12.00, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-		{InputPrice: 4.00, OutputPrice: 18.00, CacheReadPrice: 0.40, HasCacheReadPrice: true},
-	}
-	gpt56LunaTiers = []TokenPricingTier{
-		{MaxInputTokens: 272_000, InputPrice: 0.20, OutputPrice: 1.20, CacheReadPrice: 0.02, HasCacheReadPrice: true},
-		{InputPrice: 0.40, OutputPrice: 1.80, CacheReadPrice: 0.04, HasCacheReadPrice: true},
-	}
 	qwen3MaxTiers = []TokenPricingTier{
 		{MaxInputTokens: 32_000, InputPrice: 1.20, OutputPrice: 6.00},
 		{MaxInputTokens: 128_000, InputPrice: 2.40, OutputPrice: 12.00},
@@ -110,6 +125,11 @@ var (
 		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
 		CacheReadCountsTowardTier: true,
 	}
+	grok46Pricing = ModelPricing{
+		InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
+		CacheReadCountsTowardTier: true,
+	}
 	grok420Pricing = ModelPricing{
 		InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true,
 		InputPriceHigh: 2.50, OutputPriceHigh: 5.00, CacheReadPriceHigh: 0.40,
@@ -139,13 +159,16 @@ var basePricing = map[string]ModelPricing{
 		InputPrice: 3.00, OutputPrice: 15.00,
 		InputPriceHigh: 6.00, OutputPriceHigh: 22.50, // >200k context
 	},
-	"claude-haiku-4-5":  {InputPrice: 1.00, OutputPrice: 5.00},
-	"claude-opus-4-1":   {InputPrice: 15.00, OutputPrice: 75.00},
-	"claude-opus-4-0":   {InputPrice: 15.00, OutputPrice: 75.00},
-	"claude-opus-4-6":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
-	"claude-opus-4-7":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
-	"claude-opus-4-8":   {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
-	"claude-opus-5":     {InputPrice: 5.00, OutputPrice: 25.00},  // 全1M窗口统一价格
+	"claude-haiku-4-5": {InputPrice: 1.00, OutputPrice: 5.00},
+	"claude-opus-4-1":  {InputPrice: 15.00, OutputPrice: 75.00},
+	"claude-opus-4-0":  {InputPrice: 15.00, OutputPrice: 75.00},
+	"claude-opus-4-6":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-4-7":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-4-8":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-5":    {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-fable-5-1": {
+		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 0.25, HasCacheReadPrice: true,
+	},
 	"claude-fable-5":    {InputPrice: 10.00, OutputPrice: 50.00}, // claude-opus-4-8 两倍
 	"claude-opus-4-5":   {InputPrice: 5.00, OutputPrice: 25.00},
 	"claude-3-7-sonnet": {InputPrice: 3.00, OutputPrice: 15.00},
@@ -159,22 +182,36 @@ var basePricing = map[string]ModelPricing{
 	"claude-sonnet": {InputPrice: 3.00, OutputPrice: 15.00},
 	"claude-haiku":  {InputPrice: 1.00, OutputPrice: 5.00},
 
-	// ========== OpenAI GPT-5系列 ==========
+	// ========== OpenAI GPT 系列 ==========
+	// 长上下文分段计费：>272K 的请求整段改用高价。用 InputPriceHigh/OutputPriceHigh
+	// 表达（与 gpt-5.5/gpt-5.4/grok-4.5 一致），而不是 TokenPricingTiers——
+	// 两者计费等价（getTierThresholdForModel 提供同一个 272K 边界），
+	// 但只有前者能被自定义价格整份替换。
+	"gpt-6-astra": {
+		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 1.00, HasCacheReadPrice: true,
+		InputPriceHigh: 20.00, OutputPriceHigh: 75.00, CacheReadPriceHigh: 2.00, // >272K context
+		CacheReadCountsTowardTier: true,
+	},
 	"gpt-5.6": {
 		InputPrice: 5.00, OutputPrice: 30.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
-		TokenPricingTiers: gpt56SolTiers, CacheReadCountsTowardTier: true,
+		InputPriceHigh: 10.00, OutputPriceHigh: 45.00, CacheReadPriceHigh: 1.00, // >272K context
+		CacheReadCountsTowardTier: true,
 	},
 	"gpt-5.6-sol": {
 		InputPrice: 5.00, OutputPrice: 30.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
-		TokenPricingTiers: gpt56SolTiers, CacheReadCountsTowardTier: true,
+		InputPriceHigh: 10.00, OutputPriceHigh: 45.00, CacheReadPriceHigh: 1.00, // >272K context
+		CacheReadCountsTowardTier: true,
 	},
+	// Terra/Luna 应用 OpenAI 2026-07-31 调价；长上下文倍率保持不变。
 	"gpt-5.6-terra": {
 		InputPrice: 2.00, OutputPrice: 12.00, CacheReadPrice: 0.20, HasCacheReadPrice: true,
-		TokenPricingTiers: gpt56TerraTiers, CacheReadCountsTowardTier: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 18.00, CacheReadPriceHigh: 0.40, // >272K context
+		CacheReadCountsTowardTier: true,
 	},
 	"gpt-5.6-luna": {
 		InputPrice: 0.20, OutputPrice: 1.20, CacheReadPrice: 0.02, HasCacheReadPrice: true,
-		TokenPricingTiers: gpt56LunaTiers, CacheReadCountsTowardTier: true,
+		InputPriceHigh: 0.40, OutputPriceHigh: 1.80, CacheReadPriceHigh: 0.04, // >272K context
+		CacheReadCountsTowardTier: true,
 	},
 	"gpt-5.5": {
 		InputPrice: 5.00, OutputPrice: 30.00,
@@ -540,11 +577,15 @@ var basePricing = map[string]ModelPricing{
 	"deepseek-v3.2-exp":             {InputPrice: 0.27, OutputPrice: 0.41, CacheReadPrice: 0.27, HasCacheReadPrice: true},
 	"deepseek-v3.2-speciale":        {InputPrice: 0.287, OutputPrice: 0.431, CacheReadPrice: 0.058, HasCacheReadPrice: true},
 	"deepseek-v4-flash":             {InputPrice: 0.112, OutputPrice: 0.224, CacheReadPrice: 0.0028, HasCacheReadPrice: true},
-	"deepseek-v4-pro":               {InputPrice: 0.435, OutputPrice: 0.87, CacheReadPrice: 0.0036, HasCacheReadPrice: true},
-	"deepseek-prover-v2":            {InputPrice: 0.50, OutputPrice: 2.18},
+	// 2026-09-10 官方 V4.1 Flash 高峰价；当前固定单价不自动应用空闲时段半价。
+	// https://api-docs.deepseek.com/quick_start/pricing/
+	"deepseek-v4.1-flash": {InputPrice: 0.30, OutputPrice: 1.20, CacheReadPrice: 0.006, HasCacheReadPrice: true},
+	"deepseek-v4-pro":     {InputPrice: 0.435, OutputPrice: 0.87, CacheReadPrice: 0.0036, HasCacheReadPrice: true},
+	"deepseek-prover-v2":  {InputPrice: 0.50, OutputPrice: 2.18},
 
 	// ========== xAI Grok 模型 ==========
 	// 来源: https://docs.x.ai/developers/pricing
+	"grok-4.6":                     grok46Pricing,
 	"grok-4.5":                     grok45Pricing,
 	"grok-4.3":                     grok420Pricing,
 	"grok-4.20":                    grok420Pricing,
@@ -748,8 +789,11 @@ type modelPrefixMatch struct {
 
 type modelPricingSnapshot struct {
 	pricing             map[string]ModelPricing
+	systemPricing       map[string]ModelPricing
 	aliases             map[string]string
+	systemAliases       map[string]string
 	prefixBuckets       map[byte][]modelPrefixMatch
+	systemPrefixBuckets map[byte][]modelPrefixMatch
 	metadata            map[string]ModelCatalogEntry
 	remoteETag          string
 	remoteSkippedModels int
@@ -757,19 +801,26 @@ type modelPricingSnapshot struct {
 
 var activeModelPricing atomic.Pointer[modelPricingSnapshot]
 
+// modelPricingStateMu 将 models.dev 目录和自定义设置的更新串行化，避免
+// 任一更新基于旧快照重建并覆盖另一方。
+var modelPricingStateMu sync.Mutex
+var installedModelCatalog *ModelCatalogSnapshot
+var activeCustomModelPricing map[string]ModelPricing
+
 func init() {
-	activeModelPricing.Store(buildModelPricingSnapshot(nil))
+	activeModelPricing.Store(buildModelPricingSnapshot(nil, nil))
 }
 
-func buildModelPricingSnapshot(catalog *ModelCatalogSnapshot) *modelPricingSnapshot {
-	pricing := make(map[string]ModelPricing, len(basePricing))
+func buildModelPricingSnapshot(catalog *ModelCatalogSnapshot, custom map[string]ModelPricing) *modelPricingSnapshot {
+	systemPricing := make(map[string]ModelPricing, len(basePricing))
 	for id, entry := range basePricing {
-		pricing[id] = cloneModelPricing(entry)
+		// 内置目录与远端目录统一折叠，避免同一模型在目录同步前后可覆盖性翻转。
+		systemPricing[id] = collapseTwoTierHighContextPricing(id, cloneModelPricing(entry))
 	}
 
-	aliases := make(map[string]string, len(modelAliases))
+	systemAliases := make(map[string]string, len(modelAliases))
 	for alias, target := range modelAliases {
-		aliases[alias] = target
+		systemAliases[alias] = target
 	}
 
 	metadata := make(map[string]ModelCatalogEntry)
@@ -780,23 +831,55 @@ func buildModelPricingSnapshot(catalog *ModelCatalogSnapshot) *modelPricingSnaps
 		remoteSkippedModels = catalog.SkippedModels
 		for _, entry := range catalog.Models {
 			// 远端精确模型 ID 是当前目录的权威值，不能再被同名本地别名重定向。
-			delete(aliases, entry.ID)
-			pricing[entry.ID] = overlayRemotePricing(pricing[entry.ID], entry.Pricing)
+			delete(systemAliases, entry.ID)
+			systemPricing[entry.ID] = overlayRemotePricing(entry.ID, systemPricing[entry.ID], entry.Pricing)
 			metadata[entry.ID] = cloneModelCatalogEntry(entry)
+		}
+	}
+	systemPrefixBuckets := buildPrefixBuckets(systemPricing, systemAliases)
+	aliases := make(map[string]string, len(systemAliases))
+	for alias, target := range systemAliases {
+		aliases[alias] = target
+	}
+	pricing := make(map[string]ModelPricing, len(systemPricing)+len(custom))
+	for id, entry := range systemPricing {
+		pricing[id] = cloneModelPricing(entry)
+	}
+	for id, entry := range custom {
+		// 目录可能在自定义价格保存后才新增该模型或新增分层。最终快照必须仍让
+		// 系统分层价格胜出，不能让历史覆盖静默抹掉中间档。
+		if systemEntry, ok := lookupModelPricingWithFallback(systemPricing, systemAliases, systemPrefixBuckets, id); ok {
+			if len(systemEntry.TokenPricingTiers) > 0 {
+				continue
+			}
+			// 自定义只替换价目，缓存是否参与分档仍由系统模型语义决定。
+			entry.CacheReadCountsTowardTier = systemEntry.CacheReadCountsTowardTier
+		}
+		// 自定义精确 ID 是最高优先级，即使该字符串原本登记为别名也不得重定向。
+		delete(aliases, id)
+		pricing[id] = cloneModelPricing(entry)
+		if metadataEntry, exists := metadata[id]; exists {
+			metadataEntry.Pricing = cloneModelPricing(entry)
+			metadata[id] = metadataEntry
+		} else {
+			metadata[id] = ModelCatalogEntry{ID: id, Provider: "custom", Pricing: cloneModelPricing(entry)}
 		}
 	}
 
 	return &modelPricingSnapshot{
 		pricing:             pricing,
+		systemPricing:       systemPricing,
 		aliases:             aliases,
+		systemAliases:       systemAliases,
 		prefixBuckets:       buildPrefixBuckets(pricing, aliases),
+		systemPrefixBuckets: systemPrefixBuckets,
 		metadata:            metadata,
 		remoteETag:          remoteETag,
 		remoteSkippedModels: remoteSkippedModels,
 	}
 }
 
-func overlayRemotePricing(embedded, remote ModelPricing) ModelPricing {
+func overlayRemotePricing(model string, embedded, remote ModelPricing) ModelPricing {
 	// models.dev 只表达基础 token 单价、显式 cache-read 单价和 context tiers。
 	// 先复制内置项，避免远端省略字段时清掉本地计费语义。
 	overlay := cloneModelPricing(embedded)
@@ -810,14 +893,56 @@ func overlayRemotePricing(embedded, remote ModelPricing) ModelPricing {
 		overlay.TokenPricingTiers = append([]TokenPricingTier(nil), remote.TokenPricingTiers...)
 		overlay.CacheReadCountsTowardTier = remote.CacheReadCountsTowardTier
 		overlay.InputPriceHigh = 0
+		overlay.HasInputPriceHigh = false
 		overlay.OutputPriceHigh = 0
 		overlay.CacheReadPriceHigh = 0
+		overlay.HasCacheReadPriceHigh = false
 	}
-	return overlay
+	return collapseTwoTierHighContextPricing(model, overlay)
+}
+
+// collapseTwoTierHighContextPricing 把「基础档 + 末档无上限」的两档分层表折叠成
+// 基础价 + 高上下文价。两者计费等价时（档位边界必须等于 getTierThresholdForModel
+// 推导出的阈值），分层表只会挡住自定义价格覆盖，高上下文表达则可以整份替换。
+// 阈值不一致、或三档及以上的表（Qwen 全系）都无法用两档表达，保持原样。
+func collapseTwoTierHighContextPricing(model string, pricing ModelPricing) ModelPricing {
+	tiers := pricing.TokenPricingTiers
+	if len(tiers) != 2 {
+		return pricing
+	}
+	base, high := tiers[0], tiers[1]
+	if high.MaxInputTokens != 0 || base.MaxInputTokens <= 0 {
+		return pricing
+	}
+	// 折叠后运行时改用 getTierThresholdForModel，边界必须与原档位完全一致，
+	// 否则阈值会静默漂移（例如远端 272K 被本地默认值 200K 取代）。
+	if base.MaxInputTokens != getTierThresholdForModel(model) {
+		return pricing
+	}
+	pricing.InputPrice = base.InputPrice
+	pricing.OutputPrice = base.OutputPrice
+	if base.HasCacheReadPrice {
+		pricing.CacheReadPrice = base.CacheReadPrice
+		pricing.HasCacheReadPrice = true
+	}
+	pricing.InputPriceHigh = high.InputPrice
+	pricing.HasInputPriceHigh = true
+	pricing.OutputPriceHigh = high.OutputPrice
+	if high.HasCacheReadPrice {
+		pricing.CacheReadPriceHigh = high.CacheReadPrice
+		pricing.HasCacheReadPriceHigh = true
+	}
+	// 保留 CacheReadCountsTowardTier：OpenAI 系正是靠它把缓存读计入阈值判定。
+	pricing.TokenPricingTiers = nil
+	return pricing
 }
 
 func cloneModelPricing(pricing ModelPricing) ModelPricing {
 	pricing.TokenPricingTiers = append([]TokenPricingTier(nil), pricing.TokenPricingTiers...)
+	if pricing.ImageGeneration != nil {
+		image := *pricing.ImageGeneration
+		pricing.ImageGeneration = &image
+	}
 	return pricing
 }
 
@@ -870,12 +995,106 @@ func getPricing(model string) (ModelPricing, bool) {
 	return ModelPricing{}, false
 }
 
+// LookupSystemModelPricing 返回不包含自定义覆盖的系统模型价格。
+// 用于管理界面为新建覆盖项预填当前内置/远端目录价格。
+func LookupSystemModelPricing(model string) (ModelPricing, bool) {
+	snapshot := activeModelPricing.Load()
+	if snapshot == nil {
+		return ModelPricing{}, false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if pricing, ok := lookupModelPricingWithFallback(
+		snapshot.systemPricing, snapshot.systemAliases, snapshot.systemPrefixBuckets, model,
+	); ok {
+		return withEffectiveSystemDefaults(model, pricing), true
+	}
+	return ModelPricing{}, false
+}
+
+func lookupModelPricingWithFallback(
+	pricing map[string]ModelPricing,
+	aliases map[string]string,
+	prefixBuckets map[byte][]modelPrefixMatch,
+	model string,
+) (ModelPricing, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return ModelPricing{}, false
+	}
+	if entry, ok := lookupModelPricing(pricing, aliases, model); ok {
+		return entry, true
+	}
+	if alt := colonSizeTagToHyphen(model); alt != "" {
+		if entry, ok := lookupModelPricing(pricing, aliases, alt); ok {
+			return entry, true
+		}
+	}
+	if entry, ok := fuzzyMatchPricingRaw(pricing, prefixBuckets, model); ok {
+		return entry, true
+	}
+	if alt := colonSizeTagToHyphen(model); alt != "" {
+		return fuzzyMatchPricingRaw(pricing, prefixBuckets, alt)
+	}
+	return ModelPricing{}, false
+}
+
+// withEffectiveSystemDefaults expands implicit system cache prices for editing.
+// The runtime calculator still keeps the original implicit multipliers; these
+// values are only returned to the admin editor as useful defaults.
+func withEffectiveSystemDefaults(model string, pricing ModelPricing) ModelPricing {
+	pricing = cloneModelPricing(pricing)
+	cacheMultiplier := cacheReadMultiplierClaude
+	if isOpenAIModel(model) {
+		cacheMultiplier = getOpenAICacheMultiplier(model)
+	} else if isOpusModel(model) {
+		cacheMultiplier = cacheReadMultiplierOpus
+	}
+	if !pricing.HasCacheReadPrice {
+		pricing.CacheReadPrice = pricing.InputPrice * cacheMultiplier
+		pricing.HasCacheReadPrice = true
+	}
+	if (pricing.HasInputPriceHigh || pricing.InputPriceHigh > 0) && !pricing.HasCacheReadPriceHigh {
+		if pricing.CacheReadPriceHigh == 0 {
+			pricing.CacheReadPriceHigh = pricing.InputPriceHigh * cacheMultiplier
+		}
+		pricing.HasCacheReadPriceHigh = true
+	}
+	for index := range pricing.TokenPricingTiers {
+		tier := &pricing.TokenPricingTiers[index]
+		if !tier.HasCacheReadPrice {
+			tier.CacheReadPrice = tier.InputPrice * cacheMultiplier
+			tier.HasCacheReadPrice = true
+		}
+	}
+	// Token tiers select their own input price at runtime. Since cache-write
+	// fields are model-level, leave them implicit for tiered models so each tier
+	// keeps the correct duration multiplier instead of being flattened to one
+	// base price in the editor.
+	if len(pricing.TokenPricingTiers) == 0 {
+		if !pricing.HasCacheWritePrice {
+			pricing.CacheWritePrice = pricing.InputPrice * cacheWrite5mMultiplier
+			pricing.HasCacheWritePrice = true
+		}
+		if (pricing.HasInputPriceHigh || pricing.InputPriceHigh > 0) && !pricing.HasCacheWritePriceHigh {
+			if pricing.CacheWritePriceHigh == 0 {
+				pricing.CacheWritePriceHigh = pricing.InputPriceHigh * cacheWrite5mMultiplier
+			}
+			pricing.HasCacheWritePriceHigh = true
+		}
+	}
+	return pricing
+}
+
 func lookupPricingInSnapshot(snapshot *modelPricingSnapshot, model string) (ModelPricing, bool) {
-	if base, ok := snapshot.aliases[model]; ok {
+	return lookupModelPricing(snapshot.pricing, snapshot.aliases, model)
+}
+
+func lookupModelPricing(pricing map[string]ModelPricing, aliases map[string]string, model string) (ModelPricing, bool) {
+	if base, ok := aliases[model]; ok {
 		model = base
 	}
-	pricing, ok := snapshot.pricing[model]
-	return pricing, ok
+	entry, ok := pricing[model]
+	return entry, ok
 }
 
 // colonSizeTagToHyphen 将最后一个 ':' 换成 '-'（gpt-oss:120b → gpt-oss-120b）。
@@ -919,6 +1138,24 @@ func fuzzyMatchModelRaw(lowerModel string) (ModelPricing, bool) {
 		if strings.HasPrefix(lowerModel, match.prefix) {
 			if pricing, ok := snapshot.pricing[match.target]; ok {
 				return pricing, true
+			}
+		}
+	}
+	return ModelPricing{}, false
+}
+
+func fuzzyMatchPricingRaw(pricing map[string]ModelPricing, prefixBuckets map[byte][]modelPrefixMatch, lowerModel string) (ModelPricing, bool) {
+	if lowerModel == "" {
+		return ModelPricing{}, false
+	}
+	bucket, ok := prefixBuckets[lowerModel[0]]
+	if !ok {
+		return ModelPricing{}, false
+	}
+	for _, match := range bucket {
+		if strings.HasPrefix(lowerModel, match.prefix) {
+			if entry, ok := pricing[match.target]; ok {
+				return entry, true
 			}
 		}
 	}

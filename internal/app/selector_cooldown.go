@@ -12,6 +12,39 @@ import (
 	"ccLoad/internal/util"
 )
 
+type channelRestrictionTokenContextKey struct{}
+
+type channelRestrictionState struct {
+	tokenHash string
+	denied    bool
+}
+
+func withChannelRestrictionToken(ctx context.Context, tokenHash string) context.Context {
+	if ctx == nil || tokenHash == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, channelRestrictionTokenContextKey{}, &channelRestrictionState{tokenHash: tokenHash})
+}
+
+func channelRestrictionTokenFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	state, _ := ctx.Value(channelRestrictionTokenContextKey{}).(*channelRestrictionState)
+	if state == nil {
+		return ""
+	}
+	return state.tokenHash
+}
+
+func channelRestrictionDeniedFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	state, _ := ctx.Value(channelRestrictionTokenContextKey{}).(*channelRestrictionState)
+	return state != nil && state.denied
+}
+
 // filterCooldownChannels 过滤冷却中的渠道
 //
 // [IMPORTANT] 冷却状态优先级：**最高优先级**，必须在健康度排序前执行
@@ -39,6 +72,19 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 	if len(channels) == 0 {
 		return channels, nil
 	}
+	if tokenHash := channelRestrictionTokenFromContext(ctx); tokenHash != "" && s.authService != nil {
+		filtered, restricted := s.authService.FilterAllowedChannels(tokenHash, channels)
+		if restricted {
+			// 空集合必须保持为空，不能让越权渠道重新参与冷却兜底。
+			channels = filtered
+			if state, _ := ctx.Value(channelRestrictionTokenContextKey{}).(*channelRestrictionState); state != nil {
+				state.denied = len(channels) == 0
+			}
+			if len(channels) == 0 {
+				return nil, nil
+			}
+		}
+	}
 
 	now := time.Now()
 
@@ -58,8 +104,12 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 	}
 
 	// 批量查询冷却状态（优先走缓存层）
+	paid := slices.ContainsFunc(channels, func(cfg *modelpkg.Config) bool { return cfg.AntigravityCredits })
 	channelCooldowns, err := s.getAllChannelCooldowns(ctx)
 	if err != nil {
+		if paid {
+			return nil, err
+		}
 		// 降级策略：无法获取冷却数据时，跳过冷却过滤；仍保留后续健康度/负载均衡逻辑，避免直接返回未排序列表。
 		log.Printf("[ERROR] 获取渠道冷却状态失败，跳过冷却过滤（降级模式）: %v", err)
 		channelCooldowns = make(map[int64]time.Time)
@@ -67,6 +117,9 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 
 	keyCooldowns, err := s.getAllKeyCooldowns(ctx)
 	if err != nil {
+		if paid {
+			return nil, err
+		}
 		// 降级策略：同上。
 		log.Printf("[ERROR] 获取 Key 冷却状态失败，跳过冷却过滤（降级模式）: %v", err)
 		keyCooldowns = make(map[int64]map[int]time.Time)
@@ -76,6 +129,9 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 	if requestModel != "" && requestModel != "*" {
 		modelCooldowns, err = s.getAllModelCooldowns(ctx)
 		if err != nil {
+			if paid {
+				return nil, err
+			}
 			log.Printf("[ERROR] 获取模型冷却状态失败，跳过模型冷却过滤（降级模式）: %v", err)
 			modelCooldowns = make(map[int64]map[string]time.Time)
 		}
@@ -255,6 +311,9 @@ func (s *Server) filterCooledChannels(
 ) []*modelpkg.Config {
 	filtered := channels[:0]
 	for _, cfg := range channels {
+		if !cfg.AntigravityCredits && s.antigravityCredentials.standardQuotaUntil(cfg, s.resolveFinalUpstreamModel(cfg, requestModel, "gemini")).After(now) {
+			continue
+		}
 		// 1. 检查渠道级冷却
 		if cooldownUntil, exists := channelCooldowns[cfg.ID]; exists {
 			if cooldownUntil.After(now) {

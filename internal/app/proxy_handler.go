@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,6 +129,46 @@ func parseIncomingRequest(c *gin.Context, bodyLimits requestBodyLimits) (incomin
 	if int64(len(all)) > maxBody {
 		return incomingRequest{}, errBodyTooLarge
 	}
+	contentType := c.Request.Header.Get("Content-Type")
+	mediaType, mediaParams, _ := mime.ParseMediaType(contentType)
+	if shouldValidateStrictJSONBody(contentType, all) {
+		// 失败路径才走标准库解码，为的是把出错偏移量带给客户端；
+		// json.Unmarshal 同样拒绝顶层值之后的尾随数据。
+		if !sonic.Valid(all) {
+			err := json.Unmarshal(all, new(json.RawMessage))
+			if err == nil {
+				err = errors.New("expected exactly one JSON value")
+			}
+			return incomingRequest{}, fmt.Errorf("invalid JSON body: %w", err)
+		}
+	}
+	declaredMediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if separator := strings.IndexByte(declaredMediaType, ';'); separator >= 0 {
+		declaredMediaType = strings.TrimSpace(declaredMediaType[:separator])
+	}
+	if mediaType == "multipart/form-data" || declaredMediaType == "multipart/form-data" {
+		boundary := strings.TrimSpace(mediaParams["boundary"])
+		if boundary == "" {
+			return incomingRequest{}, errors.New("invalid multipart body: boundary is missing")
+		}
+		reader := multipart.NewReader(bytes.NewReader(all), boundary)
+		for {
+			part, partErr := reader.NextPart()
+			if errors.Is(partErr, io.EOF) {
+				break
+			}
+			if partErr != nil {
+				return incomingRequest{}, fmt.Errorf("invalid multipart body: %w", partErr)
+			}
+			if _, partErr = io.Copy(io.Discard, part); partErr != nil {
+				_ = part.Close()
+				return incomingRequest{}, fmt.Errorf("invalid multipart body: %w", partErr)
+			}
+			if partErr = part.Close(); partErr != nil {
+				return incomingRequest{}, fmt.Errorf("invalid multipart body: %w", partErr)
+			}
+		}
+	}
 
 	var reqModel struct {
 		Model string `json:"model"`
@@ -134,19 +176,17 @@ func parseIncomingRequest(c *gin.Context, bodyLimits requestBodyLimits) (incomin
 	_ = sonic.Unmarshal(all, &reqModel)
 
 	// multipart/form-data 支持：当 JSON 解析无 model 时，尝试从 multipart 表单字段提取
-	if reqModel.Model == "" {
-		if ct := c.Request.Header.Get("Content-Type"); ct != "" {
-			mediaType, params, _ := mime.ParseMediaType(ct)
-			if mediaType == "multipart/form-data" {
-				if boundary := params["boundary"]; boundary != "" {
-					reqModel.Model = extractModelFromMultipart(all, boundary)
-				}
-			}
+	if reqModel.Model == "" && mediaType == "multipart/form-data" {
+		if boundary := mediaParams["boundary"]; boundary != "" {
+			reqModel.Model = extractModelFromMultipart(all, boundary)
 		}
 	}
 
 	// 智能检测流式请求
 	isStreaming := isStreamingRequest(requestPath, all)
+	if mediaType == "multipart/form-data" && protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyImages {
+		isStreaming, _ = strconv.ParseBool(extractMultipartField(all, mediaParams["boundary"], "stream"))
+	}
 
 	// 多源模型名称获取：优先请求体，其次URL路径
 	originalModel := reqModel.Model
@@ -213,13 +253,17 @@ func (l requestBodyLimits) maxForPath(requestPath string) int64 {
 
 // extractModelFromMultipart 从 multipart/form-data 原始字节中提取 model 字段
 func extractModelFromMultipart(body []byte, boundary string) string {
+	return extractMultipartField(body, boundary, "model")
+}
+
+func extractMultipartField(body []byte, boundary, field string) string {
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	for {
 		part, err := reader.NextPart()
 		if err != nil {
 			break
 		}
-		if part.FormName() == "model" {
+		if part.FormName() == field && part.FileName() == "" {
 			val, err := io.ReadAll(io.LimitReader(part, 256))
 			_ = part.Close()
 			if err == nil {
@@ -284,7 +328,10 @@ func (s *Server) handleSpecialRoutes(c *gin.Context) bool {
 
 // HandleProxyRequest 通用透明代理处理器
 func (s *Server) HandleProxyRequest(c *gin.Context) {
-	if isResponsesWebsocketUpgradeRequest(c.Request) {
+	// Responses GET is reserved for the downstream WebSocket handshake. A plain
+	// GET must stop here instead of entering the generic proxy, where it has no
+	// JSON model and is otherwise routed as "*" to every eligible channel.
+	if c.Request.Method == http.MethodGet && isResponsesWebsocketPath(c.Request.URL.Path) {
 		s.HandleResponsesWebsocket(c)
 		return
 	}
@@ -368,6 +415,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
+	ctx = withChannelRestrictionToken(ctx, tokenHashStr)
 
 	var executionSession *responsesExecutionSession
 	var routingSession *responsesExecutionSession
@@ -414,6 +462,9 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	cands, err := s.selectRouteCandidates(ctx, c, originalModel, string(clientProtocol))
+	if err == nil && requestMethod == http.MethodPost && protocol.DetectRequestFamily(effectiveRequestPath) != protocol.RequestFamilyAlphaSearch {
+		cands = s.appendAntigravityCreditsCandidates(ctx, cands, originalModel, string(clientProtocol), all)
+	}
 	if err != nil {
 		if errors.Is(err, errUnknownClientProtocol) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "unsupported path"})
@@ -426,6 +477,12 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if len(cands) == 0 {
 		if protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyAlphaSearch {
 			writeEmptyAlphaSearchResponse(c.Writer)
+			return
+		}
+		if channelRestrictionDeniedFromContext(ctx) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "no allowed upstream channel for this token",
+			})
 			return
 		}
 		s.AddLogAsync(&model.LogEntry{
@@ -484,10 +541,6 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if routingSession != nil {
 		reqCtx.routingSession = routingSession
 	}
-	if executionSession != nil {
-		reqCtx.codexMultiAgentV2Optimized = executionSession.codexMultiAgentV2StateSnapshot()
-	}
-	ctx = withCodexMultiAgentV2RequestContext(ctx, reqCtx)
 	if executionSession != nil && nativeRequestBody != nil {
 		reqCtx.nativeCodexWS = executionSession.upstream
 		reqCtx.nativeCodexBody = nativeRequestBody
@@ -513,9 +566,6 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}()
 
 	lastResult, succeeded := s.runProxyAttemptLoop(ctx, cands, reqCtx, c.Writer)
-	if executionSession != nil {
-		s.updateCodexMultiAgentV2SessionState(executionSession, reqCtx)
-	}
 	if succeeded {
 		if executionSession != nil && lastResult != nil && lastResult.hasResponsesTurn {
 			s.responsesExecutionSessions.commit(executionSession, executionSessionRequestBody, lastResult.responsesTurn)
@@ -523,7 +573,11 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 
-	s.writeFinalProxyResponse(c, reqCtx, isStreaming, lastResult, len(cands))
+	channelIDs := make(map[int64]struct{}, len(cands))
+	for _, cfg := range cands {
+		channelIDs[cfg.ID] = struct{}{}
+	}
+	s.writeFinalProxyResponse(c, reqCtx, isStreaming, lastResult, len(channelIDs))
 }
 
 func determineFinalClientStatus(lastResult *proxyResult) int {
@@ -632,7 +686,41 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	stopAfterFailure func(current, next *model.Config, result *proxyResult) bool,
 ) (lastResult *proxyResult, succeeded bool) {
 	sawAlphaSearchUnsupported := false
+	// Session affinity may reorder candidates; paid attempts must still come last.
+	ordered := make([]*model.Config, 0, len(cands))
+	for _, cfg := range cands {
+		if !cfg.AntigravityCredits {
+			ordered = append(ordered, cfg)
+		}
+	}
+	for _, cfg := range cands {
+		if cfg.AntigravityCredits {
+			ordered = append(ordered, cfg)
+		}
+	}
+	cands = ordered
+	operatorSkipped := make(map[int64]bool)
 	for index, cfg := range cands {
+		if operatorSkipped[cfg.ID] {
+			continue
+		}
+		if cfg.AntigravityCredits {
+			current, loadErr := s.store.GetConfig(ctx, cfg.ID)
+			if loadErr != nil || !current.Enabled || !current.UsesAntigravityOAuth() || !s.configSupportsModelWithFuzzyMatch(current, reqCtx.originalModel) {
+				continue
+			}
+			cfg = current.Clone()
+			cfg.AntigravityCredits = true
+			cfg.CooldownFallback = false
+			actualModel := s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(protocol.Gemini))
+			if !s.antigravityCredentials.standardQuotaUntil(cfg, actualModel).After(time.Now()) {
+				continue
+			}
+			eligible, filterErr := s.filterCooldownChannelsStrict(ctx, []*model.Config{cfg}, reqCtx.originalModel, string(reqCtx.clientProtocol))
+			if filterErr != nil || len(eligible) == 0 {
+				continue
+			}
+		}
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
 		if err != nil && errors.Is(err, ErrNoAPIKeyForModel) {
 			log.Printf("[INFO] 渠道 %s (ID=%d) 没有可用于模型 %s 的 Key，跳过该渠道", cfg.Name, cfg.ID, reqCtx.originalModel)
@@ -672,6 +760,9 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 			}
 
 			lastResult = result
+			if result.operatorAborted {
+				operatorSkipped[cfg.ID] = true
+			}
 
 			// 客户端已取消：别再浪费资源“重试”了。
 			if result.isClientCanceled {

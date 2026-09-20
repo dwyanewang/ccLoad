@@ -42,8 +42,15 @@ var retryInDurationRegex = regexp.MustCompile(`(?i)\bretry\s+in\s+([0-9]+(?:\.[0
 // retryAfterSecondsRegex 匹配 Codex rolling spend limit 文案中的 “Please retry after 2196 seconds”。
 var retryAfterSecondsRegex = regexp.MustCompile(`(?i)\bretry\s+after\s+([0-9]+)\s*seconds?\b`)
 
+// rollingFreeAllowanceResetRegex 匹配 Token Harbor 免费额度的下一个滚动周期起点。
+var rollingFreeAllowanceResetRegex = regexp.MustCompile(`(?i)\bnext\s+rolling\s+7-day\s+period\s+starts\s+at\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\b`)
+
 // globalFixedWindowRetryClockRegex 匹配“请在 今天 12:00 后再试”这类全站固定窗口限额文案。
 var globalFixedWindowRetryClockRegex = regexp.MustCompile(`(今天|明天)\s*(\d{1,2})\s*[:：]\s*(\d{1,2})`)
+
+// codexUsageFrequencyLimitResetRegex 匹配 Codex 频率限制错误中的绝对重置时间。
+// 文案可能是英文或中文，但时间格式固定为 YYYY-MM-DD HH:MM:SS UTC+8。
+var codexUsageFrequencyLimitResetRegex = regexp.MustCompile(`(?i)(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+UTC\s*([+-])\s*(\d{1,2})(?:\s*:\s*(\d{2}))?`)
 
 // HTTP 状态码常量（统一定义，避免魔法数字）
 const (
@@ -71,6 +78,8 @@ const (
 const (
 	// RetryAfterThresholdSeconds Retry-After超过此值视为渠道级限流
 	RetryAfterThresholdSeconds = 60
+	// codexUsageFrequencyLimitReason 是 Codex 6004 频率限制的精确冷却原因。
+	codexUsageFrequencyLimitReason = "CODEX_USAGE_FREQUENCY_LIMIT"
 	// anthropicRateLimitUnifiedResetHeader 是 Anthropic 当前被拒绝配额窗口的 Unix 秒重置时间。
 	anthropicRateLimitUnifiedResetHeader = "Anthropic-Ratelimit-Unified-Reset"
 	// WebsocketConnectionLimitCooldown 是上游 WebSocket 并发连接槽耗尽时的渠道冷却时长。
@@ -144,6 +153,7 @@ type sseErrorDetail struct {
 type structuredQuotaErrorResponse struct {
 	Code            any                          `json:"code"`
 	Message         string                       `json:"message"`
+	Msg             string                       `json:"msg"`
 	Model           string                       `json:"model"`
 	ResetSeconds    int64                        `json:"reset_seconds"`
 	ResetsInSeconds int64                        `json:"resets_in_seconds"` // 部分上游使用复数形式
@@ -158,6 +168,7 @@ type structuredQuotaErrorObject struct {
 	Type            any                          `json:"type"`
 	Code            any                          `json:"code"`
 	Message         string                       `json:"message"`
+	Msg             string                       `json:"msg"`
 	Model           string                       `json:"model"`
 	ResetSeconds    int64                        `json:"reset_seconds"`
 	ResetsInSeconds int64                        `json:"resets_in_seconds"` // 部分上游使用复数形式
@@ -278,7 +289,7 @@ var statusCodeMetaMap = map[int]StatusCodeMeta{
 	405: {ErrorLevelChannel}, // Method Not Allowed
 	406: {ErrorLevelClient},  // Not Acceptable
 	410: {ErrorLevelClient},  // Gone（模型退役由响应语义收窄为模型级故障）
-	413: {ErrorLevelClient},  // Payload Too Large
+	413: {ErrorLevelKey},     // Payload Too Large：按模型冷却并换渠，见 ClassifyHTTPResponseWithMeta
 	414: {ErrorLevelClient},  // URI Too Long
 	415: {ErrorLevelClient},  // Unsupported Media Type
 	416: {ErrorLevelClient},  // Range Not Satisfiable
@@ -354,7 +365,9 @@ func ClassifyHTTPStatus(statusCode int) ErrorLevel {
 //
 // 分类策略：
 //   - 401/403 做语义分析：默认 Key 级，只在明确账户级不可逆错误时升级为 Channel 级
-//   - 400 固定按模型级处理，避免一个模型的请求约束误伤整个渠道
+//   - 400/413 固定按模型级处理，避免一个模型的请求约束误伤整个渠道；
+//     413 不能当客户端直返：同一份 Claude Code 历史在 Anthropic 能过、在别的网关会 RequestTooLarge，
+//     直返会打断已经开始的渠道 failover
 //   - 429 做限流范围分析：默认 Key 级，只有明确长时间/全局限流特征才升级为 Channel 级
 //   - 1308 错误优先：无论 HTTP 状态码，检测到就按 Key 级处理（用于精确冷却时间）
 //   - 其他状态码：走表驱动分类（statusCodeMetaMap）
@@ -399,7 +412,7 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 				Level: level,
 				Model: strings.TrimSpace(quotaErr.model),
 			}
-			if reason == "model_cooldown" {
+			if reason == "model_cooldown" || reason == codexUsageFrequencyLimitReason {
 				classification.ModelScoped = true
 				classification.ModelCooldownReason = reason
 				if cooldownUntil.After(now) {
@@ -473,8 +486,18 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		return classification
 	}
 
-	// 400 表示当前模型无法接受该请求。切换渠道，但只冷却实际请求的模型。
-	if statusCode == 400 {
+	// WebSocket close 1009 被桥接为 413，必须保留关闭语义，不能按普通 HTTP 413 换渠。
+	if statusCode == http.StatusRequestEntityTooLarge {
+		var payload sseErrorResponse
+		if json.Unmarshal(responseBody, &payload) == nil && strings.TrimSpace(payload.Error.Code) == "message_too_big" {
+			return HTTPResponseClassification{Level: ErrorLevelClient}
+		}
+	}
+
+	// 400/413 表示当前模型/上游无法接受该请求。切换渠道，但只冷却实际请求的模型。
+	// 413 必须与 400 同级：否则 auto 协议探测把 Anthropic 400 交给下一个候选后，
+	// 候选网关的 RequestTooLarge 会 ActionReturnClient，客户端直接中断、后面的匹配渠道进不去。
+	if statusCode == 400 || statusCode == http.StatusRequestEntityTooLarge {
 		return HTTPResponseClassification{
 			Level:       ErrorLevelKey,
 			ModelScoped: true,
@@ -495,6 +518,21 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		return HTTPResponseClassification{
 			Level:       classify404Error(responseBody),
 			ModelScoped: isModelUnavailableResponse(responseBody),
+		}
+	}
+
+	// Cloudflare 质询由出口 IP 与 TLS 指纹决定，与具体 Key 无关：同渠道其他 Key
+	// 一个都过不去，只有切换渠道才有意义。按渠道级分类交给默认指数退避处理，
+	// 不设固定冷却时长（无法预判质询持续时间），也不设置 ModelScoped（切模型无效）。
+	// 必须排在响应体关键字匹配之前：质询页 HTML 匹配不上任何渠道级特征，
+	// 否则会落到默认的 Key 级，OAuth 渠道下更是既不写 Key 冷却也不写渠道冷却。
+	if statusCode == http.StatusForbidden || statusCode == http.StatusServiceUnavailable {
+		if isCloudflareChallengeResponse(firstHeaderValueFold(headers, "cf-mitigated"), responseBody) {
+			return HTTPResponseClassification{
+				Level:                 ErrorLevelChannel,
+				PreventKeyFallback:    true,
+				ChannelCooldownReason: "cloudflare_challenge",
+			}
 		}
 	}
 
@@ -602,21 +640,15 @@ func classifyRateLimitError(headers map[string][]string, responseBody []byte) Er
 }
 
 func parseAnthropicRateLimitReset(headers map[string][]string, now time.Time) (time.Time, bool) {
-	for name, values := range headers {
-		if !strings.EqualFold(name, anthropicRateLimitUnifiedResetHeader) {
+	for _, value := range headerValuesFold(headers, anthropicRateLimitUnifiedResetHeader) {
+		resetUnix, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil {
 			continue
 		}
-		for _, value := range values {
-			resetUnix, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
-			if err != nil {
-				continue
-			}
-			until := time.Unix(resetUnix, 0)
-			if until.After(now) {
-				return until, true
-			}
+		until := time.Unix(resetUnix, 0)
+		if until.After(now) {
+			return until, true
 		}
-		return time.Time{}, false
 	}
 	return time.Time{}, false
 }
@@ -716,6 +748,11 @@ func parseStructuredQuotaCooldown(quotaErr structuredQuotaError, now time.Time) 
 	messageUpper := strings.ToUpper(message)
 
 	switch {
+	case code == "6004":
+		if until, ok := parseCodexUsageFrequencyLimitCooldown(message, now); ok {
+			return until, codexUsageFrequencyLimitReason, ErrorLevelKey, true
+		}
+		return time.Time{}, "", ErrorLevelNone, false
 	case code == "MODEL_COOLDOWN":
 		if until, ok := parseStructuredCooldownUntil(quotaErr, now); ok {
 			return until, "model_cooldown", ErrorLevelKey, true
@@ -757,6 +794,11 @@ func parseStructuredQuotaCooldown(quotaErr structuredQuotaError, now time.Time) 
 			return until, "RATE_LIMIT_RETRY_AFTER", ErrorLevelKey, true
 		}
 		return time.Time{}, "", ErrorLevelNone, false
+	case code == "RATE_LIMIT_ERROR":
+		if until, ok := parseRollingFreeAllowanceCooldownUntil(message, now); ok {
+			return until, "ROLLING_FREE_ALLOWANCE_RESET", ErrorLevelKey, true
+		}
+		return time.Time{}, "", ErrorLevelNone, false
 	case code == "USAGE_LIMIT_REACHED":
 		// 上游 usage limit（如 Claude Plus 计划限额），优先用 resets_in_seconds / resets_at
 		if until, ok := parseStructuredCooldownUntil(quotaErr, now); ok {
@@ -775,9 +817,13 @@ func parseStructuredQuotaError(responseBody []byte) (structuredQuotaError, bool)
 		return structuredQuotaError{}, false
 	}
 
+	message := errResp.Message
+	if strings.TrimSpace(message) == "" {
+		message = errResp.Msg
+	}
 	parsed := structuredQuotaError{
 		code:         normalizeStructuredScalar(errResp.Code),
-		message:      errResp.Message,
+		message:      message,
 		model:        strings.TrimSpace(errResp.Model),
 		resetSeconds: coalesceInt64(errResp.ResetSeconds, errResp.ResetsInSeconds),
 		resetsAt:     errResp.ResetsAt,
@@ -803,6 +849,9 @@ func parseStructuredQuotaError(responseBody []byte) (structuredQuotaError, bool)
 				}
 				if parsed.message == "" {
 					parsed.message = errorObj.Message
+					if strings.TrimSpace(parsed.message) == "" {
+						parsed.message = errorObj.Msg
+					}
 				}
 				if parsed.model == "" {
 					parsed.model = strings.TrimSpace(errorObj.Model)
@@ -926,6 +975,37 @@ func parseStructuredCooldownUntil(quotaErr structuredQuotaError, now time.Time) 
 	return time.Time{}, false
 }
 
+func parseCodexUsageFrequencyLimitCooldown(message string, now time.Time) (time.Time, bool) {
+	matches := codexUsageFrequencyLimitResetRegex.FindStringSubmatch(message)
+	if len(matches) < 4 {
+		return time.Time{}, false
+	}
+
+	hours, err := strconv.Atoi(matches[3])
+	if err != nil || hours > 23 {
+		return time.Time{}, false
+	}
+	minutes := 0
+	if len(matches) > 4 && matches[4] != "" {
+		minutes, err = strconv.Atoi(matches[4])
+		if err != nil || minutes > 59 {
+			return time.Time{}, false
+		}
+	}
+	offsetSeconds := (hours*60 + minutes) * 60
+	if matches[2] == "-" {
+		offsetSeconds = -offsetSeconds
+	}
+
+	dateTime := strings.Join(strings.Fields(matches[1]), " ")
+	location := time.FixedZone("UTC"+matches[2]+strconv.Itoa(hours), offsetSeconds)
+	until, err := time.ParseInLocation("2006-01-02 15:04:05", dateTime, location)
+	if err != nil || !until.After(now) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
 func parseRetryInCooldownUntil(message string, now time.Time) (time.Time, bool) {
 	matches := retryInDurationRegex.FindStringSubmatch(message)
 	if matches == nil {
@@ -950,6 +1030,19 @@ func parseRetryAfterSecondsCooldownUntil(message string, now time.Time) (time.Ti
 		return time.Time{}, false
 	}
 	return now.Add(time.Duration(seconds) * time.Second), true
+}
+
+func parseRollingFreeAllowanceCooldownUntil(message string, now time.Time) (time.Time, bool) {
+	matches := rollingFreeAllowanceResetRegex.FindStringSubmatch(message)
+	if matches == nil {
+		return time.Time{}, false
+	}
+
+	until, err := time.Parse(time.RFC3339Nano, matches[1])
+	if err != nil || !until.After(now) {
+		return time.Time{}, false
+	}
+	return until, true
 }
 
 func parseGlobalFixedWindowQuotaCooldownUntil(message string, now time.Time) (time.Time, bool) {
@@ -1092,10 +1185,43 @@ func ShouldFallbackProtocol(statusCode int, responseBody []byte) bool {
 	}
 }
 
+// firstHeaderValueFold 大小写无关地取首个 header 值。
+// HTTP 转发路径写入的是 canonical 形式，管理测试路径来自 JSON 反序列化，
+// 键名大小写不可控，因此不能依赖 map 直接索引。
+func firstHeaderValueFold(headers map[string][]string, name string) string {
+	values := headerValuesFold(headers, name)
+	if len(values) > 0 {
+		return strings.TrimSpace(values[0])
+	}
+	return ""
+}
+
+func headerValuesFold(headers map[string][]string, name string) []string {
+	for key, values := range headers {
+		if strings.EqualFold(key, name) {
+			return values
+		}
+	}
+	return nil
+}
+
 func isCloudflareBlockPage(responseBody []byte) bool {
 	body := strings.ToLower(string(responseBody))
 	return strings.Contains(body, "<title>attention required! | cloudflare</title>") &&
 		strings.Contains(body, "sorry, you have been blocked")
+}
+
+// isCloudflareChallengeResponse 判断响应是否为 Cloudflare 质询或封锁页。
+// 优先看 cf-mitigated 响应头（质询时为 "challenge"），再回退到正文关键字。
+// 两类页面都在模型执行前拒绝请求，对冷却决策而言语义等价。
+func isCloudflareChallengeResponse(cfMitigated string, responseBody []byte) bool {
+	if strings.EqualFold(strings.TrimSpace(cfMitigated), "challenge") {
+		return true
+	}
+	if strings.Contains(strings.ToLower(string(responseBody)), "<title>just a moment...</title>") {
+		return true
+	}
+	return isCloudflareBlockPage(responseBody)
 }
 
 func isProtocolConversionNotImplemented(responseBody []byte) bool {

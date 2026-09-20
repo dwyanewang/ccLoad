@@ -70,63 +70,6 @@ func setupMySQLEnv(t *testing.T) *mysqlTestEnv {
 	return startDockerMySQL(t)
 }
 
-// TestMySQLRepeatableReadSnapshotCompatibility 可安全指向远程实例：只验证恢复所需的
-// REPEATABLE READ 事务能力，不创建、修改或删除任何对象。
-func TestMySQLRepeatableReadSnapshotCompatibility(t *testing.T) {
-	dsn := os.Getenv("CCLOAD_TEST_MYSQL_DSN")
-	if dsn == "" {
-		t.Skip("CCLOAD_TEST_MYSQL_DSN 未设置")
-	}
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		t.Fatalf("open MySQL: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("ping MySQL: %v", err)
-	}
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
-	if err != nil {
-		t.Fatalf("begin repeatable-read transaction: %v", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	var one int
-	if err := tx.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
-		t.Fatalf("query in snapshot transaction: %v", err)
-	}
-	if one != 1 {
-		t.Fatalf("SELECT 1 = %d", one)
-	}
-}
-
-// BenchmarkMySQLReadOnlyRoundTrip 测量远程主库最小查询往返；不触碰业务表。
-func BenchmarkMySQLReadOnlyRoundTrip(b *testing.B) {
-	dsn := os.Getenv("CCLOAD_TEST_MYSQL_DSN")
-	if dsn == "" {
-		b.Skip("CCLOAD_TEST_MYSQL_DSN 未设置")
-	}
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		b.Fatalf("open MySQL: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-	ctx := context.Background()
-	if err := db.PingContext(ctx); err != nil {
-		b.Fatalf("ping MySQL: %v", err)
-	}
-	b.ResetTimer()
-	b.ReportAllocs()
-	for b.Loop() {
-		var one int
-		if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
-			b.Fatalf("SELECT 1: %v", err)
-		}
-	}
-}
-
 // startDockerMySQL 启动 Docker MySQL 容器
 func startDockerMySQL(t *testing.T) *mysqlTestEnv {
 	t.Helper()
@@ -214,6 +157,11 @@ func TestMySQL(t *testing.T) {
 	env := setupMySQLEnv(t)
 
 	// 子测试共享同一个容器
+	t.Run("SequentialKeyPriorities", func(t *testing.T) {
+		cleanupMySQLTables(t, env.db)
+		testSequentialKeyPrioritiesMigration(t, env.db, DialectMySQL)
+	})
+
 	t.Run("FullMigration", func(t *testing.T) {
 		cleanupMySQLTables(t, env.db)
 
@@ -233,6 +181,17 @@ func TestMySQL(t *testing.T) {
 			}
 			t.Logf("表 %s 存在（行数: %d）", table, count)
 		}
+	})
+
+	t.Run("OAuthQuotaRounding", func(t *testing.T) {
+		cleanupMySQLTables(t, env.db)
+		store, err := CreateMySQLStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("CreateMySQLStore: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		assertOAuthQuotaRoundingMatchesGo(t, store)
 	})
 
 	t.Run("SyncManagerLargeRestore", func(t *testing.T) {
@@ -449,7 +408,7 @@ func TestMySQL(t *testing.T) {
 			}
 			t.Logf("列 auth_tokens.%s 存在", col)
 		}
-		for _, col := range []string{"allowed_models", "model_scope_empty"} {
+		for _, col := range []string{"allowed_models", "model_scope_empty", "priority"} {
 			var columnName string
 			err := env.db.QueryRow(
 				"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'api_keys' AND COLUMN_NAME = ?",

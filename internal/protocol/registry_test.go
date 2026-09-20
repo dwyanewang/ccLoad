@@ -117,7 +117,7 @@ func TestRegistry_TranslateRequest_AnthropicToGemini3_UsesThinkingLevel(t *testi
 	}{
 		{name: "missing stays absent", model: "gemini-3.6-flash-high"},
 		{name: "adaptive without effort stays absent", model: "gemini-3.6-flash-high", adaptive: true},
-		{name: "minimal stays minimal when supported", model: "gemini-3.6-flash-high", effort: "minimal", want: "minimal"},
+		{name: "minimal clamps to catalog minimum", model: "gemini-3.6-flash-high", effort: "minimal", want: "low"},
 		{name: "low stays low", model: "gemini-3.6-flash-high", effort: "low", want: "low"},
 		{name: "medium stays medium", model: "gemini-3.6-flash-high", effort: "medium", want: "medium"},
 		{name: "high stays high", model: "gemini-3.6-flash-high", effort: "high", want: "high"},
@@ -1595,7 +1595,7 @@ func TestRegistry_TranslateRequest_CodexToOpenAI(t *testing.T) {
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
 
-	raw := []byte(`{"model":"gpt-4o","instructions":"be careful","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"},{"type":"input_file","file_id":"file_123","filename":"doc.pdf"}]},{"type":"function_call_output","call_id":"call_1","output":"done"}]}`)
+	raw := []byte(`{"model":"gpt-4o","instructions":"be careful","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"},{"type":"input_file","file_id":"file_123","filename":"doc.pdf"}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"done"}]}`)
 	got, err := reg.TranslateRequest(protocol.Codex, protocol.OpenAI, "gpt-4o", raw, false)
 	if err != nil {
 		t.Fatalf("TranslateRequest failed: %v", err)

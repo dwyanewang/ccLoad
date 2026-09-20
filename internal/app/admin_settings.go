@@ -15,6 +15,7 @@ import (
 
 	"ccLoad/internal/config"
 	"ccLoad/internal/model"
+	"ccLoad/internal/util"
 	"ccLoad/internal/version"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,7 @@ const (
 
 	cooldownMinSecondsSettingKey = "cooldown_min_seconds"
 	cooldownMaxSecondsSettingKey = "cooldown_max_seconds"
+	modelCustomPricingSettingKey = "model_custom_pricing"
 )
 
 var errInvalidSettingCombination = errors.New("invalid setting combination")
@@ -134,14 +136,17 @@ func settingsRequireRestart(updates map[string]string) bool {
 	if len(updates) != 1 {
 		return true
 	}
-	_, hotReloaded := updates[modelMultimodalFallbackSettingKey]
+	_, hotReloadedMultimodal := updates[modelMultimodalFallbackSettingKey]
+	_, hotReloadedPricing := updates[modelCustomPricingSettingKey]
+	hotReloaded := hotReloadedMultimodal || hotReloadedPricing
 	return !hotReloaded
 }
 
 // commitSettingUpdates 将持久化与运行态发布绑定成同一个有序操作。
-// 只要包含多模态映射，就串行化整个提交，避免并发请求让数据库终值与运行态快照错序。
+// 热更新设置分别串行化提交，避免并发请求让数据库终值与运行态快照错序。
 func (s *Server) commitSettingUpdates(updates map[string]string, persist func() error) (bool, error) {
 	value, updatesMultimodalFallback := updates[modelMultimodalFallbackSettingKey]
+	customPricingValue, updatesCustomPricing := updates[modelCustomPricingSettingKey]
 	var multimodalFallbackModels map[string]string
 	if updatesMultimodalFallback {
 		parsed, err := parseMultimodalFallbackModels(value)
@@ -152,12 +157,27 @@ func (s *Server) commitSettingUpdates(updates map[string]string, persist func() 
 		s.multimodalFallbackUpdateMu.Lock()
 		defer s.multimodalFallbackUpdateMu.Unlock()
 	}
+	var customPricing map[string]util.ModelPricing
+	if updatesCustomPricing {
+		parsed, err := util.ParseCustomModelPricing(customPricingValue)
+		if err != nil {
+			return false, fmt.Errorf("parse validated custom pricing setting: %w", err)
+		}
+		customPricing = parsed
+		s.modelPricingUpdateMu.Lock()
+		defer s.modelPricingUpdateMu.Unlock()
+	}
 
 	if err := persist(); err != nil {
 		return false, err
 	}
 	if updatesMultimodalFallback {
 		s.setMultimodalFallbackModels(multimodalFallbackModels)
+	}
+	if updatesCustomPricing {
+		if err := util.InstallCustomModelPricing(customPricing); err != nil {
+			return false, fmt.Errorf("install custom pricing setting: %w", err)
+		}
 	}
 	return settingsRequireRestart(updates), nil
 }
@@ -404,6 +424,10 @@ func validateSettingValue(key, valueType, value string) error {
 		}
 		// 按配置项定义具体约束
 		switch key {
+		case "antigravity_max_idle_conns_per_host":
+			if intVal < 1 || intVal > 100 {
+				return fmt.Errorf("%s must be between 1 and 100", key)
+			}
 		case "max_key_retries":
 			if intVal < 1 {
 				return fmt.Errorf("max_key_retries must be >= 1")
@@ -478,7 +502,7 @@ func validateSettingValue(key, valueType, value string) error {
 			return fmt.Errorf("must be a finite number")
 		}
 		switch key {
-		case "channel_check_interval_hours", "model_catalog_sync_interval_hours":
+		case "model_catalog_sync_interval_hours":
 			if floatVal < 0 || floatVal > float64(maxSettingDurationHours) {
 				return fmt.Errorf("%s must be between 0 and %d", key, maxSettingDurationHours)
 			}
@@ -497,6 +521,9 @@ func validateSettingValue(key, valueType, value string) error {
 		intVal, err := strconv.Atoi(value)
 		if err != nil {
 			return fmt.Errorf("duration must be an integer (seconds)")
+		}
+		if key == "antigravity_idle_conn_timeout_seconds" && (intVal < 1 || intVal > 210) {
+			return fmt.Errorf("%s must be between 1 and 210 seconds", key)
 		}
 		if intVal < 0 || int64(intVal) > maxSettingDurationSeconds {
 			return fmt.Errorf("duration must be between 0 and %d seconds", maxSettingDurationSeconds)
@@ -527,10 +554,15 @@ func validateSettingValue(key, valueType, value string) error {
 		}
 
 	case "json":
-		if key != "antigravity_sensitive_words" {
+		switch key {
+		case "antigravity_sensitive_words":
+			return validateJSONStringArray(value)
+		case modelCustomPricingSettingKey:
+			_, err := util.ParseCustomModelPricing(value)
+			return err
+		default:
 			return fmt.Errorf("unknown JSON setting: %s", key)
 		}
-		return validateJSONStringArray(value)
 
 	default:
 		return fmt.Errorf("unknown value type: %s", valueType)

@@ -82,30 +82,6 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   });
 }
 
-async function syncScheduledCheckVisibility(enabledOverride) {
-  const scheduledCheckWrapper = document.getElementById('channelScheduledCheckEnabledWrapper');
-  const scheduledCheckModelWrapper = document.getElementById('channelScheduledCheckModelWrapper');
-  if (!scheduledCheckWrapper) return false;
-
-  let enabled = enabledOverride === true;
-  if (typeof enabledOverride !== 'boolean') {
-    try {
-      const setting = await fetchDataWithAuth('/admin/settings/channel_check_interval_hours');
-      const intervalHours = Number(setting && setting.value);
-      enabled = Number.isFinite(intervalHours) && intervalHours > 0;
-    } catch (error) {
-      console.warn('Failed to load channel check interval setting', error);
-    }
-  }
-
-  scheduledCheckWrapper.hidden = !enabled;
-  if (scheduledCheckModelWrapper) {
-    scheduledCheckModelWrapper.hidden = !enabled;
-  }
-  syncScheduledCheckModelState();
-  return enabled;
-}
-
 function setScheduledCheckModelHint(i18nKey) {
   const hint = document.getElementById('channelScheduledCheckModelHint');
   if (!hint) return;
@@ -183,7 +159,21 @@ function syncScheduledCheckModelState() {
     input.value = nextLabel;
   }
 
-  input.disabled = wrapper.hidden || !checkbox.checked;
+  input.disabled = !checkbox.checked;
+  for (const id of ['channelScheduledCheckIntervalMinutes', 'channelScheduledCheckStartTime']) {
+    const field = document.getElementById(`${id}Wrapper`);
+    if (field) field.hidden = !checkbox.checked;
+    const control = document.getElementById(id);
+    if (control) {
+      control.disabled = !checkbox.checked;
+      control.removeAttribute?.('aria-invalid');
+    }
+    const error = document.getElementById(`${id}Error`);
+    if (error) {
+      error.hidden = true;
+      error.textContent = '';
+    }
+  }
 }
 
 function setChannelWebsocketChecked(checkbox, checked) {
@@ -282,9 +272,9 @@ async function detectChannelWebsocketSupport(button) {
   }
 }
 
-async function handleChannelSaveSuccess({ isNewChannel, savedChannelId, response }) {
-  if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterSave === 'function') {
-    await window.ChannelModalHooks.afterSave({
+async function handleChannelUpdateSuccess({ isNewChannel = false, savedChannelId, response } = {}) {
+  if (window.ChannelModalHooks && typeof window.ChannelModalHooks.afterUpdate === 'function') {
+    await window.ChannelModalHooks.afterUpdate({
       isNewChannel,
       savedChannelId,
       response
@@ -335,11 +325,22 @@ function initChannelEditorActions() {
         'batch-delete-urls': () => invokeChannelEditorAction('batchDeleteSelectedURLs'),
         'open-key-import-modal': () => invokeChannelEditorAction('openKeyImportModal'),
         'open-key-export-modal': () => invokeChannelEditorAction('openKeyExportModal'),
+        'open-key-sort-modal': () => invokeChannelEditorAction('openKeySortModal'),
+        'close-key-sort-modal': () => invokeChannelEditorAction('closeKeySortModal'),
+        'confirm-key-sort': () => invokeChannelEditorAction('confirmKeySort'),
         'toggle-inline-key-visibility': () => invokeChannelEditorAction('toggleInlineKeyVisibility'),
         'batch-delete-keys': () => invokeChannelEditorAction('batchDeleteSelectedKeys'),
         'add-common-models': (actionTarget) => openCommonModelsModal(actionTarget),
         'close-common-models-modal': () => closeCommonModelsModal(),
         'confirm-common-models': () => confirmCommonModelsSelection(),
+        'close-test-modal': () => closeTestModal(),
+        'run-channel-test': () => runChannelTest(),
+        'run-batch-test': () => runBatchTest(),
+        'show-upstream-detail': () => window.UpstreamDetailModal?.show(window._lastTestUpstreamData),
+        'toggle-channel-test-response': (actionTarget) => {
+          const responseTarget = actionTarget.dataset.responseTarget;
+          if (responseTarget) window.toggleResponse(responseTarget);
+        },
         'fetch-models-from-api': () => invokeChannelEditorAction('fetchModelsFromAPI'),
         'add-redirect-row': () => invokeChannelEditorAction('addRedirectRow'),
         'export-channel-models': () => invokeChannelEditorAction('exportChannelModels'),
@@ -374,7 +375,7 @@ function initChannelEditorActions() {
         'toggle-select-all-urls': (actionTarget) => invokeChannelEditorAction('toggleSelectAllURLs', actionTarget.checked),
         'toggle-select-all-keys': (actionTarget) => invokeChannelEditorAction('toggleSelectAllKeys', actionTarget.checked),
         'filter-keys-by-status': (actionTarget) => invokeChannelEditorAction('filterKeysByStatus', actionTarget.value),
-        'toggle-select-all-models': (actionTarget) => invokeChannelEditorAction('toggleSelectAllModels', actionTarget.checked),
+        'invert-model-selection': () => invokeChannelEditorAction('invertVisibleModelSelection'),
         'switch-model-import-format': (actionTarget) => invokeChannelEditorAction('switchModelImportFormat', actionTarget.value),
         'update-export-preview': () => invokeChannelEditorAction('updateExportPreview')
       },
@@ -427,7 +428,6 @@ async function showAddModal() {
   editingChannelAuthType = 'api_key';
   currentChannelKeyCooldowns = [];
   resetModalKeyStatusFilter();
-  await syncScheduledCheckVisibility();
 
   setChannelModalTitle('channels.addChannel');
   document.getElementById('channelForm').reset();
@@ -438,8 +438,9 @@ async function showAddModal() {
   const websocketCheckbox = document.getElementById('channelWebsockets');
   if (websocketCheckbox) websocketCheckbox.checked = false;
   document.getElementById('channelScheduledCheckModel').value = '';
+  document.getElementById('channelScheduledCheckIntervalMinutes').value = '300';
+  document.getElementById('channelScheduledCheckStartTime').value = '00:00';
 	await ensureProtocolTransformModeCombobox('auto');
-  document.querySelector('input[name="keyStrategy"][value="sequential"]').checked = true;
 
   redirectTableData = [];
   selectedModelIndices.clear();
@@ -499,17 +500,13 @@ async function editChannel(id) {
   const urlStats = editorData.url_stats && Array.isArray(editorData.url_stats.items)
     ? editorData.url_stats.items
     : [];
-  const scheduledCheckEnabled = Boolean(
-    editorData.features && editorData.features.scheduled_check_enabled
-  );
 
   resetModalKeyStatusFilter();
 
-  const scheduledVisibilityPromise = syncScheduledCheckVisibility(scheduledCheckEnabled);
   const protocolModeRenderPromise = ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
 
   editingChannelId = id;
-  editingChannelAuthType = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(channel.auth_type)
+  editingChannelAuthType = ['codebuddy_oauth', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(channel.auth_type)
     ? channel.auth_type
     : 'api_key';
   clearChannelDuplicateHint();
@@ -520,7 +517,6 @@ async function editChannel(id) {
   applyURLStats(urlStats);
 
   await Promise.all([
-    scheduledVisibilityPromise,
     protocolModeRenderPromise
   ]);
 
@@ -558,11 +554,6 @@ async function editChannel(id) {
       editorData.oauth_credential_info || null
     );
   }
-  const keyStrategy = channel.key_strategy || 'sequential';
-  const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
-  if (strategyRadio) {
-    strategyRadio.checked = true;
-  }
   document.getElementById('channelPriority').value = channel.priority;
   document.getElementById('channelRPMLimit').value = channel.rpm_limit || 0;
   document.getElementById('channelMaxConcurrency').value = String(channel.max_concurrency || 0);
@@ -572,6 +563,8 @@ async function editChannel(id) {
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
+  document.getElementById('channelScheduledCheckIntervalMinutes').value = channel.scheduled_check_interval_minutes ?? 300;
+  document.getElementById('channelScheduledCheckStartTime').value = channel.scheduled_check_start_time ?? '00:00';
   const retryOtherKeysCheckbox = document.getElementById('channelRetryOtherKeysOnFailure');
   if (retryOtherKeysCheckbox) retryOtherKeysCheckbox.checked = !!channel.retry_other_keys_on_failure;
 
@@ -769,8 +762,37 @@ function collectModelsForSubmit(rows) {
     }));
 }
 
+function validateChannelScheduledCheckSchedule() {
+  const intervalInput = document.getElementById('channelScheduledCheckIntervalMinutes');
+  const startInput = document.getElementById('channelScheduledCheckStartTime');
+  const interval = Number(intervalInput.value);
+  const scheduleErrors = [
+    [intervalInput, Number.isInteger(interval) && interval >= 1 && interval <= 1440, 'channels.scheduledCheckIntervalInvalid'],
+    [startInput, /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(startInput.value.trim()), 'channels.scheduledCheckStartInvalid']
+  ];
+  for (const [input, valid, errorKey] of scheduleErrors) {
+    const error = document.getElementById(`${input.id}Error`);
+    if (error) {
+      error.textContent = valid ? '' : window.t(errorKey);
+      error.hidden = valid;
+    }
+    if (!valid) {
+      if (!document.getElementById('customRulesModal')?.classList.contains('show')) {
+        invokeChannelEditorAction('openCustomRulesModal');
+      }
+      invokeChannelEditorAction('switchAdvancedSettingsTab', 'other');
+      input.setAttribute('aria-invalid', 'true');
+      input.focus();
+      return false;
+    }
+    input.removeAttribute?.('aria-invalid');
+  }
+  return true;
+}
+
 async function saveChannel(event) {
   event.preventDefault();
+  if (!validateChannelScheduledCheckSchedule()) return;
 
   const cooldownRuleErrors = invokeChannelEditorAction('validateCooldownDetectionRulesForSubmit');
   if (Array.isArray(cooldownRuleErrors) && cooldownRuleErrors.length > 0) {
@@ -789,8 +811,12 @@ async function saveChannel(event) {
     return;
   }
 
-  const isOAuth = ['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType);
+  const isOAuth = ['codebuddy_oauth', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType);
   const validKeyRows = isOAuth ? [] : getValidInlineKeyRows();
+  if (validKeyRows.some(row => !Number.isInteger(row.priority) || row.priority < -99999 || row.priority > 9999999)) {
+    if (window.showError) window.showError(window.t('channels.keyPriorityInvalid'));
+    return;
+  }
   const validKeys = validKeyRows.map(row => row.api_key);
   if (!isOAuth && validKeyRows.length === 0) {
     alert(window.t('channels.atLeastOneKey'));
@@ -822,7 +848,6 @@ async function saveChannel(event) {
     return;
   }
 
-  const keyStrategy = document.querySelector('input[name="keyStrategy"]:checked')?.value || 'sequential';
 
   const formData = {
     name: document.getElementById('channelName').value.trim(),
@@ -834,7 +859,8 @@ async function saveChannel(event) {
       note: row.note || '',
       allowed_models: Array.isArray(row.allowed_models) ? [...row.allowed_models] : [],
       model_scope_empty: row.model_scope_empty === true,
-      cost_multiplier: row.cost_multiplier
+      cost_multiplier: row.cost_multiplier,
+      priority: row.priority
     })),
     protocol_transform_mode: getProtocolTransformMode(),
     priority: parseInt(document.getElementById('channelPriority').value) || 0,
@@ -846,6 +872,8 @@ async function saveChannel(event) {
     scheduled_check_enabled: document.getElementById('channelScheduledCheckEnabled').checked,
     websockets: !!document.getElementById('channelWebsockets')?.checked,
     scheduled_check_model: document.getElementById('channelScheduledCheckModel').value.trim(),
+    scheduled_check_interval_minutes: Number(document.getElementById('channelScheduledCheckIntervalMinutes').value),
+    scheduled_check_start_time: document.getElementById('channelScheduledCheckStartTime').value.trim(),
     custom_request_rules: invokeChannelEditorAction('collectCustomRulesForSubmit') || null,
     cooldown_detection_rules: invokeChannelEditorAction('collectCooldownDetectionRulesForSubmit') || null,
     proxy_url: (document.getElementById('channelProxyURL')?.value || '').trim(),
@@ -853,7 +881,6 @@ async function saveChannel(event) {
     available_time_end: (document.getElementById('channelAvailableTimeEnd')?.value || '').trim(),
     retry_other_keys_on_failure: !!document.getElementById('channelRetryOtherKeysOnFailure')?.checked
   };
-  if (!isOAuth) formData.key_strategy = keyStrategy;
   if (isOAuth) {
     // OAuth 凭证 1:1：倍率经合成 Key 行提交（后端 ToConfig 取 APIKeys[0].CostMultiplier 写入渠道列）。
     // 合成行的 api_key 为掩码后的非空值，保证不被 normalizeAPIKeys 丢弃；未提交时后端保底现值。
@@ -898,7 +925,7 @@ async function saveChannel(event) {
     invokeChannelEditorAction('completeManagementAccountSave');
     resetChannelFormDirty(); // 保存成功，重置dirty状态（避免closeModal弹确认框）
     closeModal();
-    await handleChannelSaveSuccess({ isNewChannel, savedChannelId, response: resp });
+    await handleChannelUpdateSuccess({ isNewChannel, savedChannelId, response: resp });
     if (window.showSuccess) window.showSuccess(isNewChannel ? window.t('channels.channelAdded') : window.t('channels.channelUpdated'));
   } catch (e) {
     console.error('Save channel failed', e);
@@ -1871,7 +1898,6 @@ function batchRefreshSelectedChannelsReplace() {
 async function copyChannel(id, name) {
   const channel = channels.find(c => c.id === id);
   if (!channel) return;
-  await syncScheduledCheckVisibility();
 
   const copiedName = generateCopyName(name);
 
@@ -1901,11 +1927,6 @@ async function copyChannel(id, name) {
 
   await ensureProtocolTransformModeCombobox(channel.protocol_transform_mode);
   scheduleChannelDuplicateHintCheck();
-  const keyStrategy = channel.key_strategy || 'sequential';
-  const strategyRadio = document.querySelector(`input[name="keyStrategy"][value="${keyStrategy}"]`);
-  if (strategyRadio) {
-    strategyRadio.checked = true;
-  }
   document.getElementById('channelPriority').value = channel.priority;
   document.getElementById('channelRPMLimit').value = channel.rpm_limit || 0;
   document.getElementById('channelMaxConcurrency').value = String(channel.max_concurrency || 0);
@@ -1915,6 +1936,8 @@ async function copyChannel(id, name) {
   if (websocketCheckbox) websocketCheckbox.checked = !!channel.websockets;
   document.getElementById('channelScheduledCheckEnabled').checked = !!channel.scheduled_check_enabled;
   document.getElementById('channelScheduledCheckModel').value = channel.scheduled_check_model || '';
+  document.getElementById('channelScheduledCheckIntervalMinutes').value = channel.scheduled_check_interval_minutes ?? 300;
+  document.getElementById('channelScheduledCheckStartTime').value = channel.scheduled_check_start_time ?? '00:00';
   const proxyUrlInput = document.getElementById('channelProxyURL');
   if (proxyUrlInput) proxyUrlInput.value = channel.proxy_url || '';
   const availableTimeStart = document.getElementById('channelAvailableTimeStart');
@@ -2270,8 +2293,16 @@ async function confirmModelImport() {
   }
 }
 
+function getModelsForExport(rows, selectedIndices) {
+  const sourceRows = selectedIndices?.size > 0
+    ? (rows || []).filter((_, index) => selectedIndices.has(index))
+    : rows;
+  return collectModelsForSubmit(sourceRows);
+}
+
 function exportChannelModels() {
-  const models = collectModelsForSubmit(redirectTableData);
+  const selectedIndices = typeof selectedModelIndices !== 'undefined' ? selectedModelIndices : null;
+  const models = getModelsForExport(redirectTableData, selectedIndices);
   const text = window.ModelEntryParser.serializeModelEntries(models);
   if (!text) {
     if (window.showWarning) window.showWarning(window.t('channels.noModelsToExport'));
@@ -2383,18 +2414,16 @@ async function testRedirectModel(index, button) {
     return false;
   }
 
-  const channel = channels.find(item => item.id === editingChannelId);
-  if (!channel) {
-    if (window.showError) window.showError(window.t('channels.test.channelNotFound'));
-    return false;
-  }
-
   if (button) {
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
   }
   try {
-    const opened = await testChannel(channel.id, channel.name, modelName);
+    const opened = await testChannel({
+      id: editingChannelId,
+      name: document.getElementById('channelName').value,
+      models: redirectTableData
+    }, modelName);
     if (!opened) return false;
     await runChannelTest();
     return true;
@@ -2498,7 +2527,7 @@ function renderActiveRedirectModelStatus(statusCell, redirect) {
     : Math.max(0, responseRemainingMS);
   if (cooldownRemainingMS > 0) {
     const badge = TemplateEngine.render('tpl-cooldown-badge', {
-      text: humanizeMS(cooldownRemainingMS)
+      text: formatCooldownRecoveryTime(cooldownRemainingMS, 'channels.status.daysHoursUntilRecovery')
     });
     if (badge) {
       badge.classList.add('redirect-model-cooldown-badge');
@@ -2710,6 +2739,8 @@ function renderRedirectTable() {
   const validCount = redirectTableData.filter(r => r.model && r.model.trim()).length;
   countSpan.textContent = validCount;
   syncScheduledCheckModelState();
+  updateSelectAllModelsCheckbox();
+  updateModelBatchDeleteButton();
 
   // 初始化事件委托（仅一次）
   initRedirectTableEventDelegation();
@@ -2749,10 +2780,6 @@ function renderRedirectTable() {
   tbody.appendChild(fragment);
   syncChannelEditorTableSizing();
 
-  // 更新全选复选框和批量删除按钮状态
-  updateSelectAllModelsCheckbox();
-  updateModelBatchDeleteButton();
-
   // Translate dynamically rendered elements
   if (window.i18n && window.i18n.translatePage) {
     window.i18n.translatePage();
@@ -2775,18 +2802,19 @@ function toggleModelSelection(index, checked) {
 }
 
 /**
- * 全选/取消全选模型（仅操作当前可见的模型）
+ * 反选当前可见的模型；全选与全不选时互相切换
  */
-function toggleSelectAllModels(checked) {
+function invertVisibleModelSelection() {
   const visibleIndices = getVisibleModelIndices();
 
-  if (checked) {
-    visibleIndices.forEach(index => selectedModelIndices.add(index));
-  } else {
-    visibleIndices.forEach(index => selectedModelIndices.delete(index));
-  }
+  visibleIndices.forEach(index => {
+    if (selectedModelIndices.has(index)) {
+      selectedModelIndices.delete(index);
+    } else {
+      selectedModelIndices.add(index);
+    }
+  });
 
-  updateModelBatchDeleteButton();
   renderRedirectTable();
 }
 
@@ -3414,7 +3442,7 @@ async function fetchModelsFromAPI() {
   let fetchOptions;
   let modelFetchEntries = [];
   let skippedKeyCount = 0;
-  if (['antigravity_oauth', 'codex_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType)) {
+  if (['codebuddy_oauth', 'antigravity_oauth', 'codex_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth', 'cursor_oauth', 'zed_oauth'].includes(editingChannelAuthType)) {
     if (!editingChannelId) {
       if (window.showError) window.showError(window.t('channels.saveBeforeModelTest'));
       else alert(window.t('channels.saveBeforeModelTest'));
@@ -3654,8 +3682,6 @@ const COMMON_MODELS = {
     'claude-sonnet-4-6',
   ],
   codex: [
-    'gpt-5.4',
-    'gpt-5.4-mini',
     'gpt-5.5',
     'gpt-5.6-sol',
     'gpt-5.6-luna',
@@ -3817,6 +3843,7 @@ function confirmCommonModelsSelection() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    handleChannelUpdateSuccess,
     addCommonModels,
     fetchedKeyModelApplyAccepted,
     addCommonModelsToRows,
@@ -3838,6 +3865,7 @@ if (typeof module !== 'undefined' && module.exports) {
     exportChannelModels,
     fetchModelsFromAPI,
     fetchKeyRate,
+    getModelsForExport,
     initModelNormalizationOptions,
     mergeModelRowsWithFetchedModels,
     openBatchModelImportModal,

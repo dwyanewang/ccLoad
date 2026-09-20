@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 
+	"github.com/bytedance/sonic"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -33,7 +33,7 @@ func newResponsesWebsocketSession(maxBodyBytes int64) *responsesWebsocketSession
 }
 
 func (s *responsesWebsocketSession) normalizeRequest(payload []byte) ([]byte, error) {
-	if !gjson.ValidBytes(payload) {
+	if !sonic.Valid(payload) {
 		return nil, errors.New("invalid websocket request JSON")
 	}
 	requestType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
@@ -94,10 +94,6 @@ func (s *responsesWebsocketSession) normalizeRequest(payload []byte) ([]byte, er
 
 func (s *responsesWebsocketSession) normalizeFullReplacement(payload []byte) ([]byte, error) {
 	normalized, err := normalizeReplacementResponsesWebsocketRequest(payload, s.lastRequest)
-	if err != nil {
-		return nil, err
-	}
-	normalized, err = preserveGatewayOwnedResponsesInput(normalized, s.lastRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +177,15 @@ func (s *responsesWebsocketSession) normalizeHTTPRequests(payload []byte) (
 		}
 		return replayRequest, bytes.Clone(replayRequest), true, nil
 	}
+	if !gjson.GetBytes(websocketPayload, "instructions").Exists() {
+		instructions := gjson.GetBytes(s.lastRequest, "instructions")
+		if instructions.Exists() {
+			websocketPayload, err = sjson.SetRawBytes(websocketPayload, "instructions", []byte(instructions.Raw))
+			if err != nil {
+				return nil, nil, false, fmt.Errorf("inherit HTTP instructions: %w", err)
+			}
+		}
+	}
 	replayRequest, incrementalRequest, err = s.normalizeRequests(websocketPayload)
 	return replayRequest, incrementalRequest, err == nil, err
 }
@@ -234,99 +239,11 @@ func normalizeReplacementResponsesWebsocketRequest(payload []byte, lastRequest [
 			normalized, _ = sjson.SetBytes(normalized, "model", modelName)
 		}
 	}
-	if !gjson.GetBytes(normalized, "instructions").Exists() {
-		instructions := gjson.GetBytes(lastRequest, "instructions")
-		if instructions.Exists() {
-			normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
-		}
-	}
 	normalized, err = sjson.SetBytes(normalized, "stream", true)
 	if err != nil {
 		return nil, fmt.Errorf("force streaming request: %w", err)
 	}
 	return normalized, nil
-}
-
-// preserveGatewayOwnedResponsesInput keeps internal completed tool pairs across
-// a client-driven full replay. The client cannot echo items it never received.
-// We only restore them when the client's visible input exactly extends the last
-// committed visible prefix; otherwise replacement semantics win and we do not
-// guess where hidden state belongs.
-func preserveGatewayOwnedResponsesInput(payload, lastRequest []byte) ([]byte, error) {
-	lastInput := gjson.GetBytes(lastRequest, "input")
-	nextInput := gjson.GetBytes(payload, "input")
-	if !lastInput.IsArray() || !nextInput.IsArray() {
-		return payload, nil
-	}
-
-	lastItems := lastInput.Array()
-	visibleItems := make([]gjson.Result, 0, len(lastItems))
-	gatewayCallIDs := make(map[string]struct{})
-	for index := 0; index < len(lastItems); index++ {
-		if index+1 < len(lastItems) {
-			if callID, ok := codexQuotaOverdraftGatewayPair(lastItems[index], lastItems[index+1]); ok {
-				gatewayCallIDs[callID] = struct{}{}
-				index++
-				continue
-			}
-		}
-		visibleItems = append(visibleItems, lastItems[index])
-	}
-	if len(gatewayCallIDs) == 0 {
-		return payload, nil
-	}
-
-	nextItems := nextInput.Array()
-	if len(nextItems) < len(visibleItems) {
-		return payload, nil
-	}
-	for index := range visibleItems {
-		if !responsesWebsocketJSONEqual(visibleItems[index], nextItems[index]) {
-			return payload, nil
-		}
-	}
-	for _, item := range nextItems {
-		if _, exists := gatewayCallIDs[strings.TrimSpace(item.Get("call_id").String())]; exists {
-			return payload, nil
-		}
-	}
-
-	merged := make([]json.RawMessage, 0, len(lastItems)+len(nextItems)-len(visibleItems))
-	for _, item := range lastItems {
-		merged = append(merged, json.RawMessage(bytes.Clone([]byte(item.Raw))))
-	}
-	for _, item := range nextItems[len(visibleItems):] {
-		merged = append(merged, json.RawMessage(bytes.Clone([]byte(item.Raw))))
-	}
-	encoded, err := json.Marshal(merged)
-	if err != nil {
-		return nil, fmt.Errorf("marshal websocket gateway-owned input: %w", err)
-	}
-	updated, err := sjson.SetRawBytes(payload, "input", encoded)
-	if err != nil {
-		return nil, fmt.Errorf("restore websocket gateway-owned input: %w", err)
-	}
-	return updated, nil
-}
-
-func codexQuotaOverdraftGatewayPair(call, output gjson.Result) (string, bool) {
-	if strings.TrimSpace(call.Get("type").String()) != "custom_tool_call" ||
-		strings.TrimSpace(call.Get("name").String()) != "exec" ||
-		strings.TrimSpace(output.Get("type").String()) != "custom_tool_call_output" {
-		return "", false
-	}
-	callID := strings.TrimSpace(call.Get("call_id").String())
-	return callID, strings.HasPrefix(callID, "call_ccload_overdraft_") &&
-		strings.TrimSpace(output.Get("call_id").String()) == callID
-}
-
-func responsesWebsocketJSONEqual(left, right gjson.Result) bool {
-	var leftValue any
-	var rightValue any
-	if json.Unmarshal([]byte(left.Raw), &leftValue) != nil || json.Unmarshal([]byte(right.Raw), &rightValue) != nil {
-		return false
-	}
-	return reflect.DeepEqual(leftValue, rightValue)
 }
 
 func mergeResponsesWebsocketInput(parts ...gjson.Result) ([]byte, error) {

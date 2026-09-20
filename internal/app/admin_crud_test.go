@@ -84,7 +84,7 @@ func TestHandleListChannels(t *testing.T) {
 	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
 
 	// 调用处理函数
-	server.handleListChannels(c)
+	server.HandleChannels(c)
 
 	// 验证响应
 	if w.Code != http.StatusOK {
@@ -857,7 +857,7 @@ func TestHandleGetChannel(t *testing.T) {
 		{
 			name:           "无效的渠道ID",
 			channelID:      "invalid",
-			expectedStatus: http.StatusNotFound, // strconv.ParseInt失败会传入0，查不到返回404
+			expectedStatus: http.StatusBadRequest,
 			checkSuccess:   false,
 		},
 	}
@@ -867,9 +867,7 @@ func TestHandleGetChannel(t *testing.T) {
 			c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/"+tt.channelID, nil))
 			c.Params = gin.Params{{Key: "id", Value: tt.channelID}}
 
-			// 从Params中解析ID并调用
-			id, _ := strconv.ParseInt(tt.channelID, 10, 64)
-			server.handleGetChannel(c, id)
+			server.HandleChannelByID(c)
 
 			if w.Code != tt.expectedStatus {
 				t.Errorf("期望状态码%d，实际%d", tt.expectedStatus, w.Code)
@@ -1122,9 +1120,6 @@ func TestHandleChannelEditorAggregatesInitialState(t *testing.T) {
 			Available bool      `json:"available"`
 			Items     []URLStat `json:"items"`
 		} `json:"url_stats"`
-		Features struct {
-			ScheduledCheckEnabled bool `json:"scheduled_check_enabled"`
-		} `json:"features"`
 	}](t, w.Body.Bytes())
 
 	if resp.Data.Channel.ID != created.ID || resp.Data.Channel.Name != created.Name {
@@ -1138,9 +1133,6 @@ func TestHandleChannelEditorAggregatesInitialState(t *testing.T) {
 	}
 	if !resp.Data.URLStats.Available || len(resp.Data.URLStats.Items) != 1 || resp.Data.URLStats.Items[0].Requests != 1 {
 		t.Fatalf("url_stats=%+v, want available runtime stats", resp.Data.URLStats)
-	}
-	if !resp.Data.Features.ScheduledCheckEnabled {
-		t.Fatalf("features=%+v, want scheduled check enabled", resp.Data.Features)
 	}
 }
 
@@ -2767,5 +2759,100 @@ func TestChannelRequestValidate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandleChannelAPIKeyPriorities(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.cooldownManager = cooldown.NewManager(store, server)
+	server.channelManagement = newChannelManagementService(store, func(*model.Config) *http.Client { return server.client })
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+	ctx := context.Background()
+	priority := -9
+	payload := ChannelRequest{
+		Name: "key-priorities", URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+		Models: []model.ModelEntry{{Model: "model-1"}}, Enabled: true,
+		KeyStrategy: model.KeyStrategyRoundRobin,
+		APIKeys:     []ChannelAPIKeyRequest{{APIKey: "sk-default"}, {APIKey: "sk-priority", Priority: &priority}},
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
+	server.handleCreateChannel(c)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	created := mustParseAPIResponse[*model.Config](t, w.Body.Bytes()).Data
+	readKeys := func() []*model.APIKey {
+		t.Helper()
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/keys", nil))
+		server.handleGetChannelKeys(c, created.ID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("read: %d %s", w.Code, w.Body.String())
+		}
+		return mustParseAPIResponse[[]*model.APIKey](t, w.Body.Bytes()).Data
+	}
+	keys := readKeys()
+	if len(keys) != 2 || keys[0].Priority != 0 || keys[1].Priority != -9 {
+		t.Fatalf("created priorities: %+v", keys)
+	}
+	created.CostMultiplier = 2.5 // Legacy channel-level value is no longer authoritative for API keys.
+	if _, err := store.UpdateConfig(ctx, created.ID, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAPIKeyDisabled(ctx, created.ID, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := store.SetKeyCooldown(ctx, created.ID, 1, until); err != nil {
+		t.Fatal(err)
+	}
+	server.InvalidateAPIKeysCache(created.ID)
+	_ = readKeys() // Warm the cache before updating priority.
+	update := func() {
+		t.Helper()
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/channels", payload))
+		server.handleUpdateChannel(c, created.ID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("update: %d %s", w.Code, w.Body.String())
+		}
+	}
+	payload.KeyStrategy = ""                              // The editor no longer submits the historical field.
+	payload.ManagementAccount = &channelManagementInput{} // Browser submits the unchanged management settings.
+	priority = 17
+	payload.APIKeys[0].Priority = &priority
+	payload.APIKeys[1].Priority = nil
+	update()
+	keys = readKeys()
+	if keys[0].KeyStrategy != model.KeyStrategyRoundRobin || keys[1].KeyStrategy != model.KeyStrategyRoundRobin || keys[0].Priority != 17 || keys[1].Priority != -9 || !keys[0].Disabled || keys[1].CooldownUntil != until.Unix() {
+		t.Fatalf("priority update lost state or retained stale cache: %+v %+v", keys[0], keys[1])
+	}
+	priority = 0
+	update()
+	keys = readKeys()
+	if keys[0].Priority != 0 || keys[1].Priority != -9 || keys[1].CooldownUntil != until.Unix() {
+		t.Fatalf("explicit zero lost state: %+v %+v", keys[0], keys[1])
+	}
+	payload.APIKeys = []ChannelAPIKeyRequest{{APIKey: "sk-priority"}, {APIKey: "sk-default"}, {APIKey: "sk-new"}}
+	update()
+	keys = readKeys()
+	if keys[0].Priority != -9 || keys[1].Priority != 0 || keys[2].Priority != 0 || !keys[1].Disabled {
+		t.Fatalf("rebuild lost priority/state: %+v", keys)
+	}
+}
+
+func TestHandleCreateChannelRejectsInvalidKeyPriority(t *testing.T) {
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	for _, priority := range []any{-100000, 10000000, 1.5, "2"} {
+		payload := map[string]any{
+			"name": "bad-priority", "urls": []map[string]string{{"url": "https://api.example.com"}},
+			"models":   []map[string]string{{"model": "model-1"}},
+			"api_keys": []map[string]any{{"api_key": "sk-test", "priority": priority}},
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
+		server.handleCreateChannel(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("priority=%v: status=%d body=%s", priority, w.Code, w.Body.String())
+		}
 	}
 }

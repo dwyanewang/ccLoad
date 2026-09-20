@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +25,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/model"
@@ -50,7 +54,6 @@ type testChannel struct {
 	customRequestRules      *model.CustomRequestRules
 	cooldownDetectionRules  *model.CooldownDetectionRules
 	retryOtherKeysOnFailure bool
-	codexQuotaOverdraft     bool
 	models                  string // 逗号分隔的模型列表
 	apiKey                  string
 	authType                string
@@ -63,6 +66,156 @@ type proxyTestEnv struct {
 	server *Server
 	store  storage.Store
 	engine *gin.Engine
+}
+
+func TestProxy_CodeBuddyWireAndCompletion(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, clientProtocol := range []string{"openai", "anthropic", "codex", "gemini"} {
+			t.Run(fmt.Sprintf("%s/stream=%v", clientProtocol, stream), func(t *testing.T) {
+				t.Parallel()
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var request map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+					}
+					if request["stream"] != true {
+						t.Error("upstream must stream")
+					}
+					if r.Header.Get("Authorization") != "Bearer access" || r.Header.Get("X-Refresh-Token") != "" || r.Header.Get("X-User-Id") != "uid" {
+						t.Error("provider credentials missing")
+					}
+					if r.Header.Get("X-CodeBuddy-Request") != "1" || r.Header.Get("X-Agent-Intent") != "craft" || r.Header.Get("X-Conversation-Request-ID") == "" {
+						t.Error("official CodeBuddy chat fingerprint missing")
+					}
+					if r.URL.Path != "/v2/chat/completions" {
+						t.Errorf("path %s", r.URL.Path)
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					for _, chunk := range []string{
+						`{"id":"chat-1","model":"hy3","created":100,"object":"response","choices":[{"index":0,"delta":{"role":"assistant","content":"hello","tool_calls":[],"function_call":null},"finish_reason":null}]}`,
+						`{"id":"chat-1","model":"hy3","object":"response","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}`,
+						`{"id":"chat-1","object":"response","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}`,
+					} {
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+						w.(http.Flusher).Flush()
+					}
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				}))
+				defer upstream.Close()
+				credential, _ := (&codebuddyauth.Credential{AccessToken: "access", RefreshToken: "refresh", UID: "uid"}).JSON()
+				env := setupProxyTestEnv(t, []testChannel{{name: "codebuddy", upstreamProtocol: "openai", models: "hy3", authType: model.AuthTypeCodeBuddyOAuth, oauthCredential: credential}}, map[int]string{0: upstream.URL + "/v2/chat/completions#"})
+				path := "/v1/chat/completions"
+				body := map[string]any{"model": "hy3", "stream": stream, "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+				switch clientProtocol {
+				case "anthropic":
+					path = "/v1/messages"
+					body["max_tokens"] = 32
+				case "codex":
+					path = "/v1/responses"
+					delete(body, "messages")
+					body["input"] = []any{
+						map[string]any{"type": "compaction", "encrypted_content": "opaque"},
+						map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}},
+					}
+				case "gemini":
+					path = "/v1beta/models/hy3:generateContent"
+					if stream {
+						path = "/v1beta/models/hy3:streamGenerateContent"
+					}
+					delete(body, "messages")
+					body["contents"] = []any{map[string]any{"role": "user", "parts": []any{map[string]any{"text": "hi"}}}}
+				}
+				response := doProxyRequest(t, env.engine, path, body, nil)
+				if response.Code != 200 {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				if !stream {
+					var payload map[string]any
+					if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+						t.Fatalf("nonstream not JSON: %v %s", err, response.Body.String())
+					}
+					if clientProtocol == "openai" && (gjson.GetBytes(response.Body.Bytes(), "choices.0.message.content").String() != "hello world" || gjson.GetBytes(response.Body.Bytes(), "usage.total_tokens").Int() != 13) {
+						t.Fatalf("incomplete completion %s", response.Body.String())
+					}
+				} else {
+					parser := newSSEUsageParser(clientProtocol)
+					if err := parser.Feed(response.Body.Bytes()); err != nil {
+						t.Fatal(err)
+					}
+					if !parser.IsStreamComplete() {
+						t.Fatalf("incomplete SSE: %s", response.Body.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProxy_CodeBuddyNonStreamToolCallsAndErrors(t *testing.T) {
+	for _, scenario := range []string{"tools", "length", "missing-done", "truncated", "error", "business-error", "json-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Parallel()
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if scenario == "json-error" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"code":11101,"msg":"rejected"}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				if scenario == "error" {
+					_, _ = io.WriteString(w, "data: {\"error\":{\"type\":\"server_error\",\"message\":\"unavailable\"}}\n\n")
+					return
+				}
+				if scenario == "business-error" {
+					_, _ = io.WriteString(w, "data: {\"code\":11101,\"msg\":\"rejected\"}\n\n")
+					return
+				}
+				chunks := []string{
+					`{"id":"c","model":"hy3","choices":[{"index":0,"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}},{"index":1,"id":"call_b","type":"function","function":{"name":"second","arguments":"{"}}]}}]}`,
+					`{"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"}"}},{"index":0,"function":{"arguments":"\"test\"}"}}]}}]}`,
+				}
+				for _, chunk := range chunks {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+				}
+				if scenario == "truncated" {
+					return
+				}
+				finish := "tool_calls"
+				if scenario == "length" {
+					finish = "length"
+				}
+				_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":%q}]}\n\n", finish)
+				_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n")
+				if scenario != "missing-done" {
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				}
+			}))
+			defer upstream.Close()
+			credential, _ := (&codebuddyauth.Credential{AccessToken: "access"}).JSON()
+			env := setupProxyTestEnv(t, []testChannel{{name: "codebuddy", upstreamProtocol: "openai", models: "hy3", authType: model.AuthTypeCodeBuddyOAuth, oauthCredential: credential}}, map[int]string{0: upstream.URL + "/v2/chat/completions#"})
+			response := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{"model": "hy3", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}, nil)
+			if scenario == "error" || scenario == "business-error" || scenario == "json-error" || scenario == "truncated" {
+				if response.Code == 200 {
+					t.Fatalf("failure reported success: %s", response.Body.String())
+				}
+				return
+			}
+			if response.Code != 200 {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			payload := gjson.ParseBytes(response.Body.Bytes())
+			calls := payload.Get("choices.0.message.tool_calls").Array()
+			if len(calls) != 2 || calls[0].Get("id").String() != "call_a" || calls[0].Get("function.arguments").String() != `{"q":"test"}` || calls[1].Get("function.arguments").String() != "{}" {
+				t.Fatalf("broken tool aggregation %s", response.Body.String())
+			}
+			if payload.Get("usage.total_tokens").Int() != 18 || payload.Get("choices.0.message.reasoning_content").String() != "think" {
+				t.Fatalf("lost usage/reasoning %s", response.Body.String())
+			}
+			if scenario == "length" && payload.Get("choices.0.finish_reason").String() != "length" {
+				t.Fatal("lost length stop reason")
+			}
+		})
+	}
 }
 
 func TestProxy_SingleURLRecordsRuntimeStats(t *testing.T) {
@@ -123,6 +276,52 @@ func TestProxy_SingleURLRecordsRuntimeStats(t *testing.T) {
 	}
 }
 
+func TestProxy_SuccessResetsExpiredModelCooldownHistory(t *testing.T) {
+	const modelName = "gpt-test"
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-1","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "expired-model-cooldown", upstreamProtocol: "openai", models: modelName,
+	}}, map[int]string{0: upstream.URL})
+	ctx := context.Background()
+	configs, err := env.store.ListConfigs(ctx)
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+	}
+
+	// Reproduce a completed cooldown that still retains its backoff duration.
+	// The channel is selectable again, but the next failure must start fresh
+	// after any successful request for the same actual model.
+	past := time.Now().Add(-2 * time.Minute)
+	duration, err := env.store.BumpModelCooldown(ctx, configs[0].ID, modelName, past, util.StatusFirstByteTimeout)
+	if err != nil {
+		t.Fatalf("seed expired model cooldown: %v", err)
+	}
+	if duration != util.TimeoutErrorCooldown {
+		t.Fatalf("seed duration=%v, want %v", duration, util.TimeoutErrorCooldown)
+	}
+
+	response := doProxyRequest(t, env.engine, "/v1/chat/completions", map[string]any{
+		"model": modelName, "messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("proxy status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	duration, err = env.store.BumpModelCooldown(ctx, configs[0].ID, modelName, time.Now(), util.StatusFirstByteTimeout)
+	if err != nil {
+		t.Fatalf("bump model cooldown after success: %v", err)
+	}
+	if duration != util.TimeoutErrorCooldown {
+		t.Fatalf("cooldown after success=%v, want fresh %v", duration, util.TimeoutErrorCooldown)
+	}
+}
+
 func TestProxy_APIKeyCostMultiplierSnapshotsPerKeyInLogs(t *testing.T) {
 	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -173,7 +372,7 @@ func TestProxy_APIKeyCostMultiplierSnapshotsPerKeyInLogs(t *testing.T) {
 		}
 	}
 	// 日志是批量异步落库，等待一个完整刷新周期。
-	time.Sleep(config.LogBatchTimeout + 250*time.Millisecond)
+	time.Sleep(srv.logService.batchTimeout + 250*time.Millisecond)
 
 	logs, err := srv.store.ListLogs(ctx, time.Now().Add(-time.Minute), 10, 0, &model.LogFilter{Model: "gpt-multiplier-test"})
 	if err != nil {
@@ -271,22 +470,10 @@ func setupProxyTestEnvWithSettings(
 				urls[urlIndex].Protocols = []string{upstreamProtocol}
 			}
 		}
-		oauthCredential := ch.oauthCredential
-		if ch.codexQuotaOverdraft {
-			credential, err := codexauth.ParseCredential([]byte(oauthCredential))
-			if err != nil {
-				t.Fatalf("parse Codex overdraft credential for %s: %v", ch.name, err)
-			}
-			credential.QuotaOverdraft = &codexauth.QuotaOverdraft{Enabled: true}
-			oauthCredential, err = credential.JSON()
-			if err != nil {
-				t.Fatalf("encode Codex overdraft credential for %s: %v", ch.name, err)
-			}
-		}
 		cfg := &model.Config{
 			Name:                    ch.name,
 			AuthType:                ch.authType,
-			OAuthCredential:         oauthCredential,
+			OAuthCredential:         ch.oauthCredential,
 			URLs:                    urls,
 			Websockets:              ch.websockets,
 			ProtocolTransformMode:   transformMode,
@@ -378,12 +565,20 @@ func antigravityProxyClaudeThoughtSignature(modelName string) string {
 	return base64.StdEncoding.EncodeToString(payload)
 }
 
+// 身份 fixture 必须是真实形态：device_id 是 64 位小写 hex，account_uuid 是 UUID。
+// isNativeAnthropicClaudeCodeRequest 按上游 isValidUserID 校验这两处，占位串会让
+// 本该直通的原生请求在测试里被误判成第三方调用方。
+const (
+	anthropicProxyTestDeviceID    = "b7c1d0e9f28a34556677889900aabbccddeeff00112233445566778899aabbcc"
+	anthropicProxyTestAccountUUID = "5c9e1a2b-3d4f-4a5b-8c6d-7e8f90a1b2c3"
+)
+
 func anthropicProxyTestCredential(t testing.TB, accessToken string) string {
 	t.Helper()
 	credential := &anthropicauth.Credential{
 		Type: anthropicauth.ChannelType, AccessToken: accessToken, RefreshToken: "rt-anthropic",
 		Expired:     time.Now().UTC().Add(10 * 24 * time.Hour).Format(time.RFC3339),
-		AccountUUID: "account-anthropic", DeviceID: "device-anthropic",
+		AccountUUID: anthropicProxyTestAccountUUID, DeviceID: anthropicProxyTestDeviceID,
 	}
 	payload, err := credential.JSON()
 	if err != nil {
@@ -413,7 +608,7 @@ func expiredProxyOAuthCredential(t testing.TB, authType, accessToken string) str
 	case model.AuthTypeAnthropicOAuth:
 		payload, err = (&anthropicauth.Credential{
 			Type: anthropicauth.ChannelType, AccessToken: accessToken, RefreshToken: "rt-anthropic",
-			Expired: expired, AccountUUID: "account-anthropic", DeviceID: "device-anthropic",
+			Expired: expired, AccountUUID: anthropicProxyTestAccountUUID, DeviceID: anthropicProxyTestDeviceID,
 		}).JSON()
 	case model.AuthTypeAntigravityOAuth:
 		payload, err = (&antigravityauth.Credential{
@@ -491,7 +686,7 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if got := headerValueFold(upstreamHeaders, "x-api-key"); got != "sk-ant-official" {
 		t.Fatalf("official Anthropic x-api-key=%q", got)
 	}
-	if got := upstreamHeaders.Get("User-Agent"); got != "claude-cli/2.1.220 (external, cli)" {
+	if got := upstreamHeaders.Get("User-Agent"); got != "claude-cli/2.1.258 (external, cli)" {
 		t.Fatalf("User-Agent=%q", got)
 	}
 	betas := headerValueFold(upstreamHeaders, "Anthropic-Beta")
@@ -521,8 +716,11 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if got := gjson.GetBytes(upstreamBody, "messages.0.content").String(); !strings.Contains(got, "keep this native prompt") {
 		t.Fatalf("caller system prompt was dropped: %s", upstreamBody)
 	}
-	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
-		t.Fatalf("CCH was not rebuilt: %q", got)
+	// 第一方 origin：真实 Claude Code 在这里发 cch，所以 API Key 渠道也必须签（见
+	// anthropicCCHSigningEnabled）。签名值不能是占位哨兵 00000。
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); !strings.HasPrefix(got, "x-anthropic-billing-header:") ||
+		!strings.Contains(got, " cch=") || strings.Contains(got, "cch=00000;") {
+		t.Fatalf("API-key billing on first-party origin must be signed: %q", got)
 	}
 	if gjson.GetBytes(upstreamBody, "temperature").Exists() || gjson.GetBytes(upstreamBody, "top_p").Exists() ||
 		gjson.GetBytes(upstreamBody, "top_k").Exists() {
@@ -764,7 +962,8 @@ func TestProxy_AnthropicCompatibleGatewayOwnsLegacySystemTurns(t *testing.T) {
 }
 
 // TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy 守住原生 Claude Code
-// 请求的直通契约：调用方已经自带完整 CLI 指纹时，网关只重签 CCH，不重写 body。
+// 请求的直通契约：调用方已经自带完整 CLI 指纹时，API Key 网关不处理 CCH，
+// 也不重写 body。
 // 与 TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry 对称——直通判定
 // 看的是请求形态，不是凭证形态，API Key 渠道同样适用。
 func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
@@ -798,7 +997,7 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
 		"model": "claude-sonnet-4-6",
 		"system": []any{
-			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"},
+			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=4d721;"},
 			map[string]any{
 				"type": "text", "text": "explicit cache only",
 				"cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"},
@@ -833,105 +1032,286 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 		gjson.GetBytes(upstreamBody, "messages.2.content.0.cache_control").Exists() {
 		t.Fatalf("automatic cache breakpoints were added beside explicit policy: %s", upstreamBody)
 	}
-	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); strings.Contains(got, "cch=00000;") || !strings.Contains(got, " cch=") {
-		t.Fatalf("CCH was not rebuilt: %q", got)
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); got != "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=4d721;" {
+		t.Fatalf("caller-owned API-key CCH changed: %q", got)
 	}
 }
 
-func TestProxy_NativeAnthropic400RepairsToolAndBudget(t *testing.T) {
+func TestProxy_NativeAnthropic400RepairsThinkingBudget(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name          string
-		upstreamError string
-		request       map[string]any
-		assertRetry   func(testing.TB, []byte)
-	}{
-		{
-			name:          "tool blocks",
-			upstreamError: `{"type":"error","error":{"type":"invalid_request_error","message":"tool_use blocks are not supported"}}`,
-			request: map[string]any{
-				"model": "claude-sonnet-4-6", "max_tokens": 4096,
-				"messages": []any{
-					map[string]any{"role": "user", "content": "call a tool"},
-					map[string]any{"role": "assistant", "content": []any{map[string]any{
-						"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{"q": "x"},
-					}}},
-					map[string]any{"role": "user", "content": []any{map[string]any{
-						"type": "tool_result", "tool_use_id": "toolu_1", "content": "result",
-					}}},
-				},
-				"tools":       []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
-				"tool_choice": map[string]any{"type": "auto"},
-			},
-			assertRetry: func(t testing.TB, body []byte) {
-				t.Helper()
-				if gjson.GetBytes(body, "tools").Exists() || gjson.GetBytes(body, "tool_choice").Exists() ||
-					strings.Contains(string(body), `"type":"tool_use"`) || strings.Contains(string(body), `"type":"tool_result"`) {
-					t.Fatalf("tool blocks survived retry: %s", body)
-				}
-				if !strings.Contains(string(body), "[Tool call: lookup]") || !strings.Contains(string(body), "[Tool result: toolu_1]") {
-					t.Fatalf("tool semantics were not preserved as text: %s", body)
-				}
-			},
-		},
-		{
-			name:          "thinking budget",
-			upstreamError: `{"type":"error","error":{"type":"invalid_request_error","message":"thinking budget_tokens must be less than max_tokens"}}`,
-			request: map[string]any{
-				"model": "claude-sonnet-4-6", "max_tokens": 10000,
-				"thinking": map[string]any{"type": "enabled", "budget_tokens": 10000},
-				"messages": []any{map[string]any{"role": "user", "content": "hello"}},
-			},
-			assertRetry: func(t testing.TB, body []byte) {
-				t.Helper()
-				if got := gjson.GetBytes(body, "thinking.type").String(); got != "enabled" {
-					t.Fatalf("thinking.type=%q body=%s", got, body)
-				}
-				if got := gjson.GetBytes(body, "thinking.budget_tokens").Int(); got != 32000 {
-					t.Fatalf("budget_tokens=%d body=%s", got, body)
-				}
-				if got := gjson.GetBytes(body, "max_tokens").Int(); got != 64000 {
-					t.Fatalf("max_tokens=%d body=%s", got, body)
-				}
-			},
-		},
+	var attempts atomic.Int32
+	var bodies [][]byte
+	env := setupProxyTestEnv(t, []testChannel{{name: "anthropic-repair", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6", apiKey: "sk-ant"}}, map[int]string{0: "https://anthropic-gateway.example.com"})
+	env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		bodies = append(bodies, body)
+		if attempts.Add(1) == 1 {
+			return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"type":"invalid_request_error","message":"thinking budget_tokens must be less than max_tokens"}}`))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))}, nil
+	})}
+	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+		"model": "claude-sonnet-4-6", "max_tokens": 10000, "thinking": map[string]any{"type": "enabled", "budget_tokens": 10000}, "messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, map[string]string{"anthropic-version": "2023-06-01"})
+	if response.Code != http.StatusOK || attempts.Load() != 2 || len(bodies) != 2 {
+		t.Fatalf("status=%d attempts=%d bodies=%d response=%s", response.Code, attempts.Load(), len(bodies), response.Body.String())
 	}
+	body := bodies[1]
+	if gjson.GetBytes(body, "thinking.type").String() != "enabled" || gjson.GetBytes(body, "thinking.budget_tokens").Int() != 32000 || gjson.GetBytes(body, "max_tokens").Int() != 64000 {
+		t.Fatalf("thinking budget was not repaired: %s", body)
+	}
+}
 
-	for _, test := range tests {
+func TestProxy_NativeAnthropicToolErrorsPreserveRequest(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct{ name, upstreamError string }{
+		{"unsupported tools", `{"error":{"type":"invalid_request_error","message":"tool_use blocks are not supported"}}`},
+		{"missing result", `{"error":{"type":"invalid_request_error","message":"tool_use ids were found without tool_result blocks immediately after: toolu_1"}}`},
+		{"wrapped Google error", `{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tool_use ids were found without tool_result blocks immediately after: toolu_1\"}}"}}`},
+		{"unsupported tool choice", `{"error":{"type":"invalid_request_error","message":"tool_choice is not supported"}}`},
+	} {
 		t.Run(test.name, func(t *testing.T) {
+			upstreamError := test.upstreamError
 			t.Parallel()
 			var attempts atomic.Int32
-			var bodies [][]byte
-			env := setupProxyTestEnv(t, []testChannel{{
-				name: "anthropic-repair", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6", apiKey: "sk-ant",
-			}}, map[int]string{0: "https://anthropic-gateway.example.com"})
+			env := setupProxyTestEnv(t, []testChannel{{name: "anthropic-tool-rejection", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6", apiKey: "sk-ant"}}, map[int]string{0: "https://anthropic-gateway.example.com"})
 			env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-				body, _ := io.ReadAll(r.Body)
-				bodies = append(bodies, body)
-				if attempts.Add(1) == 1 {
-					return &http.Response{
-						StatusCode: http.StatusBadRequest,
-						Header:     http.Header{"Content-Type": []string{"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(test.upstreamError)),
-					}, nil
+				attempts.Add(1)
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
 				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body: io.NopCloser(strings.NewReader(
-						`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
-					)),
-				}, nil
+				for path, want := range map[string]string{"tools.0.name": "lookup", "tool_choice.type": "auto", "messages.1.content.0.type": "tool_use", "messages.1.content.0.id": "toolu_1", "messages.1.content.0.input.q": "x", "messages.2.content.0.type": "tool_result", "messages.2.content.0.tool_use_id": "toolu_1", "messages.2.content.0.content": "result"} {
+					if got := gjson.GetBytes(body, path).String(); got != want {
+						t.Errorf("%s=%q, want %q", path, got, want)
+					}
+				}
+				return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(upstreamError))}, nil
 			})}
-
-			response := doProxyRequest(t, env.engine, "/v1/messages", test.request, map[string]string{
-				"anthropic-version": "2023-06-01",
-			})
-			if response.Code != http.StatusOK || attempts.Load() != 2 || len(bodies) != 2 {
-				t.Fatalf("status=%d attempts=%d bodies=%d response=%s", response.Code, attempts.Load(), len(bodies), response.Body.String())
+			response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+				"model": "claude-sonnet-4-6", "max_tokens": 4096,
+				"tools": []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}}, "tool_choice": map[string]any{"type": "auto"},
+				"messages": []any{
+					map[string]any{"role": "user", "content": "call a tool"},
+					map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{"q": "x"}}}},
+					map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "result"}}},
+				},
+			}, map[string]string{"anthropic-version": "2023-06-01"})
+			if response.Code != http.StatusBadRequest || attempts.Load() != 1 {
+				t.Fatalf("status=%d attempts=%d response=%s", response.Code, attempts.Load(), response.Body.String())
 			}
-			test.assertRetry(t, bodies[1])
+			if got := gjson.Get(response.Body.String(), "error.message").String(); got != gjson.Get(upstreamError, "error.message").String() {
+				t.Fatalf("upstream error lost: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxy_NativeAnthropicToolRepairIsLocalized(t *testing.T) {
+	t.Parallel()
+	const requestBody = `{
+		"model":"claude-sonnet-4-6","max_tokens":4096,
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}},{"name":"read","input_schema":{"type":"object"}},{"name":"unused","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"tool","name":"lookup"},
+		"messages":[
+			{"role":"user","content":"call tools"},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"Call_A","name":"lookup","input":{"q":"a"}},
+				{"type":"tool_use","id":"Call_B","name":"read","input":{"file":"keep"}},
+				{"type":"tool_use","id":"Call_C","name":"lookup","input":{"q":"c"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"Call_A","is_error":true,"cache_control":{"type":"ephemeral","ttl":"1h"},"content":[{"type":"text","text":"a failed"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]},
+				{"type":"tool_result","tool_use_id":"Call_C","content":"c result"},
+				{"type":"tool_result","tool_use_id":"Call_B","content":"keep result"},
+				{"type":"text","text":"continue"}
+			]}
+		]}`
+	for _, tc := range []struct {
+		name, message, param                   string
+		removeTool                             string
+		pairOnly, retry                        bool
+		brokenPair, duplicateID, repeatError   bool
+		mixedTTL, emptyText, unsupportedResult bool
+		scalarResult                           bool
+	}{
+		{name: "unused definition", message: "tools.2.custom.input_schema: Invalid schema", removeTool: "unused", retry: true},
+		{name: "definition and its history", message: "tools.0.custom.input_schema: Invalid schema", removeTool: "lookup", retry: true},
+		{name: "parameter location", param: "tools[0].input_schema.properties.thinking", message: "Invalid schema", removeTool: "lookup", retry: true},
+		{name: "one call not all calls of same tool", message: "messages.1.content.0: tool_use blocks are not supported", pairOnly: true, retry: true},
+		{name: "wire index after empty text cleanup", message: "messages.1.content.0: tool_use blocks are not supported", pairOnly: true, retry: true, emptyText: true},
+		{name: "mixed TTL reorder", message: "messages.1.content.0: tool_use blocks are not supported", mixedTTL: true},
+		{name: "unknown history location", param: "messages.99.content.0.input.thinking", message: "Invalid argument"},
+		{name: "unparseable history location", param: "messages.1.content.0.input.thinking-mode", message: "Invalid argument"},
+		{name: "unknown result content", message: "messages.1.content.0: tool_use blocks are not supported", unsupportedResult: true},
+		// 标量 tool_result.content 无法在保留语义的前提下文本化，降级必须整体放弃。
+		{name: "scalar result content", message: "messages.1.content.0: tool_use blocks are not supported", scalarResult: true},
+		{name: "result location", message: "messages.2.content.0: tool_result is not supported", pairOnly: true, retry: true},
+		{name: "result parameter", param: "messages[2].content[0]", message: "unsupported tool_result block", pairOnly: true, retry: true},
+		// 第三方兼容网关的措辞不受 Anthropic 契约约束，判定必须是语义而非整句相等。
+		{name: "gateway wording", message: "messages.1.content.0: This model does not support tool_use blocks", pairOnly: true, retry: true},
+		{name: "gateway wording not allowed", message: "messages.1.content.0: tool_use block type is not allowed here", pairOnly: true, retry: true},
+		{name: "bounded retry", message: "tools.0.custom.input_schema: Invalid schema", removeTool: "lookup", retry: true, repeatError: true},
+		{name: "no location", message: "tool_use blocks are not supported"},
+		{name: "unrelated prose", message: "The description mentions tools.0: tool_use blocks are not supported"},
+		{name: "conflicting locations", param: "tools.1.name", message: "tools.0.name: Invalid thinking tool name"},
+		{name: "unknown parameter", param: "tools.bad", message: "tools.0.name: Invalid thinking tool name"},
+		{name: "out of range", message: "tools.90.name: Invalid name"},
+		{name: "negative index", message: "tools[-1].name: Invalid name"},
+		{name: "missing result is not incompatibility", message: "messages.1.content.0: tool_use ids were found without tool_result blocks immediately after: Call_A"},
+		{name: "invalid arguments are not incompatibility", message: "messages.1.content.0.input.thinking: Invalid tool_use input"},
+		{name: "non tool block", message: "messages.2.content.3: tool_result blocks are not supported"},
+		{name: "incomplete pair", message: "messages.1.content.0: tool_use blocks are not supported", brokenPair: true},
+		{name: "definition with incomplete pair", message: "tools.0.input_schema: Invalid schema", brokenPair: true},
+		{name: "duplicate ID", message: "messages.1.content.0: tool_use blocks are not supported", duplicateID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var request map[string]any
+			if err := json.Unmarshal([]byte(requestBody), &request); err != nil {
+				t.Fatal(err)
+			}
+			request["thinking"] = map[string]any{"type": "adaptive"}
+			request["output_config"] = map[string]any{"effort": "high"}
+			if strings.Contains(tc.message+tc.param, "thinking") {
+				request["tool_choice"] = map[string]any{"type": "auto"}
+			}
+			messages := request["messages"].([]any)
+			if tc.mixedTTL {
+				result := messages[2].(map[string]any)["content"].([]any)[2].(map[string]any)
+				result["cache_control"] = map[string]any{"type": "ephemeral", "ttl": "5m"}
+			}
+			if tc.emptyText {
+				content := messages[1].(map[string]any)["content"].([]any)
+				messages[1].(map[string]any)["content"] = append([]any{map[string]any{"type": "text", "text": ""}}, content...)
+			}
+			if tc.unsupportedResult {
+				result := messages[2].(map[string]any)["content"].([]any)[0].(map[string]any)
+				result["content"] = []any{map[string]any{"type": "unknown_content", "data": "preserve"}}
+			}
+			if tc.scalarResult {
+				result := messages[2].(map[string]any)["content"].([]any)[0].(map[string]any)
+				result["content"] = 123
+			}
+			if tc.brokenPair {
+				content := messages[2].(map[string]any)["content"].([]any)
+				messages[2].(map[string]any)["content"] = content[1:]
+			}
+			if tc.duplicateID {
+				content := messages[1].(map[string]any)["content"].([]any)
+				content[2].(map[string]any)["id"] = "Call_A"
+			}
+			errorBody, err := json.Marshal(map[string]any{"error": map[string]any{"type": "invalid_request_error", "message": tc.message, "param": tc.param}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := setupProxyTestEnv(t, []testChannel{{name: "localized-repair", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6", apiKey: "sk-ant"}}, map[int]string{0: "https://anthropic-gateway.example.com"})
+			var bodies [][]byte
+			env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				body, readErr := io.ReadAll(r.Body)
+				if readErr != nil {
+					t.Error(readErr)
+				}
+				bodies = append(bodies, body)
+				status, response := http.StatusBadRequest, string(errorBody)
+				if len(bodies) > 1 && !tc.repeatError {
+					status = http.StatusOK
+					response = `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(response))}, nil
+			})}
+			response := doProxyRequest(t, env.engine, "/v1/messages", request, map[string]string{"anthropic-version": "2023-06-01"})
+			wantAttempts, wantStatus := 1, http.StatusBadRequest
+			if tc.retry {
+				wantAttempts = 2
+				if !tc.repeatError {
+					wantStatus = http.StatusOK
+				}
+			}
+			if len(bodies) != wantAttempts || response.Code != wantStatus {
+				t.Fatalf("attempts=%d status=%d, want %d/%d: %s", len(bodies), response.Code, wantAttempts, wantStatus, response.Body.String())
+			}
+			if strings.Contains(tc.message+tc.param, "thinking") && !gjson.GetBytes(bodies[0], "thinking").Exists() {
+				t.Fatal("fixture must retain thinking on the actual wire")
+			}
+			if !tc.retry {
+				if gjson.Get(response.Body.String(), "error.message").String() != tc.message {
+					t.Fatalf("original error lost: %s", response.Body.String())
+				}
+				return
+			}
+			before, after := gjson.ParseBytes(bodies[0]), gjson.ParseBytes(bodies[1])
+			for _, path := range []string{"messages.0", "messages.1.content.1", "model", "max_tokens", "system", "thinking", "output_config"} {
+				if !reflect.DeepEqual(before.Get(path).Value(), after.Get(path).Value()) {
+					t.Errorf("unrelated %s changed", path)
+				}
+			}
+			var toolNames []string
+			for _, tool := range after.Get("tools").Array() {
+				toolNames = append(toolNames, tool.Get("name").String())
+			}
+			wantTools := []string{"lookup", "read", "unused"}
+			if tc.removeTool != "" {
+				wantTools = slices.DeleteFunc(wantTools, func(name string) bool { return name == tc.removeTool })
+			}
+			if !reflect.DeepEqual(toolNames, wantTools) {
+				t.Errorf("tools=%v, want %v", toolNames, wantTools)
+			}
+			if tc.removeTool != "" && tc.removeTool == before.Get("tool_choice.name").String() {
+				if after.Get("tool_choice").Exists() {
+					t.Error("removed tool is still forced by tool_choice")
+				}
+			} else if !reflect.DeepEqual(before.Get("tool_choice").Value(), after.Get("tool_choice").Value()) {
+				t.Error("unrelated tool_choice changed")
+			}
+			if tc.removeTool == "unused" {
+				if !reflect.DeepEqual(before.Get("messages").Value(), after.Get("messages").Value()) {
+					t.Error("removing unused definition changed history")
+				}
+				return
+			}
+			converted := after.Get("messages.1.content.0")
+			if converted.Get("type").String() != "text" ||
+				!strings.Contains(converted.Get("text").String(), "lookup") ||
+				!strings.Contains(converted.Get("text").String(), `"q":"a"`) {
+				t.Errorf("selected call history lost: %s", converted.Raw)
+			}
+			if strings.Contains(converted.Get("text").String(), "cache_control") {
+				t.Error("wire-only fields must not leak into converted history text")
+			}
+			if tc.pairOnly && !reflect.DeepEqual(before.Get("messages.1.content.2").Value(), after.Get("messages.1.content.2").Value()) {
+				t.Error("another call of the same tool changed")
+			}
+			var resultIDs []string
+			imageFound, errorFound, seenOther := false, false, false
+			for _, part := range after.Get("messages.2.content").Array() {
+				if part.Get("type").String() == "tool_result" {
+					if seenOther {
+						t.Error("remaining results must precede converted text")
+					}
+					resultIDs = append(resultIDs, part.Get("tool_use_id").String())
+				} else {
+					seenOther = true
+				}
+				if part.Get("type").String() == "image" {
+					wantImage := before.Get("messages.2.content.0.content.1").Value().(map[string]any)
+					wantImage["cache_control"] = before.Get("messages.2.content.0.cache_control").Value()
+					imageFound = reflect.DeepEqual(part.Value(), wantImage)
+				}
+				if strings.Contains(part.Get("text").String(), "Call_A] (error)") {
+					errorFound = true
+				}
+			}
+			wantResults := []string{"Call_B"}
+			if tc.pairOnly {
+				wantResults = []string{"Call_C", "Call_B"}
+			}
+			if !reflect.DeepEqual(resultIDs, wantResults) || !imageFound || !errorFound {
+				t.Errorf("results=%v want=%v image=%v error=%v: %s", resultIDs, wantResults, imageFound, errorFound, bodies[1])
+			}
 		})
 	}
 }
@@ -964,7 +1344,7 @@ func TestProxy_NativeAnthropicDoesNotRepairUnrelatedSignature400(t *testing.T) {
 	}
 }
 
-func TestProxy_NativeAnthropicRepairFailureUsesNormalChannelRouting(t *testing.T) {
+func TestProxy_NativeAnthropicToolRepairFailurePreservesNextChannelRequest(t *testing.T) {
 	t.Parallel()
 
 	var firstAttempts atomic.Int32
@@ -986,14 +1366,28 @@ func TestProxy_NativeAnthropicRepairFailureUsesNormalChannelRouting(t *testing.T
 	}, map[int]string{0: "https://first-anthropic.example.com", 1: "https://fallback-anthropic.example.com"})
 	env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host == "first-anthropic.example.com" {
-			firstAttempts.Add(1)
+			attempt := firstAttempts.Add(1)
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				t.Error(readErr)
+			}
+			if attempt == 2 && (gjson.GetBytes(body, "tools").Exists() || gjson.GetBytes(body, "tool_choice").Exists() || gjson.GetBytes(body, "messages.1.content.0.type").String() != "text") {
+				t.Errorf("rejected last tool was not localized: %s", body)
+			}
 			return &http.Response{
 				StatusCode: http.StatusBadRequest,
 				Header:     http.Header{"Content-Type": []string{"application/json"}},
 				Body: io.NopCloser(strings.NewReader(
-					`{"type":"error","error":{"type":"invalid_request_error","message":"tool_use blocks are not supported"}}`,
+					`{"type":"error","error":{"type":"invalid_request_error","message":"tools.0.input_schema: Invalid schema"}}`,
 				)),
 			}, nil
+		}
+		body, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Error(readErr)
+		}
+		if gjson.GetBytes(body, "tools.0.name").String() != "lookup" || gjson.GetBytes(body, "messages.1.content.0.type").String() != "tool_use" || gjson.GetBytes(body, "messages.2.content.0.tool_use_id").String() != "toolu_1" || gjson.GetBytes(body, "tool_choice.name").String() != "lookup" {
+			t.Errorf("fallback lost tools: %s", body)
 		}
 		fallbackAttempts.Add(1)
 		return &http.Response{
@@ -1012,8 +1406,10 @@ func TestProxy_NativeAnthropicRepairFailureUsesNormalChannelRouting(t *testing.T
 			map[string]any{"role": "assistant", "content": []any{map[string]any{
 				"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": map[string]any{},
 			}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "keep result"}}},
 		},
-		"tools": []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
+		"tool_choice": map[string]any{"type": "tool", "name": "lookup"},
+		"tools":       []any{map[string]any{"name": "lookup", "input_schema": map[string]any{"type": "object"}}},
 	}, map[string]string{"anthropic-version": "2023-06-01"})
 	if response.Code != http.StatusOK || firstAttempts.Load() != 2 || fallbackAttempts.Load() != 1 {
 		t.Fatalf("status=%d first=%d fallback=%d body=%s", response.Code, firstAttempts.Load(), fallbackAttempts.Load(), response.Body.String())
@@ -1153,6 +1549,349 @@ func TestProxy_OAuthBaseURLSettingsOverrideChannelURLs(t *testing.T) {
 			t.Fatalf("Antigravity override response=%d body=%s", response.Code, response.Body.String())
 		}
 	})
+}
+
+func TestProxy_AntigravityCreditsFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                           string
+		model                                                          string
+		redirect                                                       string
+		stale, refreshFailure, terminal                                bool
+		initialQuota, fallback, unknown, networkCooldown, insufficient bool
+		wantStandard, wantPaid                                         int32
+	}{
+		{name: "standard then credits", model: "claude-sonnet-4-6", wantStandard: 1, wantPaid: 1},
+		{name: "empty ordinary without fallback", model: "claude-sonnet-4-6", initialQuota: true, wantPaid: 1},
+		{name: "empty ordinary with fallback", model: "claude-sonnet-4-6", initialQuota: true, fallback: true, wantStandard: 1, wantPaid: 1},
+		{name: "unknown balance", model: "claude-sonnet-4-6", unknown: true, wantStandard: 1},
+		{name: "gemini", model: "gemini-3-flash", wantStandard: 1},
+		{name: "network cooldown", model: "claude-sonnet-4-6", initialQuota: true, networkCooldown: true},
+		{name: "insufficient credits", model: "claude-sonnet-4-6", insufficient: true, wantStandard: 1, wantPaid: 1},
+		{name: "stale balance refresh", model: "claude-sonnet-4-6", initialQuota: true, stale: true, wantPaid: 1},
+		{name: "subscription refresh terminal rejection", model: "claude-sonnet-4-6", initialQuota: true, stale: true, terminal: true},
+		{name: "refresh failure never bypasses balance", model: "claude-sonnet-4-6", initialQuota: true, unknown: true, refreshFailure: true},
+		{name: "alias to Claude", model: "custom-alias", redirect: "claude-sonnet-4-6", wantStandard: 1, wantPaid: 1},
+		{name: "Claude to Gemini", model: "claude-sonnet-4-6", redirect: "gemini-3-flash", wantStandard: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actualModel := tc.model
+			if tc.redirect != "" {
+				actualModel = tc.redirect
+			}
+			var standard, paid atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/token" {
+					if tc.terminal {
+						w.WriteHeader(400)
+						_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+						return
+					}
+					w.WriteHeader(503)
+					_, _ = io.WriteString(w, `{"error":"temporarily_unavailable"}`)
+					return
+				}
+				if r.URL.Path == "/v1internal:loadCodeAssist" {
+					if tc.terminal {
+						w.WriteHeader(401)
+						_, _ = io.WriteString(w, `{"error":{"status":"UNAUTHENTICATED"}}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"paidTier":{"id":"paid","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"50","minimumCreditAmountForUsage":"1"}]}}`)
+					return
+				}
+				var wire struct {
+					Model   string   `json:"model"`
+					Credits []string `json:"enabledCreditTypes"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+					t.Error(err)
+				}
+				if wire.Model != actualModel {
+					t.Errorf("wire model=%s", wire.Model)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if len(wire.Credits) == 0 {
+					standard.Add(1)
+					w.WriteHeader(429)
+					_, _ = io.WriteString(w, `{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"3600s"}]}}`)
+					return
+				}
+				paid.Add(1)
+				if !slices.Equal(wire.Credits, []string{"GOOGLE_ONE_AI"}) {
+					t.Errorf("credits=%v", wire.Credits)
+				}
+				if tc.insufficient {
+					w.WriteHeader(429)
+					_, _ = io.WriteString(w, `{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"INSUFFICIENT_G1_CREDITS_BALANCE"}]}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"paid ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}}`)
+			}))
+			credential, err := antigravityauth.ParseCredential([]byte(antigravityProxyTestCredential(t, "credits-token")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			balance, minimum := 50.0, 1.0
+			credential.Credits = &antigravityauth.Credits{Balance: &balance, Minimum: &minimum, SampledAt: time.Now()}
+			if tc.stale {
+				credential.Credits.SampledAt = time.Now().Add(-11 * time.Minute)
+			}
+			if tc.refreshFailure {
+				credential.Expired = time.Now().Add(time.Minute).UTC().Format(time.RFC3339)
+			}
+			if tc.unknown {
+				credential.Credits.Balance = nil
+			}
+			if tc.initialQuota {
+				credential.StandardQuota = map[string]time.Time{actualModel: time.Now().Add(time.Hour)}
+			}
+			raw, err := credential.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := setupProxyTestEnvWithSettings(t, []testChannel{{name: "credits", upstreamProtocol: "gemini", models: tc.model, priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: raw}}, map[int]string{0: upstream.URL}, map[string]string{"cooldown_fallback_enabled": strconv.FormatBool(tc.fallback)})
+			env.server.antigravityService.TokenURL = upstream.URL + "/token"
+			env.server.antigravityService.DailyAPIBaseURL = upstream.URL
+			configs, err := env.store.ListConfigs(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.redirect != "" {
+				configs[0].ModelEntries = []model.ModelEntry{{Model: tc.model, RedirectModel: tc.redirect}}
+				if _, err := env.store.UpdateConfig(context.Background(), configs[0].ID, configs[0]); err != nil {
+					t.Fatal(err)
+				}
+				env.server.InvalidateChannelListCache()
+			}
+			if tc.networkCooldown {
+				if err := env.store.SetModelCooldown(context.Background(), configs[0].ID, tc.model, time.Now().Add(time.Hour)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := doProxyRequest(t, env.engine, "/v1beta/models/"+tc.model+":generateContent", map[string]any{"contents": []any{map[string]any{"role": "user", "parts": []any{map[string]any{"text": "hello"}}}}}, nil)
+			if standard.Load() != tc.wantStandard || paid.Load() != tc.wantPaid {
+				t.Fatalf("standard=%d paid=%d status=%d body=%s", standard.Load(), paid.Load(), response.Code, response.Body.String())
+			}
+			if tc.wantPaid > 0 && !tc.insufficient && response.Code != 200 {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			stored, err := env.store.GetConfig(context.Background(), configs[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := antigravityauth.ParseCredential([]byte(stored.OAuthCredential))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.networkCooldown && antigravityClaudeModel(actualModel) && !persisted.StandardQuota[actualModel].After(time.Now()) {
+				t.Fatal("standard quota evidence lost")
+			}
+			if tc.insufficient && (!stored.Enabled || persisted.Credits.Available()) {
+				t.Fatal("insufficient balance did not disable only credits")
+			}
+			if tc.terminal && stored.Enabled {
+				t.Fatal("terminal metadata-triggered refresh rejection did not disable matching credential")
+			}
+		})
+	}
+}
+
+func TestProxy_AntigravityGeminiQuotaCooldownAndAccountFallback(t *testing.T) {
+	const actualModel = "gemini-3.8-flash-high"
+	for _, tc := range []struct {
+		name         string
+		requestModel string
+		stream       bool
+		otherModel   bool
+		allExhausted bool
+		multiURL     bool
+	}{
+		{name: "nonstream", requestModel: actualModel},
+		{name: "stream preserves other models", requestModel: actualModel, stream: true, otherModel: true},
+		{name: "Claude alias to Gemini", requestModel: "claude-sonnet-4-6", stream: true},
+		{name: "all exhausted selects earliest reset", requestModel: actualModel, stream: true, allExhausted: true},
+		{name: "multiple URLs preserve quota cooldown", requestModel: actualModel, stream: true, multiURL: true},
+		{name: "multiple URLs preserve other models", requestModel: actualModel, stream: true, multiURL: true, otherModel: true},
+		{name: "multiple URLs all exhausted select earliest reset", requestModel: actualModel, stream: true, multiURL: true, allExhausted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls [2]atomic.Int32
+			var channels []testChannel
+			urls := make(map[int]string)
+			resetDelay := []time.Duration{26*time.Hour + 56*time.Minute + 11*time.Second, time.Hour}
+			for i := range calls {
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls[i].Add(1)
+					var wire struct {
+						Model   string   `json:"model"`
+						Credits []string `json:"enabledCreditTypes"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+						t.Error(err)
+					}
+					if wire.Model != actualModel || len(wire.Credits) != 0 {
+						t.Errorf("unexpected Gemini request: %+v", wire)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					if i == 0 || tc.allExhausted {
+						w.WriteHeader(http.StatusTooManyRequests)
+						_, _ = fmt.Fprintf(w, `{"error":{"code":429,"message":"Individual quota reached. Please upgrade your subscription to increase your limits.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"uiMessage":"true","model":%q,"quotaResetDelay":%q}}]}}`, actualModel, resetDelay[i].String())
+						return
+					}
+					const response = `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"available account"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}}`
+					if tc.stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w, "data: %s\n\n", response)
+					} else {
+						_, _ = io.WriteString(w, response)
+					}
+				}))
+				defer upstream.Close()
+				credential, err := antigravityauth.ParseCredential([]byte(antigravityProxyTestCredential(t, fmt.Sprintf("quota-token-%d", i))))
+				if err != nil {
+					t.Fatal(err)
+				}
+				credential.Email = fmt.Sprintf("quota-%d@example.com", i)
+				raw, err := credential.JSON()
+				if err != nil {
+					t.Fatal(err)
+				}
+				channels = append(channels, testChannel{name: fmt.Sprintf("quota-%d", i), upstreamProtocol: "gemini", models: tc.requestModel, authType: model.AuthTypeAntigravityOAuth, oauthCredential: raw})
+				urls[i] = upstream.URL
+			}
+			env := setupProxyTestEnvWithSettings(t, channels, urls, map[string]string{"cooldown_fallback_enabled": "true"})
+			ctx := context.Background()
+			configs, err := env.store.ListConfigs(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cfg := range configs {
+				cfg.ModelEntries = []model.ModelEntry{{Model: tc.requestModel, RedirectModel: actualModel}}
+				if tc.multiURL {
+					fallback := cfg.URLs[0]
+					fallback.URL += "/fallback"
+					cfg.URLs = append(cfg.URLs, fallback)
+				}
+				if tc.otherModel {
+					cfg.ModelEntries = append(cfg.ModelEntries, model.ModelEntry{Model: "gemini-other"})
+				}
+				if _, err := env.store.UpdateConfig(ctx, cfg.ID, cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			env.server.InvalidateChannelListCache()
+			start := time.Now()
+			for range 2 {
+				response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+					"model": tc.requestModel, "stream": tc.stream, "max_tokens": 32,
+					"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+				}, nil)
+				if tc.allExhausted {
+					if response.Code != http.StatusTooManyRequests {
+						t.Fatalf("exhausted response=%d body=%s", response.Code, response.Body.String())
+					}
+					continue
+				}
+				if response.Code != http.StatusOK {
+					t.Fatalf("account fallback failed: status=%d body=%s", response.Code, response.Body.String())
+				}
+				if tc.stream {
+					parser := newSSEUsageParser("anthropic")
+					if err := parser.Feed(response.Body.Bytes()); err != nil {
+						t.Fatal(err)
+					}
+					if !parser.IsStreamComplete() || parser.GetLastError() != nil {
+						t.Fatalf("incomplete fallback stream: %s", response.Body.String())
+					}
+				} else if gjson.GetBytes(response.Body.Bytes(), "content.0.text").String() != "available account" {
+					t.Fatalf("unexpected fallback response: %s", response.Body.String())
+				}
+			}
+			if calls[0].Load() != 1 || calls[1].Load() != 2 {
+				t.Errorf("account requests=%d/%d, want 1/2", calls[0].Load(), calls[1].Load())
+			}
+			cooldowns, err := env.store.GetAllModelCooldowns(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cfg := range configs {
+				exhausted := cfg.Name == "quota-0" || tc.allExhausted
+				if !exhausted {
+					if len(cooldowns[cfg.ID]) != 0 {
+						t.Error("available account was cooled")
+					}
+					continue
+				}
+				delay := resetDelay[0]
+				if cfg.Name == "quota-1" {
+					delay = resetDelay[1]
+				}
+				until := cooldowns[cfg.ID][actualModel]
+				if len(cooldowns[cfg.ID]) != 1 || until.Before(start.Add(delay).Truncate(time.Second)) || until.After(time.Now().Add(delay)) {
+					t.Errorf("model cooldown=%v, want only %s until reset in %s", cooldowns[cfg.ID], actualModel, delay)
+				}
+				stored, err := env.store.GetConfig(ctx, cfg.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				channelCooled := time.Unix(stored.CooldownUntil, 0).After(time.Now())
+				if channelCooled == tc.otherModel {
+					t.Errorf("channel cooled=%v with other model=%v", channelCooled, tc.otherModel)
+				}
+			}
+		})
+	}
+}
+
+func TestProxy_AntigravityRateLimitRetryBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		delay   string
+		succeed bool
+		calls   int32
+	}{
+		{"0.01s", true, 2}, {"0.01s", false, 2}, {"3s", false, 1}, {"3.125s", false, 1},
+	} {
+		t.Run(fmt.Sprintf("%s/%v", tc.delay, tc.succeed), func(t *testing.T) {
+			var calls atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if gjson.GetBytes(body, "enabledCreditTypes").Exists() {
+					t.Error("rate limiting authorized credits")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) == 2 && tc.succeed {
+					_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}`)
+					return
+				}
+				w.WriteHeader(429)
+				_, _ = fmt.Fprintf(w, `{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED"},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":%q}]}}`, tc.delay)
+			}))
+			env := setupProxyTestEnv(t, []testChannel{{name: "rate", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "rate-token")}}, map[int]string{0: upstream.URL})
+			start := time.Now()
+			response := doProxyRequest(t, env.engine, "/v1beta/models/claude-sonnet-4-6:generateContent", map[string]any{"contents": []any{map[string]any{"role": "user", "parts": []any{map[string]any{"text": "hello"}}}}}, nil)
+			if calls.Load() != tc.calls {
+				t.Fatalf("calls=%d want=%d", calls.Load(), tc.calls)
+			}
+			if tc.succeed && response.Code != 200 {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if !tc.succeed {
+				configs, err := env.store.ListConfigs(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				delay, _ := time.ParseDuration(tc.delay)
+				until := cooldowns[configs[0].ID]["claude-sonnet-4-6"]
+				if until.Before(start.Add(delay)) || until.After(time.Now().Add(delay+time.Second)) {
+					t.Fatalf("imprecise cooldown %v for %s", until, tc.delay)
+				}
+			}
+		})
+	}
 }
 
 func TestProxy_AntigravityOAuthWrapsGeminiWireAndTranslatesOpenAIResponse(t *testing.T) {
@@ -1373,6 +2112,103 @@ func TestProxy_AntigravityProviderAdapterRequest(t *testing.T) {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestProxy_AntigravityClaudeSystemReminderPreservesToolPairing(t *testing.T) {
+	t.Parallel()
+	for _, target := range []string{"claude-sonnet-4-6", "gemini-3-flash"} {
+		for _, reminderPosition := range []string{"before results", "after results", "within results"} {
+			t.Run(target+"/"+reminderPosition, func(t *testing.T) {
+				t.Parallel()
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					wire, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(500)
+						return
+					}
+					contents := gjson.GetBytes(wire, "request.contents").Array()
+					if len(contents) != 3 {
+						t.Errorf("contents=%d, want user/model/user: %s", len(contents), wire)
+						w.WriteHeader(400)
+						return
+					}
+					calls := contents[1].Get("parts").Array()
+					results := contents[2].Get("parts").Array()
+					if len(calls) != 2 || len(results) != 3 {
+						t.Errorf("calls=%d results=%d: %s", len(calls), len(results), wire)
+						w.WriteHeader(400)
+						return
+					}
+					resultOffset, reminderIndex := 0, 2
+					if target == "gemini-3-flash" {
+						resultOffset, reminderIndex = 1, 0
+					}
+					for i, id := range []string{"call_a", "call_b"} {
+						call, result := calls[i].Get("functionCall"), results[resultOffset+i].Get("functionResponse")
+						if call.Get("id").String() != id || result.Get("id").String() != id || call.Get("name").String() != result.Get("name").String() {
+							t.Errorf("tool order or pairing lost: %s", wire)
+						}
+						textPath := "response.result"
+						if i == 1 {
+							textPath += ".text"
+						}
+						if got := result.Get(textPath).String(); got != []string{"A", "B"}[i] {
+							t.Errorf("result=%q, want original result", got)
+						}
+					}
+					if got := results[resultOffset+1].Get("functionResponse.parts.0.inlineData"); got.Get("mimeType").String() != "image/png" || got.Get("data").String() != "aW1hZ2U=" {
+						t.Errorf("tool result image lost: %s", wire)
+					}
+					if !strings.Contains(results[reminderIndex].Get("text").String(), "keep the reminder") {
+						t.Errorf("reminder lost or misplaced: %s", wire)
+					}
+					if gjson.GetBytes(wire, "request.tools.0.functionDeclarations.#").Int() != 2 {
+						t.Errorf("tool definitions lost: %s", wire)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}`)
+				}))
+				t.Cleanup(upstream.Close)
+				env := setupProxyTestEnv(t, []testChannel{{name: "antigravity-system-tool-pairing", upstreamProtocol: "gemini", models: target, priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-system-pairing")}}, map[int]string{0: upstream.URL})
+				messages := []any{
+					map[string]any{"role": "user", "content": "read both"},
+					map[string]any{"role": "assistant", "content": []any{
+						map[string]any{"type": "tool_use", "id": "call_a", "name": "read_a", "input": map[string]any{}},
+						map[string]any{"type": "tool_use", "id": "call_b", "name": "read_b", "input": map[string]any{}},
+					}},
+				}
+				reminder := map[string]any{"role": "system", "content": "keep the reminder"}
+				results := []any{
+					map[string]any{"type": "tool_result", "tool_use_id": "call_b", "content": []any{
+						map[string]any{"type": "text", "text": "B"},
+						map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}},
+					}},
+					map[string]any{"type": "tool_result", "tool_use_id": "call_a", "content": "A"},
+				}
+				if reminderPosition == "before results" {
+					messages = append(messages, reminder)
+				}
+				if reminderPosition == "within results" {
+					results = append([]any{map[string]any{"type": "text", "text": "keep the reminder"}}, results...)
+				}
+				messages = append(messages, map[string]any{"role": "user", "content": results})
+				if reminderPosition == "after results" {
+					messages = append(messages, reminder)
+				}
+				response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+					"model": target, "max_tokens": 64, "messages": messages,
+					"tools": []any{
+						map[string]any{"name": "read_a", "input_schema": map[string]any{"type": "object"}},
+						map[string]any{"name": "read_b", "input_schema": map[string]any{"type": "object"}},
+					},
+				}, nil)
+				if response.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+			})
+		}
 	}
 }
 
@@ -1793,110 +2629,25 @@ func TestProxy_AntigravityOAuthUsesWebSearchWireContract(t *testing.T) {
 	}
 }
 
-func TestProxy_AntigravityOAuthRetriesRejectedClaudeThinkingSignature(t *testing.T) {
-	validSignature := antigravityProxyClaudeThoughtSignature("claude-sonnet-4-6")
+func TestProxy_AntigravityOAuthRejectsSignatureWithoutRewritingHistory(t *testing.T) {
 	var attempts atomic.Int32
-	var bodies [][]byte
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read Antigravity signature request: %v", err)
-		}
-		bodies = append(bodies, body)
+		attempts.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		if attempts.Add(1) == 1 {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, `{"error":{"code":400,"message":"Corrupted thought signature."}}`)
-			return
-		}
-		_, _ = io.WriteString(w, `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"retry ok"}]},"finishReason":"STOP"}]}}`)
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "antigravity-signature", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", priority: 100,
-		authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-signature"),
-	}}, map[int]string{0: upstream.URL})
-
-	response := doProxyRequest(t, env.engine, "/v1beta/models/claude-sonnet-4-6:generateContent", map[string]any{
-		"systemInstruction": map[string]any{"parts": []any{map[string]any{"text": "API proxy"}}},
-		"contents": []any{
-			map[string]any{"role": "model", "parts": []any{map[string]any{
-				"text":             "prior reasoning",
-				"thought":          true,
-				"thoughtSignature": validSignature,
-			}}},
-			map[string]any{"role": "user", "parts": []any{map[string]any{"text": "continue"}}},
-		},
-	}, nil)
-	if response.Code != http.StatusOK || gjson.Get(response.Body.String(), "candidates.0.content.parts.0.text").String() != "retry ok" {
-		t.Fatalf("signature retry response=%d body=%s upstream_bodies=%q", response.Code, response.Body.String(), bodies)
-	}
-	if attempts.Load() != 2 || len(bodies) != 2 {
-		t.Fatalf("signature attempts=%d bodies=%d", attempts.Load(), len(bodies))
-	}
-	if got := gjson.GetBytes(bodies[0], "request.contents.0.parts.0.thoughtSignature").String(); got == "" {
-		t.Fatalf("first signature missing: body=%s", bodies[0])
-	}
-	if gjson.GetBytes(bodies[1], "request.contents.0.parts.0.thoughtSignature").Exists() ||
-		gjson.GetBytes(bodies[1], "request.contents.0.parts.0.thought").Exists() {
-		t.Fatalf("retry kept rejected thinking metadata: body=%s", bodies[1])
-	}
-	if got := gjson.GetBytes(bodies[1], "request.systemInstruction.parts.#").Int(); got != 2 {
-		t.Fatalf("identity prompt duplicated on retry: parts=%d body=%s", got, bodies[1])
-	}
-	if got := gjson.GetBytes(bodies[1], "request.systemInstruction.parts.1.text").String(); got != "A\u200BPI p\u200Broxy" {
-		t.Fatalf("zero-width obfuscation was not preserved: %q", got)
-	}
-}
-
-func TestProxy_AntigravityOAuthCapacityAfterSignatureRetryCoolsModel(t *testing.T) {
-	validSignature := antigravityProxyClaudeThoughtSignature("claude-sonnet-4-6")
-	var attempts atomic.Int32
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if attempts.Add(1) == 1 {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, `{"error":{"code":400,"message":"Corrupted thought signature."}}`)
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, `{"error":{"code":503,"message":"No capacity available for model claude-sonnet-4-6 on the server","status":"UNAVAILABLE","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"error_number":"2010","model":"claude-sonnet-4-6"}}]}}`)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":400,"message":"Corrupted thought signature."}}`)
 	}))
 	t.Cleanup(upstream.Close)
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "antigravity-signature-capacity", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", priority: 100,
-		authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-signature-capacity"),
-	}}, map[int]string{0: upstream.URL})
-
+	env := setupProxyTestEnv(t, []testChannel{{name: "signature-error", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-signature")}}, map[int]string{0: upstream.URL})
 	response := doProxyRequest(t, env.engine, "/v1beta/models/claude-sonnet-4-6:generateContent", map[string]any{
-		"contents": []any{
-			map[string]any{"role": "model", "parts": []any{map[string]any{
-				"text":             "prior reasoning",
-				"thought":          true,
-				"thoughtSignature": validSignature,
-			}}},
-			map[string]any{"role": "user", "parts": []any{map[string]any{"text": "continue"}}},
-		},
+		"contents": []any{map[string]any{"role": "model", "parts": []any{map[string]any{"text": "prior reasoning", "thought": true, "thoughtSignature": antigravityProxyClaudeThoughtSignature("claude-sonnet-4-6")}}}, map[string]any{"role": "user", "parts": []any{map[string]any{"text": "continue"}}}},
 	}, nil)
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status=%d, want 429; body=%s", response.Code, response.Body.String())
-	}
-	if got := attempts.Load(); got != 2 {
-		t.Fatalf("attempts=%d, want 2", got)
-	}
-
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("ListConfigs=(%d, %v)", len(configs), err)
+	if response.Code != http.StatusBadRequest || attempts.Load() != 1 {
+		t.Fatalf("status=%d attempts=%d body=%s", response.Code, attempts.Load(), response.Body.String())
 	}
 	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if until := cooldowns[configs[0].ID]["claude-sonnet-4-6"]; !until.After(time.Now()) {
-		t.Fatalf("capacity after signature retry did not cool model: %v", cooldowns)
+	if err != nil || len(cooldowns) != 0 {
+		t.Fatalf("signature error cooled model: %v %v", cooldowns, err)
 	}
 }
 
@@ -2671,7 +3422,7 @@ func TestProxy_AntigravityOAuthRefreshesAfterUnauthorized(t *testing.T) {
 	if response.Code != http.StatusOK || gjson.Get(response.Body.String(), "candidates.0.content.parts.0.text").String() != "refreshed" {
 		t.Fatalf("response=%d body=%s", response.Code, response.Body.String())
 	}
-	if upstreamAttempts.Load() != 2 || refreshes.Load() != 1 || paidTierRefreshes.Load() != 1 {
+	if upstreamAttempts.Load() != 2 || refreshes.Load() != 1 || paidTierRefreshes.Load() != 0 {
 		t.Fatalf("upstream attempts=%d refreshes=%d paid tier refreshes=%d", upstreamAttempts.Load(), refreshes.Load(), paidTierRefreshes.Load())
 	}
 	configs, err := env.store.ListConfigs(context.Background())
@@ -2679,7 +3430,7 @@ func TestProxy_AntigravityOAuthRefreshesAfterUnauthorized(t *testing.T) {
 		t.Fatalf("persisted channel=%#v err=%v", configs, err)
 	}
 	persistedCredential, err := antigravityauth.ParseCredential([]byte(configs[0].OAuthCredential))
-	if err != nil || persistedCredential.PaidTier == nil || persistedCredential.PaidTier.DisplayName() != "Google AI Pro" {
+	if err != nil || persistedCredential.PaidTier != nil {
 		t.Fatalf("persisted paid tier = (%#v, %v)", persistedCredential, err)
 	}
 }
@@ -2964,6 +3715,259 @@ func TestProxy_XAIOAuthZeroKeyFinalizesWireAndReassemblesNonStream(t *testing.T)
 	keys, err := env.store.GetAPIKeys(context.Background(), configs[0].ID)
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("xAI OAuth channel keys = %#v, %v", keys, err)
+	}
+}
+
+func TestProxy_CodexOAuthImage25Snapshots(t *testing.T) {
+	for _, imageModel := range []string{"gpt-image-2.5-flare-2026-09-08", "gpt-image-2.5-sunburst-2026-09-08"} {
+		t.Run(imageModel, func(t *testing.T) {
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != "/backend-api/codex/responses" || r.Header.Get("Authorization") != "Bearer image-access" {
+					t.Errorf("upstream request: %s %v", r.URL.Path, r.Header)
+				}
+				wire, _ := json.Marshal(body)
+				if body["model"] != "gpt-5.6-luna" || body["stream"] != true ||
+					gjson.GetBytes(wire, "tools.0.model").String() != imageModel ||
+					gjson.GetBytes(wire, "tools.0.quality").String() != "max" ||
+					gjson.GetBytes(wire, "input.0.content.0.text").String() != "draw a cat" {
+					t.Errorf("image request contract: %s", wire)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"result\":\"aW1hZ2U=\",\"output_format\":\"png\"}}\n\n")
+				_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-image\",\"status\":\"completed\",\"output\":[],\"tool_usage\":{\"image_gen\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}}\n\n")
+			}))
+			defer upstream.Close()
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "codex-images", upstreamProtocol: "codex", models: imageModel,
+				authType:        model.AuthTypeCodexOAuth,
+				oauthCredential: codexProxyTestCredential(t, "image-access", "refresh", "account"),
+			}}, map[int]string{0: upstream.URL + "/backend-api/codex/responses#"})
+			for _, stream := range []bool{false, true} {
+				response := doProxyRequest(t, env.engine, "/v1/images/generations", map[string]any{
+					"model": imageModel, "prompt": "draw a cat", "quality": "max", "stream": stream,
+				}, nil)
+				if response.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				if !stream {
+					if gjson.Get(response.Body.String(), "data.0.b64_json").String() != "aW1hZ2U=" || gjson.Get(response.Body.String(), "usage.total_tokens").Int() != 8 {
+						t.Fatalf("image result: %s", response.Body.String())
+					}
+					continue
+				}
+				completed := false
+				for _, block := range strings.Split(response.Body.String(), "\n\n") {
+					_, data := parseSSEEventChunk([]byte(block + "\n\n"))
+					if gjson.GetBytes(data, "type").String() == "image_generation.completed" {
+						completed = gjson.GetBytes(data, "b64_json").String() == "aW1hZ2U="
+					}
+				}
+				if !completed {
+					t.Fatalf("missing completed image: %s", response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestProxy_CodexOAuthImage25Direct(t *testing.T) {
+	t.Parallel()
+
+	for _, imageModel := range []string{"gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"} {
+		for _, endpoint := range []string{"generations", "edits"} {
+			for _, stream := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", imageModel, endpoint, stream), func(t *testing.T) {
+					t.Parallel()
+
+					imageData := "aW1hZ2U="
+					if stream {
+						imageData = strings.Repeat("YWJj", maxSSEEventSize/4+1)
+					}
+					upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						var body map[string]any
+						if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+							t.Fatal(err)
+						}
+						if r.URL.Path != "/backend-api/codex/images/"+endpoint || r.Header.Get("Authorization") != "Bearer image-access" {
+							t.Errorf("upstream request: %s %v", r.URL.Path, r.Header)
+						}
+						if body["model"] != imageModel || body["stream"] != stream || body["prompt"] != "draw a cat" ||
+							body["n"] != float64(2) || body["quality"] != "max" || body["tools"] != nil || body["prompt_cache_key"] != nil {
+							t.Errorf("image wire: %#v", body)
+						}
+						if endpoint == "edits" {
+							wire, _ := json.Marshal(body)
+							if gjson.GetBytes(wire, "images.0.file_id").String() != "file-image" || gjson.GetBytes(wire, "mask.file_id").String() != "file-mask" {
+								t.Errorf("image references lost: %s", wire)
+							}
+						}
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+							prefix := "image_generation"
+							if endpoint == "edits" {
+								prefix = "image_edit"
+							}
+							_, _ = fmt.Fprintf(w, "event: %s.completed\ndata: {\"type\":\"%s.completed\",\"b64_json\":\"%s\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}\n\n", prefix, prefix, imageData)
+						} else {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = io.WriteString(w, `{"created":1770000000,"data":[{"b64_json":"aW1hZ2U="}],"usage":{"input_tokens":3,"output_tokens":5}}`)
+						}
+					}))
+					defer upstream.Close()
+					env := setupProxyTestEnv(t, []testChannel{{
+						name: "codex-images", upstreamProtocol: "codex", models: imageModel, authType: model.AuthTypeCodexOAuth,
+						oauthCredential: codexProxyTestCredential(t, "image-access", "refresh", "account"),
+					}}, map[int]string{0: upstream.URL + "/backend-api/codex/responses#"})
+					request := map[string]any{"model": imageModel, "prompt": "draw a cat", "quality": "max", "n": 2, "stream": stream}
+					if endpoint == "edits" {
+						request["images"] = []any{map[string]any{"file_id": "file-image"}}
+						request["mask"] = map[string]any{"file_id": "file-mask"}
+					}
+					response := doProxyRequest(t, env.engine, "/v1/images/"+endpoint, request, nil)
+					if response.Code != http.StatusOK {
+						t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+					}
+					payload := response.Body.Bytes()
+					if stream {
+						_, payload = parseSSEEventChunk(payload)
+					}
+					field := "data.0.b64_json"
+					if stream {
+						field = "b64_json"
+					}
+					if gjson.GetBytes(payload, field).String() != imageData {
+						t.Fatalf("image response mismatch, bytes=%d", len(payload))
+					}
+					entry := waitForProxyLog(t, env, imageModel)
+					if entry.StatusCode != http.StatusOK || entry.InputTokens != 3 || entry.OutputTokens != 5 {
+						t.Fatalf("image log: %+v", entry)
+					}
+					if imageModel != "gpt-image-2.5" && !floatEquals(entry.Cost, 0.000174) {
+						t.Fatalf("image cost=%g, want 0.000174", entry.Cost)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProxy_CodexOAuthImage25Multipart(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if r.URL.Path != "/backend-api/codex/images/edits" || r.Header.Get("Content-Type") != "application/json" ||
+					gjson.GetBytes(body, "model").String() != "gpt-image-2.5-flare" || gjson.GetBytes(body, "stream").Bool() != stream ||
+					gjson.GetBytes(body, "images.0.image_url").String() != "data:text/plain; charset=utf-8;base64,aW1hZ2U=" ||
+					gjson.GetBytes(body, "mask.image_url").String() != "data:text/plain; charset=utf-8;base64,bWFzaw==" ||
+					gjson.GetBytes(body, "partial_images").Int() != 2 {
+					t.Errorf("multipart wire: %s %v %s", r.URL.Path, r.Header, body)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "event: image_edit.completed\ndata: {\"type\":\"image_edit.completed\",\"b64_json\":\"aW1hZ2U=\"}\n\n")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"data":[{"b64_json":"aW1hZ2U="}]}`)
+				}
+			}))
+			defer upstream.Close()
+			env := setupProxyTestEnv(t, []testChannel{{name: "codex-edit", upstreamProtocol: "codex", models: "codex/gpt-image-2.5-flare",
+				authType: model.AuthTypeCodexOAuth, oauthCredential: codexProxyTestCredential(t, "image-access", "refresh", "account")}},
+				map[int]string{0: upstream.URL + "/backend-api/codex/responses#"})
+			var buf bytes.Buffer
+			form := multipart.NewWriter(&buf)
+			for key, value := range map[string]string{"model": "codex/gpt-image-2.5-flare", "prompt": "edit a cat", "stream": strconv.FormatBool(stream), "partial_images": "2"} {
+				if err := form.WriteField(key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range []string{"image", "mask"} {
+				part, err := form.CreateFormFile(name, name+".png")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.WriteString(part, name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := form.Close(); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &buf)
+			req.Header.Set("Content-Type", form.FormDataContentType())
+			req.Header.Set("Authorization", "Bearer test-api-key")
+			response := httptest.NewRecorder()
+			env.engine.ServeHTTP(response, req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxy_CodexOAuthImage25FailuresAndCooldown(t *testing.T) {
+	t.Parallel()
+
+	for _, failure := range []string{"invalid", "rate_limit", "stream_error", "incomplete"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Parallel()
+
+			var calls atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				if failure == "rate_limit" {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"image model limit"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				if failure == "stream_error" {
+					_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"type\":\"server_error\",\"message\":\"image failed\"}}\n\n")
+				} else {
+					_, _ = io.WriteString(w, "event: image_generation.partial_image\ndata: {\"type\":\"image_generation.partial_image\",\"b64_json\":\"cGFydGlhbA==\"}\n\n")
+				}
+			}))
+			defer upstream.Close()
+			name := "codex/gpt-image-2.5-flare"
+			env := setupProxyTestEnvWithSettings(t, []testChannel{{name: "image-errors", upstreamProtocol: "codex", models: name, protocolTransformMode: model.ProtocolTransformModeAuto,
+				authType: model.AuthTypeCodexOAuth, oauthCredential: codexProxyTestCredential(t, "image-access", "refresh", "account")}},
+				map[int]string{0: upstream.URL + "/backend-api/codex/responses#"}, map[string]string{"cooldown_fallback_enabled": "false"})
+			request := map[string]any{"model": name, "prompt": "draw a cat", "stream": true}
+			if failure == "invalid" {
+				request["n"] = 0
+			}
+			response := doProxyRequest(t, env.engine, "/v1/images/generations", request, nil)
+			if failure == "invalid" {
+				if response.Code != http.StatusBadRequest || calls.Load() != 0 {
+					t.Fatalf("invalid request: status=%d calls=%d", response.Code, calls.Load())
+				}
+				return
+			}
+			entry := waitForProxyLog(t, env, name)
+			if entry.StatusCode == http.StatusOK {
+				t.Fatalf("failure logged as success: %+v", entry)
+			}
+			if entry.ActualModel != "gpt-image-2.5-flare" {
+				t.Fatalf("actual model=%q", entry.ActualModel)
+			}
+			if failure == "stream_error" {
+				return // Error envelope follows the existing classifier's cooldown policy.
+			}
+			if failure == "incomplete" && entry.StatusCode != util.StatusStreamIncomplete {
+				t.Fatalf("incomplete status=%d", entry.StatusCode)
+			}
+			before := calls.Load()
+			_ = doProxyRequest(t, env.engine, "/v1/images/generations", request, nil)
+			if calls.Load() != before {
+				t.Fatalf("cooled model retried: before=%d after=%d", before, calls.Load())
+			}
+		})
 	}
 }
 
@@ -3533,7 +4537,7 @@ func TestProxy_OAuthRefreshFailureChecksExistingAccessToken(t *testing.T) {
 				if response.Code != http.StatusUnauthorized {
 					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 				}
-				if tt.authType == model.AuthTypeCodexOAuth {
+				if tt.authType == model.AuthTypeCodexOAuth || tt.authType == model.AuthTypeAntigravityOAuth {
 					if configs[0].Enabled {
 						t.Fatal("terminally rejected Codex credential left channel enabled")
 					}
@@ -3560,6 +4564,75 @@ func TestProxy_OAuthRefreshFailureChecksExistingAccessToken(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestProxy_OperatorAbort_DuringOAuthRefreshDoesNotCoolChannel(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"type":"authentication_error","message":"expired"}}`)
+	}))
+	defer upstream.Close()
+	backup := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-backup","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`)
+	}))
+	defer backup.Close()
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "abort-refresh", upstreamProtocol: "codex", models: "gpt-test", priority: 100, authType: model.AuthTypeCodexOAuth, oauthCredential: codexProxyTestCredential(t, "at-old", "rt-old", "account")},
+		{name: "backup", upstreamProtocol: "codex", models: "gpt-test", priority: 50},
+	}, map[int]string{0: upstream.URL, 1: backup.URL})
+	refreshStarted, releaseRefresh := make(chan struct{}), make(chan struct{})
+	defer close(releaseRefresh)
+	refreshClient := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		close(refreshStarted)
+		<-releaseRefresh
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"access_token":"at-new","refresh_token":"rt-new","expires_in":604800}`)), Request: req}, nil
+	})}
+	service := codexauth.NewService(refreshClient)
+	service.TokenURL = "https://oauth.test/token"
+	env.server.codexCredentials.service = service
+	env.server.codexCredentials.clientFor = func(*model.Config) *http.Client { return refreshClient }
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","stream":false,"input":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-api-key")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { defer close(done); env.engine.ServeHTTP(response, req) }()
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refresh did not start")
+	}
+	active := env.server.activeRequests.List()
+	if len(active) != 1 || !env.server.activeRequests.Abort(active[0].ID) {
+		t.Fatal("no abortable request during refresh")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("abort did not stop waiting for refresh")
+	}
+	if response.Code != http.StatusOK || gjson.Get(response.Body.String(), "id").String() != "resp-backup" {
+		t.Fatalf("backup response=%d %s", response.Code, response.Body.String())
+	}
+	cfg, err := env.store.GetConfig(context.Background(), active[0].ChannelID)
+	if err != nil || !cfg.Enabled {
+		t.Fatalf("channel disabled: cfg=%+v err=%v", cfg, err)
+	}
+	cooldowns, err := env.store.GetAllChannelCooldowns(context.Background())
+	if err != nil || !cooldowns[cfg.ID].IsZero() {
+		t.Fatalf("abort cooled credentials: cooldowns=%+v err=%v", cooldowns, err)
+	}
+	// 刷新期间的中断绕过 forwardAttempt，必须仍留下 502 记录，否则日志只剩
+	// "401 + 换渠道成功"，运维无法解释换渠原因。
+	abortLog := waitForProxyLogMatching(t, env, func(e *model.LogEntry) bool {
+		return e.ChannelID == cfg.ID && e.StatusCode == http.StatusBadGateway &&
+			strings.Contains(e.Message, errOperatorAbort.Error())
+	})
+	if abortLog == nil {
+		t.Fatal("operator abort during refresh left no proxy log")
 	}
 }
 
@@ -3707,6 +4780,59 @@ func TestProxy_XAIOAuthDoesNotReplayAfterCommittedSemanticOutput(t *testing.T) {
 	}
 }
 
+func TestProxy_CodexPreservesOfficialClientIdentity(t *testing.T) {
+	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
+	for _, authType := range []string{model.AuthTypeAPIKey, model.AuthTypeCodexOAuth} {
+		t.Run(authType, func(t *testing.T) {
+			for _, version := range []string{"", "0.153.4"} {
+				t.Run("version="+version, func(t *testing.T) {
+					captured := make(chan http.Header, 1)
+					upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						captured <- r.Header.Clone()
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, "event: response.completed\ndata: "+`{"type":"response.completed","response":{"id":"resp-identity","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`+"\n\n")
+					}))
+					defer upstream.Close()
+					channel := testChannel{
+						name: "codex-identity", upstreamProtocol: "codex", models: "gpt-test",
+						authType: authType, apiKey: "sk-upstream",
+					}
+					if authType == model.AuthTypeCodexOAuth {
+						channel.oauthCredential = codexProxyTestCredential(t, "at-upstream", "rt-upstream", "account-upstream")
+					}
+					env := setupProxyTestEnv(t, []testChannel{channel}, map[int]string{0: upstream.URL})
+					headers := map[string]string{
+						"User-Agent": clientUserAgent, "Originator": "codex-tui",
+						"X-Codex-Window-Id": "client-thread:0",
+					}
+					if version != "" {
+						headers["Version"] = version
+					}
+					response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+						"model": "gpt-test", "instructions": "test", "input": []any{}, "stream": true,
+					}, headers)
+					if response.Code != http.StatusOK {
+						t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+					}
+					var got http.Header
+					select {
+					case got = <-captured:
+					default:
+						t.Fatal("upstream request was not captured")
+					}
+					if got.Get("User-Agent") != clientUserAgent || got.Get("Version") != version {
+						t.Errorf("upstream identity = UA %q Version %q, want UA %q Version %q",
+							got.Get("User-Agent"), got.Get("Version"), clientUserAgent, version)
+					}
+					if windowID := got.Get("X-Codex-Window-Id"); windowID != "client-thread:0" {
+						t.Errorf("upstream X-Codex-Window-Id = %q, want client-thread:0", windowID)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestProxy_CodexOAuthNonStreamingOpenAIClientReassemblesAndTranslates(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		wireBody, err := io.ReadAll(r.Body)
@@ -3751,367 +4877,66 @@ func TestProxy_CodexOAuthNonStreamingOpenAIClientReassemblesAndTranslates(t *tes
 }
 
 func TestProxy_CodexOAuthUsageLimitCoolsActualModel(t *testing.T) {
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Codex-Primary-Used-Percent", "100")
-		w.Header().Set("X-Codex-Primary-Window-Minutes", "10080")
-		w.Header().Set("X-Codex-Primary-Reset-After-Seconds", "7260")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":7260}}`)
-	}))
-	defer upstream.Close()
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%t", streaming), func(t *testing.T) {
+			var attempts atomic.Int64
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("X-Codex-Primary-Used-Percent", "100")
+				w.Header().Set("X-Codex-Primary-Window-Minutes", "10080")
+				w.Header().Set("X-Codex-Primary-Reset-After-Seconds", "7260")
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: "+`{"type":"error","status_code":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":7260}}`+"\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":7260}}`)
+			}))
+			defer upstream.Close()
 
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "codex-oauth-usage-limit", upstreamProtocol: "codex", models: "gpt-5.4-mini,gpt-5.4", priority: 100,
-		authType:        model.AuthTypeCodexOAuth,
-		oauthCredential: codexProxyTestCredential(t, "at-usage-limit", "rt-usage-limit", "account-usage-limit"),
-	}}, map[int]string{0: upstream.URL})
+			credential := strings.TrimSuffix(codexProxyTestCredential(t, "at-usage-limit", "rt-usage-limit", "account-usage-limit"), "}") +
+				`,"quota_overdraft":{"enabled":true}}`
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "codex-oauth-usage-limit", upstreamProtocol: "codex", models: "gpt-5.4-mini,gpt-5.4", priority: 100,
+				authType: model.AuthTypeCodexOAuth, oauthCredential: credential,
+			}}, map[int]string{0: upstream.URL})
 
-	before := time.Now()
-	_ = doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model":  "gpt-5.4-mini",
-		"input":  "hello",
-		"stream": false,
-	}, nil)
+			before := time.Now()
+			response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+				"model":  "gpt-5.4-mini",
+				"input":  []any{map[string]any{"type": "message", "role": "user", "content": "hello"}},
+				"stream": streaming,
+			}, nil)
+			if response.Code != http.StatusTooManyRequests || attempts.Load() != 1 {
+				t.Fatalf("status=%d upstream attempts=%d, want 429 after one attempt; body=%s",
+					response.Code, attempts.Load(), response.Body.String())
+			}
 
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("get model cooldowns: %v", err)
-	}
-	until := cooldowns[configs[0].ID]["gpt-5.4-mini"]
-	duration := until.Sub(before)
-	if duration < 7250*time.Second || duration > 7270*time.Second {
-		t.Fatalf("model cooldown duration=%v, want about 7260s", duration)
-	}
-	if _, exists := cooldowns[configs[0].ID]["gpt-5.4"]; exists {
-		t.Fatal("unaffected Codex model must not be cooled")
-	}
-	persistedCredential, err := codexauth.ParseCredential([]byte(configs[0].OAuthCredential))
-	if err != nil || persistedCredential.PassiveUsage == nil || len(persistedCredential.PassiveUsage.Windows) != 1 ||
-		persistedCredential.PassiveUsage.Windows[0].UsedPercent != 100 ||
-		persistedCredential.PassiveUsage.Windows[0].LimitWindowSeconds != 7*24*60*60 ||
-		persistedCredential.PassiveUsage.Windows[0].ResetAt < before.Add(7250*time.Second).Unix() {
-		t.Fatalf("HTTP 429 Codex quota = (%#v, %v)", persistedCredential, err)
-	}
-}
-
-func TestProxy_CodexOAuthQuotaOverdraftReplaysSSEUsageLimitWithoutCooldown(t *testing.T) {
-	var attempts atomic.Int64
-	secondBody := make(chan []byte, 1)
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		if attempts.Add(1) == 1 {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, `event: error`+"\n"+
-				`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"team","resets_in_seconds":7260},"status_code":429}`+"\n\n")
-			return
-		}
-		if attempts.Load() == 2 {
-			secondBody <- body
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp-overdraft","object":"response","status":"completed","model":"gpt-5.4-mini","output":[],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`+"\n\n")
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "codex-oauth-overdraft-success", upstreamProtocol: "codex", models: "gpt-5.4-mini,gpt-5.6-luna", priority: 100,
-		authType:            model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-success", "rt-overdraft-success", "account-overdraft-success"),
-		codexQuotaOverdraft: true,
-	}}, map[int]string{0: upstream.URL})
-	seedConfigs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(seedConfigs) != 1 {
-		t.Fatalf("ListConfigs before request: configs=%d err=%v", len(seedConfigs), err)
-	}
-	if err := env.store.SetModelCooldown(context.Background(), seedConfigs[0].ID, "gpt-5.4-mini", time.Now().Add(time.Minute)); err != nil {
-		t.Fatalf("seed model cooldown: %v", err)
-	}
-
-	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model": "gpt-5.4-mini",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "hello"}},
-		}},
-		"stream": true,
-	}, nil)
-	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
-	}
-	if attempts.Load() != 2 {
-		t.Fatalf("upstream attempts=%d, want 2", attempts.Load())
-	}
-
-	replayed := <-secondBody
-	items := gjson.GetBytes(replayed, "input").Array()
-	if len(items) != 3 {
-		t.Fatalf("replayed input items=%d body=%s, want original message plus tool pair", len(items), replayed)
-	}
-	callID := items[1].Get("call_id").String()
-	if items[1].Get("type").String() != "custom_tool_call" || items[1].Get("name").String() != "exec" ||
-		!strings.HasPrefix(callID, "call_ccload_overdraft_") ||
-		items[2].Get("type").String() != "custom_tool_call_output" || items[2].Get("call_id").String() != callID {
-		t.Fatalf("invalid overdraft tool pair: %s", replayed)
-	}
-
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("GetAllModelCooldowns: %v", err)
-	}
-	if len(cooldowns[configs[0].ID]) != 0 {
-		t.Fatalf("successful overdraft replay left model cooldowns: %+v", cooldowns[configs[0].ID])
-	}
-	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.StatusCode != http.StatusOK || entry.Message != "ok [quota_overdraft]" {
-		t.Fatalf("proxy log status/message=%d/%q, want 200 overdraft success", entry.StatusCode, entry.Message)
-	}
-	if entry.Cost <= 0 {
-		t.Fatalf("overdraft success cost=%v, want priced request", entry.Cost)
-	}
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("GetConfig after overdraft success: %v", err)
-	}
-	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	if err != nil {
-		t.Fatalf("parse persisted overdraft credential: %v", err)
-	}
-	if persistedCredential.QuotaOverdraft == nil || !persistedCredential.QuotaOverdraft.Enabled ||
-		persistedCredential.QuotaOverdraft.ActiveUntil <= time.Now().Unix() ||
-		persistedCredential.QuotaOverdraft.SuccessfulRequests != 1 ||
-		persistedCredential.QuotaOverdraft.CostMicroUSD != util.USDToMicroUSD(entry.Cost) {
-		t.Fatalf("persisted overdraft stats=%#v, want requests=1 cost_microusd=%d",
-			persistedCredential.QuotaOverdraft, util.USDToMicroUSD(entry.Cost))
-	}
-	logs, err := env.store.ListLogs(context.Background(), time.Now().Add(-time.Minute), 20, 0, &model.LogFilter{LogSource: model.LogSourceProxy})
-	if err != nil || len(logs) != 1 {
-		t.Fatalf("proxy logs=%d err=%v, want one final success log", len(logs), err)
-	}
-
-	followUp := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model": "gpt-5.6-luna",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "follow up"}},
-		}},
-		"stream": true,
-	}, nil)
-	if followUp.Code != http.StatusOK || attempts.Load() != 3 {
-		t.Fatalf("follow-up status=%d attempts=%d body=%s, want direct active-cycle success",
-			followUp.Code, attempts.Load(), followUp.Body.String())
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		logs, err = env.store.ListLogs(context.Background(), time.Now().Add(-time.Minute), 20, 0, &model.LogFilter{LogSource: model.LogSourceProxy})
-		if err == nil && len(logs) == 2 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err != nil || len(logs) != 2 || logs[0].Message != "ok [quota_overdraft]" || logs[1].Message != "ok [quota_overdraft]" {
-		t.Fatalf("active-cycle logs=%#v err=%v, want both successes marked overdraft", logs, err)
-	}
-	persisted, err = env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("GetConfig after active-cycle follow-up: %v", err)
-	}
-	persistedCredential, err = codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	wantCost := util.USDToMicroUSD(logs[0].Cost) + util.USDToMicroUSD(logs[1].Cost)
-	if err != nil || persistedCredential.QuotaOverdraft == nil ||
-		persistedCredential.QuotaOverdraft.SuccessfulRequests != 2 ||
-		persistedCredential.QuotaOverdraft.CostMicroUSD != wantCost {
-		t.Fatalf("active-cycle stats=%#v err=%v, want requests=2 cost=%d",
-			persistedCredential.QuotaOverdraft, err, wantCost)
-	}
-}
-
-func TestProxy_CodexOAuthQuotaOverdraftRecoversLegacyActiveCycle(t *testing.T) {
-	now := time.Now().UTC()
-	resetAt := now.Add(time.Hour).Unix()
-	credential, err := (&codexauth.Credential{
-		Type: codexauth.ChannelType, AccessToken: "at-overdraft-legacy", RefreshToken: "rt-overdraft-legacy",
-		Expired: now.Add(time.Hour).Format(time.RFC3339), AccountID: "account-overdraft-legacy",
-		QuotaOverdraft: &codexauth.QuotaOverdraft{Enabled: true, SuccessfulRequests: 1, CostMicroUSD: 100},
-		PassiveUsage: &codexauth.PassiveUsage{
-			SampledAt: now.Format(time.RFC3339Nano),
-			Windows: []codexauth.PassiveUsageWindow{{
-				Scope: codexauth.ChannelType, LimitName: "codex", Kind: "primary", UsedPercent: 100,
-				LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAt: resetAt, SampledAt: now.Format(time.RFC3339Nano),
-			}},
-		},
-	}).JSON()
-	if err != nil {
-		t.Fatalf("encode legacy overdraft credential: %v", err)
-	}
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp-overdraft-legacy",`+
-			`"status":"completed","model":"gpt-5.4-mini","output":[],`+
-			`"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`+"\n\n")
-	}))
-	defer upstream.Close()
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "codex-oauth-overdraft-legacy", upstreamProtocol: "codex", models: "gpt-5.4-mini", priority: 100,
-		authType: model.AuthTypeCodexOAuth, oauthCredential: credential,
-	}}, map[int]string{0: upstream.URL})
-
-	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model": "gpt-5.4-mini", "stream": true,
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "continue"}},
-	}, nil)
-	if response.Code != http.StatusOK {
-		t.Fatalf("legacy active-cycle status=%d body=%s", response.Code, response.Body.String())
-	}
-	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.Message != "ok [quota_overdraft]" || entry.Cost <= 0 {
-		t.Fatalf("legacy active-cycle log=%#v", entry)
-	}
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("legacy active-cycle configs=%d err=%v", len(configs), err)
-	}
-	persisted, err := codexauth.ParseCredential([]byte(configs[0].OAuthCredential))
-	wantCost := int64(100) + util.USDToMicroUSD(entry.Cost)
-	if err != nil || persisted.QuotaOverdraft == nil || persisted.QuotaOverdraft.ActiveUntil != resetAt ||
-		persisted.QuotaOverdraft.SuccessfulRequests != 2 || persisted.QuotaOverdraft.CostMicroUSD != wantCost {
-		t.Fatalf("legacy active-cycle stats=%#v err=%v, want requests=2 cost=%d", persisted, err, wantCost)
-	}
-}
-
-func TestProxy_CodexOAuthQuotaOverdraftDoesNotReplayCommittedSSEUsageLimit(t *testing.T) {
-	var attempts atomic.Int64
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		attempts.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `event: response.output_text.delta`+"\n"+
-			`data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial"}`+"\n\n")
-		_, _ = io.WriteString(w, `event: error`+"\n"+
-			`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"team","resets_in_seconds":7260},"status_code":429}`+"\n\n")
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "codex-oauth-overdraft-committed", upstreamProtocol: "codex", models: "gpt-5.4-mini", priority: 100,
-		authType:            model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-committed", "rt-overdraft-committed", "account-overdraft-committed"),
-		codexQuotaOverdraft: true,
-	}}, map[int]string{0: upstream.URL})
-
-	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model": "gpt-5.4-mini",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "hello"}},
-		}},
-		"stream": true,
-	}, nil)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "partial") {
-		t.Fatalf("committed response status/body=%d/%q, want HTTP 200 with partial output", response.Code, response.Body.String())
-	}
-	if attempts.Load() != 1 {
-		t.Fatalf("upstream attempts=%d, committed SSE error must not be replayed", attempts.Load())
-	}
-
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("GetAllModelCooldowns: %v", err)
-	}
-	if _, exists := cooldowns[configs[0].ID]["gpt-5.4-mini"]; !exists {
-		t.Fatal("committed SSE usage limit must still cool the affected model")
-	}
-	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.StatusCode != http.StatusTooManyRequests || strings.Contains(entry.Message, "quota_overdraft") {
-		t.Fatalf("proxy log status/message=%d/%q, want ordinary 429 without overdraft marker", entry.StatusCode, entry.Message)
-	}
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("GetConfig after committed SSE error: %v", err)
-	}
-	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	if err != nil || persistedCredential.QuotaOverdraft == nil ||
-		persistedCredential.QuotaOverdraft.SuccessfulRequests != 0 ||
-		persistedCredential.QuotaOverdraft.CostMicroUSD != 0 {
-		t.Fatalf("committed SSE error changed overdraft stats: credential=%#v err=%v", persistedCredential, err)
-	}
-}
-
-func TestProxy_CodexOAuthQuotaOverdraftReplayFailureAppliesCooldownOnce(t *testing.T) {
-	var attempts atomic.Int64
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		attempts.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7260}}`)
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "codex-oauth-overdraft-failure", upstreamProtocol: "codex", models: "gpt-5.4-mini", priority: 100,
-		authType:            model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-failure", "rt-overdraft-failure", "account-overdraft-failure"),
-		codexQuotaOverdraft: true,
-	}}, map[int]string{0: upstream.URL})
-
-	before := time.Now()
-	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
-		"model": "gpt-5.4-mini",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "hello"}},
-		}},
-		"stream": false,
-	}, nil)
-	if response.Code != http.StatusTooManyRequests {
-		t.Fatalf("status=%d body=%s, want 429", response.Code, response.Body.String())
-	}
-	if attempts.Load() != 2 {
-		t.Fatalf("upstream attempts=%d, want exactly 2", attempts.Load())
-	}
-
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("GetAllModelCooldowns: %v", err)
-	}
-	duration := cooldowns[configs[0].ID]["gpt-5.4-mini"].Sub(before)
-	if duration < 7250*time.Second || duration > 7270*time.Second {
-		t.Fatalf("model cooldown duration=%v, want about 7260s", duration)
-	}
-	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.StatusCode != http.StatusTooManyRequests || !strings.HasSuffix(entry.Message, "[quota_overdraft]") {
-		t.Fatalf("proxy log status/message=%d/%q, want final 429 overdraft marker", entry.StatusCode, entry.Message)
-	}
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("GetConfig after overdraft failure: %v", err)
-	}
-	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	if err != nil {
-		t.Fatalf("parse persisted overdraft credential: %v", err)
-	}
-	if persistedCredential.QuotaOverdraft == nil || persistedCredential.QuotaOverdraft.SuccessfulRequests != 0 ||
-		persistedCredential.QuotaOverdraft.CostMicroUSD != 0 {
-		t.Fatalf("failed replay changed overdraft stats: %#v", persistedCredential.QuotaOverdraft)
-	}
-	logs, err := env.store.ListLogs(context.Background(), time.Now().Add(-time.Minute), 20, 0, &model.LogFilter{LogSource: model.LogSourceProxy})
-	if err != nil || len(logs) != 1 {
-		t.Fatalf("proxy logs=%d err=%v, want one final failure log", len(logs), err)
+			configs, err := env.store.ListConfigs(context.Background())
+			if err != nil || len(configs) != 1 {
+				t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+			}
+			cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
+			if err != nil {
+				t.Fatalf("get model cooldowns: %v", err)
+			}
+			duration := cooldowns[configs[0].ID]["gpt-5.4-mini"].Sub(before)
+			if duration < 7250*time.Second || duration > 7270*time.Second {
+				t.Fatalf("model cooldown duration=%v, want about 7260s", duration)
+			}
+			if _, exists := cooldowns[configs[0].ID]["gpt-5.4"]; exists {
+				t.Fatal("unaffected Codex model must not be cooled")
+			}
+			persistedCredential, err := codexauth.ParseCredential([]byte(configs[0].OAuthCredential))
+			if err != nil || persistedCredential.PassiveUsage == nil || len(persistedCredential.PassiveUsage.Windows) != 1 ||
+				persistedCredential.PassiveUsage.Windows[0].UsedPercent != 100 ||
+				persistedCredential.PassiveUsage.Windows[0].LimitWindowSeconds != 7*24*60*60 ||
+				persistedCredential.PassiveUsage.Windows[0].ResetAt < before.Add(7250*time.Second).Unix() {
+				t.Fatalf("Codex quota = (%#v, %v)", persistedCredential, err)
+			}
+		})
 	}
 }
 
@@ -4164,7 +4989,7 @@ func TestProxy_RetryOtherKeysOnFailure(t *testing.T) {
 				{name: "fallback", models: "gpt-test", priority: 50},
 			}, map[int]string{0: upstream.URL, 1: fallback.URL})
 			if err := env.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{{
-				ChannelID: 1, KeyIndex: 1, APIKey: "sk-provider-b", KeyStrategy: model.KeyStrategySequential,
+				ChannelID: 1, KeyIndex: 1, APIKey: "sk-provider-b", Priority: -1, KeyStrategy: model.KeyStrategySequential,
 			}}); err != nil {
 				t.Fatalf("create secondary key: %v", err)
 			}
@@ -4251,7 +5076,7 @@ func TestProxy_RetryOtherKeysSessionAffinity(t *testing.T) {
 		},
 	}, map[int]string{0: primary.URL, 1: fallback.URL})
 	if err := env.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{{
-		ChannelID: 1, KeyIndex: 1, APIKey: "sk-provider-b", KeyStrategy: model.KeyStrategySequential,
+		ChannelID: 1, KeyIndex: 1, APIKey: "sk-provider-b", Priority: -1, KeyStrategy: model.KeyStrategySequential,
 	}}); err != nil {
 		t.Fatalf("create relay keys: %v", err)
 	}
@@ -5388,7 +6213,7 @@ func TestProxy_CodexPriorityRequestBillsFastModeWithoutResponseTier(t *testing.T
 	}
 }
 
-func TestProxy_CodexPriorityRequestUsesUpstreamDefaultTier(t *testing.T) {
+func TestProxy_CodexPriorityRequestBillsFastModeDespiteUpstreamDefaultTier(t *testing.T) {
 	t.Parallel()
 
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -5414,12 +6239,12 @@ func TestProxy_CodexPriorityRequestUsesUpstreamDefaultTier(t *testing.T) {
 	}
 
 	entry := waitForProxyLog(t, env, "gpt-5.6")
-	if entry.ServiceTier != "default" {
-		t.Fatalf("ServiceTier=%q, want default", entry.ServiceTier)
+	if entry.ServiceTier != "priority" {
+		t.Fatalf("ServiceTier=%q, want priority", entry.ServiceTier)
 	}
-	wantCost := util.CalculateCostDetailed("gpt-5.6", 1000, 1000, 0, 0, 0)
+	wantCost := util.CalculateCostDetailed("gpt-5.6", 1000, 1000, 0, 0, 0) * 2.5
 	if !floatEquals(entry.Cost, wantCost) {
-		t.Fatalf("Cost=%v, want standard cost %v", entry.Cost, wantCost)
+		t.Fatalf("Cost=%v, want fast-mode cost %v", entry.Cost, wantCost)
 	}
 }
 
@@ -5512,6 +6337,27 @@ func waitForProxyLog(t testing.TB, env *proxyTestEnv, modelName string) *model.L
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("proxy log for model %q not found within deadline", modelName)
+	return nil
+}
+
+func waitForProxyLogMatching(t testing.TB, env *proxyTestEnv, match func(*model.LogEntry) bool) *model.LogEntry {
+	t.Helper()
+
+	ctx := context.Background()
+	since := time.Now().Add(-time.Minute)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		logs, err := env.store.ListLogs(ctx, since, 50, 0, &model.LogFilter{LogSource: model.LogSourceProxy})
+		if err != nil {
+			t.Fatalf("ListLogs failed: %v", err)
+		}
+		for _, entry := range logs {
+			if match(entry) {
+				return entry
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	return nil
 }
 
@@ -5769,6 +6615,8 @@ func TestProxy_DebugLogDistinguishesTransportErrorFromEmptyHTTPResponse(t *testi
 	t.Parallel()
 
 	t.Run("transport error before response", func(t *testing.T) {
+		t.Parallel()
+
 		env := setupProxyTestEnv(t, []testChannel{
 			{name: "transport-debug", upstreamProtocol: "openai", models: "gpt-transport-debug", apiKey: "sk-test"},
 		}, map[int]string{0: "https://transport-error.example.com"})
@@ -5805,6 +6653,8 @@ func TestProxy_DebugLogDistinguishesTransportErrorFromEmptyHTTPResponse(t *testi
 	})
 
 	t.Run("empty HTTP response", func(t *testing.T) {
+		t.Parallel()
+
 		env := setupProxyTestEnv(t, []testChannel{
 			{name: "empty-response-debug", upstreamProtocol: "openai", models: "gpt-empty-response", apiKey: "sk-test"},
 		}, map[int]string{0: "https://empty-response.example.com"})
@@ -6661,6 +7511,97 @@ func TestProxy_LocalModeUsesDeclaredProtocolOrder(t *testing.T) {
 	}
 }
 
+func TestProxy_OfficialCodexClientPrefersDeclaredNativeCodex(t *testing.T) {
+	tests := []struct {
+		name           string
+		protocols      []string
+		userAgent      string
+		wantPath       string
+		wantNativeBody bool
+	}{
+		{
+			name:           "official client prefers codex when declared",
+			protocols:      []string{"openai", "codex"},
+			userAgent:      "codex_cli_rs/0.153.4",
+			wantPath:       "/v1/responses",
+			wantNativeBody: true,
+		},
+		{
+			name:      "official client does not invent codex capability",
+			protocols: []string{"openai"},
+			userAgent: "codex_cli_rs/0.153.4",
+			wantPath:  "/v1/chat/completions",
+		},
+		{
+			name:      "non official client keeps declaration order",
+			protocols: []string{"openai", "codex"},
+			wantPath:  "/v1/chat/completions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
+			var gotBody []byte
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1/responses":
+					_, _ = io.WriteString(w, `{"id":"resp-native","object":"response","status":"completed","model":"gpt-test","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+				case "/v1/chat/completions":
+					_, _ = io.WriteString(w, `{"id":"chatcmpl-translated","object":"chat.completion","model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer upstream.Close()
+
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "official-codex-preference", upstreamProtocol: "openai",
+				protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-test",
+			}}, map[int]string{0: upstream.URL})
+			configs, err := env.store.ListConfigs(context.Background())
+			if err != nil || len(configs) != 1 {
+				t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+			}
+			configs[0].URLs[0].Protocols = tt.protocols
+			if _, err := env.store.UpdateConfig(context.Background(), configs[0].ID, configs[0]); err != nil {
+				t.Fatalf("UpdateConfig: %v", err)
+			}
+			env.server.InvalidateChannelListCache()
+
+			headers := map[string]string{}
+			if tt.userAgent != "" {
+				headers["User-Agent"] = tt.userAgent
+			}
+			response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+				"model":        "gpt-test",
+				"instructions": "preserve this",
+				"input": []any{map[string]any{
+					"type": "message", "role": "user",
+					"content": []any{map[string]any{"type": "input_text", "text": "hello"}},
+				}},
+				"stream": false,
+			}, headers)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s path=%s", response.Code, response.Body.String(), gotPath)
+			}
+			if gotPath != tt.wantPath {
+				t.Fatalf("upstream path=%q, want %q", gotPath, tt.wantPath)
+			}
+			if tt.wantNativeBody {
+				if !gjson.GetBytes(gotBody, "input.0.content.0.text").Exists() || gjson.GetBytes(gotBody, "messages").Exists() {
+					t.Fatalf("native Codex body was translated: %s", gotBody)
+				}
+			} else if tt.wantPath == "/v1/chat/completions" && !gjson.GetBytes(gotBody, "messages").Exists() {
+				t.Fatalf("OpenAI fallback body was not translated: %s", gotBody)
+			}
+		})
+	}
+}
+
 func TestProxy_LocalModeUsesFixedOrderWhenAllURLsAreAutomatic(t *testing.T) {
 	var paths []string
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6972,6 +7913,8 @@ func TestProxy_AutomaticProtocolFallback_CacheIsolatedByRequestFamily(t *testing
 }
 
 func TestProxy_AutomaticProtocolFallback_LogsAttemptsAndCachesOnlyEndpointFailures(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name                 string
 		statuses             []int
@@ -7005,6 +7948,8 @@ func TestProxy_AutomaticProtocolFallback_LogsAttemptsAndCachesOnlyEndpointFailur
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			var attempts atomic.Int64
 			fallbackUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				attempt := attempts.Add(1)
@@ -7159,6 +8104,8 @@ func TestProxy_AutomaticProtocolFallback_DoesNotTranslateOrdinaryErrors(t *testi
 }
 
 func TestProxy_CodexMap429To503Setting(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name             string
 		clientProtocol   string
@@ -7425,6 +8372,89 @@ func TestProxy_AutomaticProtocolFallback_SkipsUnrepresentableTransforms(t *testi
 	}
 	if !slices.Equal(paths, []string{"/v1/responses"}) {
 		t.Fatalf("paths=%v, want native Codex after local transform rejection", paths)
+	}
+}
+
+func TestProxy_LocalMode_SkipsUnrepresentableTransformsAndRetriesNextProtocol(t *testing.T) {
+	var paths []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"unexpected protocol"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "local-compaction-protocol-skip", upstreamProtocol: "anthropic",
+		protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol",
+	}}, map[int]string{0: upstream.URL})
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+	}
+	configs[0].URLs[0].Protocols = []string{"anthropic", "codex"}
+	if _, err := env.store.UpdateConfig(context.Background(), configs[0].ID, configs[0]); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []map[string]any{{
+			"type":              "compaction",
+			"encrypted_content": "opaque",
+		}},
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !slices.Equal(paths, []string{"/v1/responses"}) {
+		t.Fatalf("paths=%v, want native Codex after local Anthropic transform rejection", paths)
+	}
+}
+
+func TestProxy_LocalMode_SkipsUnrepresentableTransformsAndRetriesNextChannel(t *testing.T) {
+	var anthropicHits, codexHits int
+	anthropicUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		anthropicHits++
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"anthropic should not be called"}}`)
+	}))
+	defer anthropicUpstream.Close()
+	codexUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		codexHits++
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"unexpected path"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer codexUpstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "anthropic-local", upstreamProtocol: "anthropic", protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol"},
+		{name: "codex-local", upstreamProtocol: "codex", protocolTransformMode: model.ProtocolTransformModeLocal, models: "gpt-5.6-sol"},
+	}, map[int]string{0: anthropicUpstream.URL, 1: codexUpstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []map[string]any{{
+			"type":              "compaction",
+			"encrypted_content": "opaque",
+		}},
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if anthropicHits != 0 || codexHits != 1 {
+		t.Fatalf("anthropicHits=%d codexHits=%d, want 0/1", anthropicHits, codexHits)
 	}
 }
 
@@ -8389,7 +9419,7 @@ func TestProxy_Success_NonStreaming_OpenAIToCodexTransform(t *testing.T) {
 func TestProxy_CodexInvalidEncryptedContentRetriesWithoutEncryptedInputItems(t *testing.T) {
 	t.Parallel()
 
-	const invalidEncryptedContentBody = `{"error":{"message":"The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":"","code":"invalid_encrypted_content"}}`
+	const invalidEncryptedContentBody = `{"error":{"message":"Could not decrypt the provided encrypted_content. Ensure the value is the unmodified encrypted_content from a previous response.","type":"packy_invalid-argument","code":"invalid-argument"}}`
 
 	var attempts atomic.Int32
 	var bodies [][]byte
@@ -8422,7 +9452,7 @@ func TestProxy_CodexInvalidEncryptedContentRetriesWithoutEncryptedInputItems(t *
 	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
 		"model": "gpt-5.5",
 		"input": []map[string]any{
-			{"type": "compaction", "encrypted_content": "drop-compaction"},
+			{"type": "compaction", "encrypted_content": "keep-compaction"},
 			{"type": "reasoning", "summary": []any{}, "content": nil, "encrypted_content": "drop-reasoning"},
 			{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hi"}}},
 		},
@@ -8443,9 +9473,10 @@ func TestProxy_CodexInvalidEncryptedContentRetriesWithoutEncryptedInputItems(t *
 	if bytes.Contains(bodies[1], []byte(`"type":"reasoning"`)) {
 		t.Fatalf("retry request should remove reasoning item, got %s", bodies[1])
 	}
-	if bytes.Contains(bodies[1], []byte(`"encrypted_content"`)) ||
-		bytes.Contains(bodies[1], []byte(`"type":"compaction"`)) {
-		t.Fatalf("retry request should remove encrypted input items, got %s", bodies[1])
+	if bytes.Contains(bodies[1], []byte(`"type":"reasoning"`)) ||
+		!bytes.Contains(bodies[1], []byte(`"type":"compaction"`)) ||
+		!bytes.Contains(bodies[1], []byte(`"encrypted_content":"keep-compaction"`)) {
+		t.Fatalf("retry request should remove encrypted reasoning while preserving compaction, got %s", bodies[1])
 	}
 	if !bytes.Contains(bodies[1], []byte(`"type":"message"`)) {
 		t.Fatalf("retry request should keep non-encrypted input items, got %s", bodies[1])
@@ -8689,6 +9720,68 @@ func TestProxy_CodexNormalizesToolSearchArgumentsBeforeForward(t *testing.T) {
 	}
 	if !foundOutput {
 		t.Fatalf("tool_search_output without arguments should be preserved: %s", upstreamBody)
+	}
+}
+
+func TestProxy_AnyrouterCodexContentItemKinds(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		url   string
+		strip bool
+	}{
+		{"prefix-AnyRouter-codex", "https://upstream.example.com", true},
+		{"regular-codex", "https://upstream.example.com", false},
+		{"url-only", "https://anyrouter.top", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupProxyTestEnv(t, []testChannel{
+				{name: tc.name, upstreamProtocol: "codex", models: "gpt-6-astra", apiKey: "sk-test"},
+			}, map[int]string{0: tc.url})
+			var captured []byte
+			env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				var err error
+				captured, err = io.ReadAll(r.Body)
+				if err != nil {
+					return nil, err
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test","object":"response","status":"completed","model":"gpt-6-astra","output":[]}`)),
+				}, nil
+			})}
+			input := []map[string]any{
+				{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "hello"}}, "internal_chat_message_metadata_passthrough": map[string]any{"content_item_kinds": []string{"test"}, "turn_id": "turn-1", "create_time": 123}},
+				{"type": "message", "role": "user", "content": []map[string]any{{"type": "input_text", "text": "world"}}, "internal_chat_message_metadata_passthrough": map[string]any{"content_item_kinds": []string{"test"}}},
+			}
+			w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{"model": "gpt-6-astra", "input": input}, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d: %s", w.Code, w.Body.String())
+			}
+			var got struct {
+				Input []map[string]any `json:"input"`
+			}
+			if err := json.Unmarshal(captured, &got); err != nil {
+				t.Fatal(err)
+			}
+			if tc.strip {
+				for _, item := range input {
+					delete(item["internal_chat_message_metadata_passthrough"].(map[string]any), "content_item_kinds")
+				}
+			}
+			wantJSON, err := json.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want []map[string]any
+			if err := json.Unmarshal(wantJSON, &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got.Input, want) {
+				t.Fatalf("upstream input mismatch: got %#v, want %#v", got.Input, want)
+			}
+		})
 	}
 }
 
@@ -10173,7 +11266,7 @@ func TestProxy_KeyRetry_On401(t *testing.T) {
 		t.Fatalf("CreateConfig: %v", err)
 	}
 	err = store.CreateAPIKeysBatch(ctx, []*model.APIKey{
-		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-bad"},
+		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-bad", Priority: 1},
 		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-good"},
 	})
 	if err != nil {
@@ -10220,8 +11313,8 @@ func TestProxy_APIKeyModelAllowlistRoutesToMatchingKey(t *testing.T) {
 		t.Fatalf("CreateConfig: %v", err)
 	}
 	if err := srv.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{
-		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-gpt", AllowedModels: []string{"gpt-5"}},
-		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-qwen", AllowedModels: []string{"qwen3"}},
+		{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-gpt", Priority: 100, AllowedModels: []string{"gpt-5"}},
+		{ChannelID: created.ID, KeyIndex: 1, APIKey: "sk-qwen", Priority: -10, AllowedModels: []string{"qwen3"}},
 	}); err != nil {
 		t.Fatalf("CreateAPIKeysBatch: %v", err)
 	}
@@ -10275,7 +11368,7 @@ func TestProxy_NoKeyForModelSkipsChannelWithoutCooldown(t *testing.T) {
 		t.Fatalf("CreateConfig(second): %v", err)
 	}
 	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
-		{ChannelID: first.ID, KeyIndex: 0, APIKey: "sk-qwen", AllowedModels: []string{"qwen3"}},
+		{ChannelID: first.ID, KeyIndex: 0, APIKey: "sk-qwen", Priority: -10, AllowedModels: []string{"qwen3"}},
 		{ChannelID: second.ID, KeyIndex: 0, APIKey: "sk-fallback"},
 	}); err != nil {
 		t.Fatalf("CreateAPIKeysBatch: %v", err)
@@ -10459,12 +11552,13 @@ func TestProxy_ClientCancel_Returns499(t *testing.T) {
 	}
 }
 
-// 管理员手动中断必须走「上游断链」而不是「客户端取消」：上游还没提交响应时
-// 应当模型级冷却当前渠道并切到下一个渠道，绝不能变成 499（不冷却、不重试）。
-func TestProxy_OperatorAbort_FailsOverLikeNetworkFailure(t *testing.T) {
+// 下游响应未提交时，中断跳过当前渠道所有 URL/Key，不施加故障冷却。
+func TestProxy_OperatorAbort_SkipsChannelWithoutCooldown(t *testing.T) {
 	upstreamStarted := make(chan struct{})
 	var startOnce sync.Once
+	var primaryHits atomic.Int64
 	primary := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryHits.Add(1)
 		startOnce.Do(func() { close(upstreamStarted) })
 		select {
 		case <-r.Context().Done(): // 被中断：不提交任何响应
@@ -10483,9 +11577,27 @@ func TestProxy_OperatorAbort_FailsOverLikeNetworkFailure(t *testing.T) {
 	defer backup.Close()
 
 	env := setupProxyTestEnv(t, []testChannel{
-		{name: "abort-primary", models: "gpt-abort", apiKey: "sk-1", priority: 100},
+		{name: "abort-primary", models: "gpt-abort", apiKey: "sk-1", priority: 100, retryOtherKeysOnFailure: true},
 		{name: "abort-backup", models: "gpt-abort", apiKey: "sk-2", priority: 50},
 	}, map[int]string{0: primary.URL, 1: backup.URL})
+
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range configs {
+		if cfg.Name != "abort-primary" {
+			continue
+		}
+		cfg.URLs = model.ChannelURLs{{URL: primary.URL}, {URL: primary.URL + "/alternate"}}
+		if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-extra"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.server.InvalidateChannelListCache()
 
 	body, _ := json.Marshal(map[string]any{
 		"model":    "gpt-abort",
@@ -10542,6 +11654,9 @@ func TestProxy_OperatorAbort_FailsOverLikeNetworkFailure(t *testing.T) {
 		t.Fatalf("backup channel hits=%d, want 1", got)
 	}
 
+	if got := primaryHits.Load(); got != 1 {
+		t.Fatalf("primary hits=%d, want 1: abort must skip remaining URLs and keys", got)
+	}
 	channels, err := env.store.ListConfigs(context.Background())
 	if err != nil {
 		t.Fatalf("ListConfigs: %v", err)
@@ -10561,13 +11676,100 @@ func TestProxy_OperatorAbort_FailsOverLikeNetworkFailure(t *testing.T) {
 		t.Fatalf("GetAllModelCooldowns: %v", err)
 	}
 	until, ok := cooldowns[primaryID]["gpt-abort"]
-	if !ok || !until.After(time.Now()) {
-		t.Fatalf("aborted channel must get a model cooldown, got %v (ok=%v)", until, ok)
+	if ok && until.After(time.Now()) {
+		t.Fatalf("operator abort must not cool the channel, got %v (ok=%v)", until, ok)
+	}
+}
+
+func TestProxy_OperatorAbort_NonStreamPingOnlyHTTP(t *testing.T) {
+	upstreamStarted := make(chan struct{})
+	primary := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		close(upstreamStarted)
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, ": PING\n\n")
+		flusher.Flush()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				_, _ = io.WriteString(w, ": PING\n\n")
+				flusher.Flush()
+			}
+		}
+	}))
+	defer primary.Close()
+
+	var backupHits atomic.Int64
+	backup := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer backup.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "abort-nonstream-primary", models: "gpt-abort-nonstream", apiKey: "sk-1", priority: 100},
+		{name: "abort-nonstream-backup", models: "gpt-abort-nonstream", apiKey: "sk-2", priority: 50},
+	}, map[int]string{0: primary.URL, 1: backup.URL})
+
+	body, _ := json.Marshal(map[string]any{
+		"model": "gpt-abort-nonstream", "stream": false,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-api-key")
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		env.engine.ServeHTTP(w, req)
+	}()
+	select {
+	case <-upstreamStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("non-stream upstream did not start")
+	}
+	time.Sleep(100 * time.Millisecond)
+	var aborted bool
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		for _, active := range env.server.activeRequests.List() {
+			if active.Abortable && env.server.activeRequests.Abort(active.ID) {
+				aborted = true
+				break
+			}
+		}
+		if aborted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !aborted {
+		t.Fatal("no abortable non-stream request appeared")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("non-stream proxy request did not finish after abort")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 after failover; body=%q", w.Code, w.Body.String())
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != `{"id":"chat-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}` {
+		t.Fatalf("non-stream response contains partial primary data: %q", got)
+	}
+	if got := backupHits.Load(); got != 1 {
+		t.Fatalf("backup hits=%d, want 1", got)
 	}
 }
 
 // 响应已提交给客户端后再中断：按契约禁止网关内部切换或重放，正确收场是 599
-// （流式中断）+ 模型级冷却，绝不能变成 499，也不能偷偷换渠道重发一遍。
+// （流式中断），不施加冷却，也不能换渠道重发。
 func TestProxy_OperatorAbort_AfterCommitDoesNotSwitchChannel(t *testing.T) {
 	primary := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -10663,8 +11865,352 @@ func TestProxy_OperatorAbort_AfterCommitDoesNotSwitchChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAllModelCooldowns: %v", err)
 	}
-	if until, ok := cooldowns[primaryID]["gpt-abort-stream"]; !ok || !until.After(time.Now()) {
-		t.Fatalf("aborted channel must get a model cooldown, got %v (ok=%v)", until, ok)
+	if until, ok := cooldowns[primaryID]["gpt-abort-stream"]; ok && until.After(time.Now()) {
+		t.Fatalf("operator abort must not cool the channel, got %v (ok=%v)", until, ok)
+	}
+}
+
+// abortOnCommitDownstream 在 deferredResponseWriter.Commit() 复制响应头时触发中断，
+// 精确命中"提交动作已开始、但首字节尚未写出下游"的窗口。
+// gin 会在代理注册活跃请求前就调用 Header()，所以 trigger 必须重试到真正中断为止。
+type abortOnCommitDownstream struct {
+	http.ResponseWriter
+	trigger      func() bool
+	armed        atomic.Bool
+	wroteHdr     atomic.Bool
+	bodyBytes    atomic.Int64
+	bytesAtAbort atomic.Int64
+}
+
+func (w *abortOnCommitDownstream) Header() http.Header {
+	if w.trigger != nil && !w.armed.Load() && w.trigger() {
+		w.armed.Store(true)
+		w.bytesAtAbort.Store(w.bodyBytes.Load())
+	}
+	return w.ResponseWriter.Header()
+}
+
+func (w *abortOnCommitDownstream) WriteHeader(status int) {
+	w.wroteHdr.Store(true)
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *abortOnCommitDownstream) Write(p []byte) (int, error) {
+	w.bodyBytes.Add(int64(len(p)))
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *abortOnCommitDownstream) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *abortOnCommitDownstream) SetWriteDeadline(time.Time) error { return nil }
+
+// 中断恰好落在首字节提交窗口时，下游实际未收到任何字节，必须仍按"未提交"切换渠道，
+// 而不是把空的 200 留给客户端。
+func TestProxy_OperatorAbort_AtCommitBoundaryStillFailsOver(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stream     bool
+		translated bool
+	}{
+		{name: "passthrough_stream", stream: true},
+		{name: "translated_stream", stream: true, translated: true},
+		{name: "translated_nonstream", translated: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`+"\n\n")
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"primary","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+			}))
+			defer upstream.Close()
+
+			var backupHits atomic.Int64
+			backup := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				backupHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"resp-backup","choices":[{"message":{"role":"assistant","content":"backup"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+			}))
+			defer backup.Close()
+
+			env := setupProxyTestEnv(t, []testChannel{
+				{name: "abort-at-commit", models: "abort-commit", priority: 100},
+				{name: "backup", models: "abort-commit", priority: 50},
+			}, map[int]string{0: upstream.URL, 1: backup.URL})
+
+			var probe *abortOnCommitDownstream
+			done := make(chan struct{})
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(done)
+				probe = &abortOnCommitDownstream{ResponseWriter: w}
+				probe.trigger = func() bool {
+					for _, entry := range env.server.activeRequests.List() {
+						if env.server.activeRequests.Abort(entry.ID) {
+							return true
+						}
+					}
+					return false
+				}
+				env.engine.ServeHTTP(probe, r)
+			}))
+			defer proxy.Close()
+
+			path := "/v1/chat/completions"
+			if tc.translated {
+				path = "/v1/messages"
+			}
+			body := fmt.Sprintf(`{"model":"abort-commit","stream":%t,"max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`, tc.stream)
+			req, err := http.NewRequest(http.MethodPost, proxy.URL+path, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer test-api-key")
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			responseBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			<-done
+			if !probe.armed.Load() {
+				t.Fatal("abort never triggered at commit boundary")
+			}
+			if probe.bytesAtAbort.Load() != 0 {
+				t.Fatalf("downstream received %d bytes before abort", probe.bytesAtAbort.Load())
+			}
+			if backupHits.Load() != 1 {
+				t.Fatalf("backup hits=%d, want 1; body=%q", backupHits.Load(), responseBody)
+			}
+			var payload struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(responseBody, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || payload.ID != "resp-backup" {
+				t.Fatalf("status=%d body=%s, want backup response", resp.StatusCode, responseBody)
+			}
+		})
+	}
+}
+
+// 中断落在 WriteHeader 成功之后：响应头已真正写给下游，Commit 必须置 committed=true。
+// 旧代码用 responseWriteAborted（取消状态反推）会在此窗口误判为"未提交"，导致非法换渠。
+// 本测试用 cancelOnWriteHeader 在下游 WriteHeader 成功后立即取消 ctx，精确命中
+// "写出成功、但取消已可见"的边界。
+func TestDeferredCommit_CancelAfterHeaderDelivered_StillCommits(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	raw := &cancelOnWriteHeader{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+
+	cw, stopWrites := newCancelableResponseWriter(ctx, raw)
+	defer stopWrites()
+
+	dw := newDeferredResponseWriter(cw)
+	dw.WriteHeader(http.StatusOK)
+
+	err := dw.Commit()
+	if err != nil {
+		t.Fatalf("Commit() returned error %v after header was already delivered; must succeed", err)
+	}
+	if !dw.Committed() {
+		t.Fatal("Committed() is false after header was delivered; must be true")
+	}
+	if raw.Code != http.StatusOK {
+		t.Fatalf("raw recorder status=%d, want 200", raw.Code)
+	}
+}
+
+// cancelOnWriteHeader 在 WriteHeader 完成后立即取消 ctx。
+// 模拟"响应头刚写给下游、取消紧随其后"的精确竞态。
+type cancelOnWriteHeader struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelCauseFunc
+}
+
+func (w *cancelOnWriteHeader) WriteHeader(status int) {
+	w.ResponseRecorder.WriteHeader(status)
+	if w.cancel != nil {
+		w.cancel(errOperatorAbort)
+		w.cancel = nil // 只触发一次
+	}
+}
+
+// cancelBeforeWriteHeader 在包装链传递 WriteHeader 时取消，精确覆盖
+// Commit 前置检查已通过、但 cancelableResponseWriter 尚未接受写头的窗口。
+type cancelBeforeWriteHeader struct {
+	http.ResponseWriter
+	cancel context.CancelCauseFunc
+}
+
+func (w *cancelBeforeWriteHeader) WriteHeader(status int) {
+	w.cancel(errOperatorAbort)
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *cancelBeforeWriteHeader) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func TestDeferredCommit_CancelBeforeHeaderDelivered_ReturnsError(t *testing.T) {
+	for _, duringWriteHeader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("during_write_header=%t", duringWriteHeader), func(t *testing.T) {
+			ctx, cancel := context.WithCancelCause(context.Background())
+			defer cancel(nil)
+			raw := httptest.NewRecorder()
+			cw, stopWrites := newCancelableResponseWriter(ctx, raw)
+			defer stopWrites()
+
+			var target http.ResponseWriter = cw
+			if duringWriteHeader {
+				target = &cancelBeforeWriteHeader{ResponseWriter: cw, cancel: cancel}
+			}
+			dw := newDeferredResponseWriter(target)
+			dw.Header().Set("X-Primary", "must-not-be-committed")
+			dw.WriteHeader(http.StatusAccepted)
+			if _, err := dw.Write([]byte(`{"id":"primary"}`)); err != nil {
+				t.Fatal(err)
+			}
+			if !duringWriteHeader {
+				cancel(errOperatorAbort)
+			}
+
+			if err := dw.Commit(); !errors.Is(err, errOperatorAbort) {
+				t.Fatalf("Commit() error=%v, want operator abort", err)
+			}
+			if dw.Committed() {
+				t.Fatal("Committed() is true but header was never delivered")
+			}
+			// 同一底层连接仍能写入完整备用响应，且主渠道没有提交状态或正文。
+			raw.Header().Del("X-Primary")
+			raw.WriteHeader(http.StatusCreated)
+			_, _ = raw.Write([]byte(`{"id":"backup"}`))
+			response := raw.Result()
+			defer func() { _ = response.Body.Close() }()
+			var payload struct {
+				ID string `json:"id"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusCreated || response.Header.Get("X-Primary") != "" || payload.ID != "backup" {
+				t.Fatalf("unexpected fallback response: status=%d header=%v payload=%+v", response.StatusCode, response.Header, payload)
+			}
+		})
+	}
+}
+
+// blockedDownstream 模拟客户端不读取时阻塞的 Write/Flush，写截止时间必须能解除阻塞。
+type blockedDownstream struct {
+	*httptest.ResponseRecorder
+	blockFlush  bool
+	started     chan struct{}
+	released    chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (w *blockedDownstream) block() {
+	w.startOnce.Do(func() { close(w.started) })
+	<-w.released
+}
+
+func (w *blockedDownstream) Write(p []byte) (int, error) {
+	if w.blockFlush {
+		return w.ResponseRecorder.Write(p)
+	}
+	w.block()
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (w *blockedDownstream) Flush() { w.block() }
+
+func (w *blockedDownstream) SetWriteDeadline(deadline time.Time) error {
+	if !deadline.IsZero() && !deadline.After(time.Now()) {
+		w.releaseOnce.Do(func() { close(w.released) })
+	}
+	return nil
+}
+
+func TestProxy_OperatorAbort_UnblocksDownstream(t *testing.T) {
+	for _, translated := range []bool{false, true} {
+		for _, flush := range []bool{false, true} {
+			t.Run(fmt.Sprintf("translated=%v/flush=%v", translated, flush), func(t *testing.T) {
+				upstreamClosed := make(chan struct{})
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					if translated {
+						_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"abort-blocked\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hello\"}}\n\n")
+					} else {
+						_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"hello"}}]}`+"\n\n")
+					}
+					w.(http.Flusher).Flush()
+					<-r.Context().Done()
+					close(upstreamClosed)
+				}))
+				defer upstream.Close()
+				var backupHits atomic.Int64
+				backup := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { backupHits.Add(1); w.WriteHeader(502) }))
+				defer backup.Close()
+				upstreamProtocol := "openai"
+				if translated {
+					upstreamProtocol = "anthropic"
+				}
+				env := setupProxyTestEnv(t, []testChannel{
+					{name: "blocked", upstreamProtocol: upstreamProtocol, models: "abort-blocked", priority: 100},
+					{name: "backup", models: "abort-blocked", priority: 50},
+				}, map[int]string{0: upstream.URL, 1: backup.URL})
+				requestPath, requestBody := "/v1/chat/completions", `{"model":"abort-blocked","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+				if translated {
+					requestPath, requestBody = "/v1/responses", `{"model":"abort-blocked","stream":true,"input":"hi"}`
+				}
+				req := httptest.NewRequest(http.MethodPost, requestPath, strings.NewReader(requestBody))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer test-api-key")
+				w := &blockedDownstream{ResponseRecorder: httptest.NewRecorder(), blockFlush: flush, started: make(chan struct{}), released: make(chan struct{})}
+				done := make(chan struct{})
+				go func() { defer close(done); env.engine.ServeHTTP(w, req) }()
+				defer func() { _ = w.SetWriteDeadline(time.Now()); <-done }()
+				select {
+				case <-w.started:
+				case <-time.After(5 * time.Second):
+					t.Fatal("downstream never blocked")
+				}
+				active := env.server.activeRequests.List()
+				if len(active) != 1 || !env.server.activeRequests.Abort(active[0].ID) {
+					t.Fatal("no abortable request")
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("abort did not unblock downstream")
+				}
+				select {
+				case <-upstreamClosed:
+				case <-time.After(time.Second):
+					t.Fatal("upstream still connected")
+				}
+				if backupHits.Load() != 0 {
+					t.Fatal("committed response retried on backup")
+				}
+				if len(env.server.activeRequests.List()) != 0 {
+					t.Fatal("aborted request still active")
+				}
+				entry := waitForProxyLog(t, env, "abort-blocked")
+				if entry.StatusCode != util.StatusStreamIncomplete {
+					t.Fatalf("status=%d, want interrupted", entry.StatusCode)
+				}
+			})
+		}
 	}
 }
 
@@ -11282,6 +12828,113 @@ func TestProxy_ResponsesMetadataThenSSEError_RetriesNextChannel(t *testing.T) {
 	}
 }
 
+// Codex 上游在响应开始与终态之间会插入 `event: keepalive`（data: {"type":"keepalive",...}）。
+// 它既不是 ping 心跳，也不在 Responses 元数据事件列表里，修复前会被算成语义输出，
+// 导致 deferredWriter 提前 commit，随后的 server_is_overloaded 无法切渠道。
+func TestProxy_ResponsesKeepaliveThenSSEError_RetriesNextChannel(t *testing.T) {
+	t.Parallel()
+
+	var firstCalls atomic.Int32
+	upstream1 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-ch1-created","status":"in_progress"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: response.in_progress\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.in_progress","response":{"id":"resp-ch1-created","status":"in_progress"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: keepalive\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"keepalive","sequence_number":2}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: error\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":3}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream1.Close()
+
+	var secondCalls atomic.Int32
+	upstream2 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-ch2","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream2.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "ch1-keepalive-then-overloaded", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1", priority: 100},
+		{name: "ch2-ok", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-2", priority: 50},
+	}, map[int]string{0: upstream1.URL, 1: upstream2.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":  "gpt-test",
+		"stream": true,
+		"input":  "hi",
+	}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 after retrying next channel, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "resp-ch2") {
+		t.Fatalf("expected completed response from second channel, got: %s", body)
+	}
+	if strings.Contains(body, "resp-ch1-created") || strings.Contains(body, "server_is_overloaded") {
+		t.Fatalf("expected first channel metadata/keepalive/error not to leak to client, body: %s", body)
+	}
+	if firstCalls.Load() != 1 || secondCalls.Load() != 1 {
+		t.Fatalf("upstream calls first=%d second=%d, want 1/1", firstCalls.Load(), secondCalls.Load())
+	}
+}
+
+// keepalive 是上游保活帧：它不算语义输出（否则会提前 commit、阻断切渠道），
+// 但字节本身必须原样透传给客户端，不能像 ping 那样被解析器丢弃。
+func TestProxy_ResponsesKeepaliveIsForwardedToClient(t *testing.T) {
+	t.Parallel()
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "event: response.created\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-keepalive","status":"in_progress"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "event: keepalive\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"keepalive","sequence_number":2}`+"\n\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-keepalive","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "ch-keepalive-ok", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1", priority: 100},
+	}, map[int]string{0: upstream.URL})
+
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model":  "gpt-test",
+		"stream": true,
+		"input":  "hi",
+	}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"type":"keepalive"`) {
+		t.Fatalf("keepalive frame must be forwarded to client, body: %s", body)
+	}
+	if !strings.Contains(body, "resp-keepalive") {
+		t.Fatalf("expected completed response from channel, body: %s", body)
+	}
+}
+
 func TestProxy_TranslatedEmptyChunkDoesNotCommitBeforeFailure(t *testing.T) {
 	t.Parallel()
 
@@ -11841,5 +13494,285 @@ func TestProxy_MultimodalFallbackRewritesRequestModel(t *testing.T) {
 	}
 	if got := <-upstreamModels; got != "gpt-vision" {
 		t.Fatalf("upstream model=%q, want gpt-vision", got)
+	}
+}
+
+func TestProxy_AntigravityThinkingSignatureRecovery(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			signature := antigravityProxyClaudeThoughtSignature("claude-sonnet-4-6")
+			var bodies [][]byte
+			rejected := false
+			truncated := false
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				bodies = append(bodies, raw)
+				if rejected {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(400)
+					_, _ = io.WriteString(w, `{"error":{"message":"Invalid thought signature"}}`)
+					return
+				}
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"response":{"candidates":[{"content":{"role":"model","parts":[{"thought":true,"text":"private reasoning"}]}}]}}`)
+					if truncated {
+						return
+					}
+					chunk := map[string]any{"response": map[string]any{"usageMetadata": map[string]any{"promptTokenCount": 1, "candidatesTokenCount": 2}, "candidates": []any{map[string]any{"content": map[string]any{"role": "model", "parts": []any{map[string]any{"thought": true, "thoughtSignature": signature}, map[string]any{"text": "answer"}}}, "finishReason": "STOP"}}}}
+					data, _ := json.Marshal(chunk)
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					data, _ := json.Marshal(map[string]any{"response": map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"role": "model", "parts": []any{map[string]any{"thought": true, "text": "private reasoning", "thoughtSignature": signature}, map[string]any{"text": "answer"}}}, "finishReason": "STOP"}}}})
+					_, _ = w.Write(data)
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			env := setupProxyTestEnv(t, []testChannel{{name: "replay", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-replay")}}, map[int]string{0: upstream.URL})
+			now := time.Now()
+			env.server.antigravityReplay.now = func() time.Time { return now }
+			send := func(session, text, explicit string, history bool) *httptest.ResponseRecorder {
+				messages := []any{map[string]any{"role": "user", "content": "question"}}
+				if history {
+					block := map[string]any{"type": "thinking", "thinking": text}
+					if explicit != "" {
+						block["signature"] = explicit
+					}
+					messages = append(messages, map[string]any{"role": "assistant", "content": []any{block, map[string]any{"type": "text", "text": "answer"}}}, map[string]any{"role": "user", "content": "continue"})
+				}
+				return doProxyRequest(t, env.engine, "/v1/messages", map[string]any{"model": "claude-sonnet-4-6", "max_tokens": 128, "stream": streaming, "messages": messages}, map[string]string{"Session-Id": session})
+			}
+			hasSignature := func() bool {
+				for _, content := range gjson.GetBytes(bodies[len(bodies)-1], "request.contents").Array() {
+					for _, part := range content.Get("parts").Array() {
+						if part.Get("thought").Bool() && part.Get("thoughtSignature").String() == base64.StdEncoding.EncodeToString([]byte(signature)) {
+							return true
+						}
+					}
+				}
+				return false
+			}
+			if res := send("session-a", "", "", false); res.Code != 200 {
+				t.Fatalf("initial response %d %s", res.Code, res.Body.String())
+			}
+			if res := send("session-a", "private reasoning", "", true); res.Code != 200 || !hasSignature() {
+				t.Fatalf("missing recovered signature: status=%d body=%s upstream=%s", res.Code, res.Body.String(), bodies[len(bodies)-1])
+			}
+			send("session-b", "private reasoning", "", true)
+			if hasSignature() {
+				t.Fatal("signature crossed sessions")
+			}
+			send("session-a", "edited reasoning", "", true)
+			if hasSignature() {
+				t.Fatal("signature attached to edited reasoning")
+			}
+			send("session-a", "private reasoning", "invalid-explicit-signature", true)
+			if hasSignature() {
+				t.Fatal("explicit invalid signature silently replaced")
+			}
+			now = now.Add(4 * time.Hour)
+			send("session-a", "private reasoning", "", true)
+			if hasSignature() {
+				t.Fatal("expired signature restored")
+			}
+			rejected = true
+			send("session-a", "private reasoning", "", true)
+			rejected = false
+			send("session-a", "private reasoning", "", true)
+			if hasSignature() {
+				t.Fatal("rejected signature survived cache invalidation")
+			}
+			if streaming {
+				truncated = true
+				send("truncated", "", "", false)
+				truncated = false
+				send("truncated", "private reasoning", "", true)
+				if hasSignature() {
+					t.Fatal("truncated response populated signature cache")
+				}
+			}
+		})
+	}
+}
+
+func TestProxy_AntigravityResponsesWebSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		stream, mixed, none bool
+	}{{name: "json"}, {name: "stream", stream: true}, {name: "mixed", mixed: true}, {name: "none", none: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			search := !tc.mixed && !tc.none
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				if got := gjson.GetBytes(raw, "requestType").String(); (got == "web_search") != search {
+					t.Errorf("requestType=%s body=%s", got, raw)
+				}
+				if search {
+					if gjson.GetBytes(raw, "model").String() != "gemini-2.5-flash" || gjson.GetBytes(raw, "request.tools.0.googleSearch.includedDomains.0").String() != "example.com" {
+						t.Errorf("missing search wire: %s", raw)
+					}
+				} else if gjson.GetBytes(raw, "model").String() != "gemini-3-flash" || strings.Contains(string(raw), `"googleSearch"`) {
+					t.Errorf("non-search request changed model/tools: %s", raw)
+				}
+				body := `{"response":{"responseId":"search-response","candidates":[{"content":{"role":"model","parts":[{"text":"答案"}]},"groundingMetadata":{"webSearchQueries":["question"],"groundingChunks":[{"web":{"uri":"https://example.com/result","title":"Source"}}],"groundingSupports":[{"groundingChunkIndices":[0],"segment":{"startIndex":0,"endIndex":6,"text":"答案"}}]},"finishReason":"STOP"}]}}`
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, body)
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			env := setupProxyTestEnv(t, []testChannel{{name: "search", upstreamProtocol: "gemini", models: "gemini-3-flash", priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-search")}}, map[int]string{0: upstream.URL})
+			tools := []any{map[string]any{"type": "web_search", "filters": map[string]any{"allowed_domains": []string{"example.com"}}}}
+			if tc.mixed {
+				tools = append(tools, map[string]any{"type": "function", "name": "lookup", "parameters": map[string]any{"type": "object"}})
+			}
+			body := map[string]any{"model": "gemini-3-flash", "input": "question", "instructions": "keep instructions", "tools": tools, "stream": tc.stream}
+			if tc.none {
+				body["tool_choice"] = "none"
+			}
+			response := doProxyRequest(t, env.engine, "/v1/responses", body, nil)
+			if response.Code != 200 {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			result := gjson.Parse(response.Body.String())
+			if tc.stream {
+				for _, event := range strings.Split(response.Body.String(), "\n\n") {
+					data := gjson.ParseBytes(sseEventData([]byte(event)))
+					if data.Get("type").String() == "response.completed" {
+						result = data.Get("response")
+					}
+				}
+			}
+			if search {
+				if result.Get("output.0.type").String() != "web_search_call" || result.Get("tool_usage.web_search.num_requests").Int() != 1 {
+					t.Fatalf("missing search output: %s", response.Body.String())
+				}
+				annotation := result.Get("output.1.content.0.annotations.0")
+				if annotation.Get("url").String() != "https://example.com/result" || annotation.Get("end_index").Int() != 2 {
+					t.Fatalf("invalid citation: %s", result.Raw)
+				}
+			}
+		})
+	}
+}
+
+func TestProxy_AntigravityResponsesSignatureRecovery(t *testing.T) {
+	const signature = "EjQKMgEMOdbHO0Gd+c9Mxk4ELwPGbpCEcp2mFfYYLix2UVtBH3fL8GECc4+JITVnHF4qZDsA"
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			var bodies [][]byte
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				bodies = append(bodies, raw)
+				body := `{"response":{"responseId":"replay-response","candidates":[{"content":{"role":"model","parts":[{"text":"signed answer","thoughtSignature":"` + signature + `"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2}}}`
+				if streaming {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, body)
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			env := setupProxyTestEnv(t, []testChannel{{name: "responses-replay", upstreamProtocol: "gemini", models: "gemini-3-flash", priority: 100, authType: model.AuthTypeAntigravityOAuth, oauthCredential: antigravityProxyTestCredential(t, "at-responses-replay")}}, map[int]string{0: upstream.URL})
+			now := time.Now()
+			env.server.antigravityReplay.now = func() time.Time { return now }
+			injectAPIToken(env.server.authService, "other-caller", 0, 2)
+			send := func(input any, caller, session string) *httptest.ResponseRecorder {
+				return doProxyRequest(t, env.engine, "/v1/responses", map[string]any{"model": "gemini-3-flash", "input": input, "stream": streaming}, map[string]string{"Authorization": "Bearer " + caller, "Session-Id": session})
+			}
+			response := send("question", "test-api-key", "replay-session")
+			if response.Code != 200 {
+				t.Fatalf("initial status=%d body=%s", response.Code, response.Body.String())
+			}
+			result := gjson.Parse(response.Body.String())
+			if streaming {
+				for _, event := range strings.Split(response.Body.String(), "\n\n") {
+					data := gjson.ParseBytes(sseEventData([]byte(event)))
+					if data.Get("type").String() == "response.completed" {
+						result = data.Get("response")
+					}
+				}
+			}
+			var message, carrier json.RawMessage
+			for _, item := range result.Get("output").Array() {
+				switch item.Get("type").String() {
+				case "message":
+					message = json.RawMessage(item.Raw)
+				case "reasoning":
+					carrier = json.RawMessage(item.Raw)
+				}
+			}
+			if len(message) == 0 || len(carrier) == 0 {
+				t.Fatalf("missing signed message/carrier: %s", response.Body.String())
+			}
+			history := func(msg json.RawMessage, withCarrier bool) []any {
+				input := []any{map[string]any{"role": "user", "content": "question"}}
+				if withCarrier && strings.Contains(gjson.GetBytes(carrier, "encrypted_content").String(), ":next:text:") {
+					input = append(input, carrier)
+				}
+				input = append(input, msg)
+				if withCarrier && !strings.Contains(gjson.GetBytes(carrier, "encrypted_content").String(), ":next:text:") {
+					input = append(input, carrier)
+				}
+				return append(input, map[string]any{"role": "user", "content": "continue"})
+			}
+			check := func(want bool) {
+				t.Helper()
+				found := false
+				for _, content := range gjson.GetBytes(bodies[len(bodies)-1], "request.contents").Array() {
+					for _, part := range content.Get("parts").Array() {
+						if part.Get("text").String() == "signed answer" && part.Get("thoughtSignature").String() == signature {
+							found = true
+						}
+					}
+				}
+				if found != want {
+					t.Fatalf("signature restored=%v want=%v body=%s", found, want, bodies[len(bodies)-1])
+				}
+			}
+			send(history(message, false), "test-api-key", "replay-session")
+			check(true)
+			send(history(message, true), "test-api-key", "replay-session")
+			check(true)
+			send(history(message, false), "other-caller", "replay-session")
+			check(false)
+			send(history(message, false), "test-api-key", "other-session")
+			check(false)
+			edited := setJSONValue(message, "content.0.text", "edited answer")
+			send(history(edited, false), "test-api-key", "replay-session")
+			check(false)
+			now = now.Add(2 * time.Hour)
+			send(history(message, false), "test-api-key", "replay-session")
+			check(false)
+			// A different account on the same channel must not inherit the old cache.
+			configs, err := env.store.ListConfigs(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := configs[0]
+			oldCredential := cfg.OAuthCredential
+			credential, err := antigravityauth.ParseCredential([]byte(cfg.OAuthCredential))
+			if err != nil {
+				t.Fatal(err)
+			}
+			credential.RefreshToken = "other-account-refresh"
+			credential.Email = "other@example.com"
+			cfg.OAuthCredential, err = credential.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = env.store.CompareAndSwapOAuthCredential(context.Background(), cfg.ID, model.AuthTypeAntigravityOAuth, oldCredential, cfg.OAuthCredential); err != nil {
+				t.Fatal(err)
+			}
+			env.server.antigravityCredentials.invalidate(cfg.ID)
+			env.server.InvalidateChannelListCache()
+			send(history(message, false), "test-api-key", "replay-session")
+			check(false)
+		})
 	}
 }

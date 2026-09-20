@@ -2,17 +2,23 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/model"
 )
 
 const (
 	channelManagementScheduleInterval = time.Minute
 	channelManagementScheduleWorkers  = 4
+	codeBuddyCheckinWorkers           = 4
+	codeBuddyCheckinTimeout           = 60 * time.Second
 )
 
 // managementCheckinLoop owns the daily management check-in scheduler lifecycle.
@@ -28,6 +34,10 @@ func (s *Server) managementCheckinLoop() {
 	if err := s.runDueManagementCheckins(ctx, time.Now()); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("[WARN] 管理账户每日签到补偿扫描失败: %v", err)
 	}
+	// Domestic CodeBuddy OAuth accounts use the provider's fixed 09:00/21:00
+	// local check-in windows. Initialize the current slot without replaying it
+	// on every server restart; the next slot transition performs the check-in.
+	codeBuddySlot := codeBuddyCheckinSlot(time.Now())
 
 	ticker := time.NewTicker(channelManagementScheduleInterval)
 	defer ticker.Stop()
@@ -41,8 +51,197 @@ func (s *Server) managementCheckinLoop() {
 			if err := s.runDueManagementCheckins(ctx, now); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("[WARN] 管理账户每日签到扫描失败: %v", err)
 			}
+			if slot := codeBuddyCheckinSlot(now); slot != "" && slot != codeBuddySlot {
+				s.runDueCodeBuddyCheckins(ctx)
+				codeBuddySlot = slot
+			}
 		}
 	}
+}
+
+func (s *Server) runDueCodeBuddyCheckins(ctx context.Context) {
+	if s == nil || s.store == nil || s.codeBuddyService == nil || s.codeBuddyCredentials == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	configs, err := s.store.ListConfigs(ctx)
+	if err != nil {
+		log.Printf("[WARN] CodeBuddy 签到扫描失败: %v", err)
+		return
+	}
+	targets := make([]*model.Config, 0, len(configs))
+	for _, cfg := range configs {
+		if cfg != nil && cfg.Enabled && cfg.UsesCodeBuddyOAuth() && !isInternationalCodeBuddyConfig(cfg) {
+			targets = append(targets, cfg)
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	jobs := make(chan *model.Config)
+	workers := min(codeBuddyCheckinWorkers, len(targets))
+	if workers == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for cfg := range jobs {
+				s.runCodeBuddyCheckin(ctx, cfg)
+			}
+		}()
+	}
+	for _, cfg := range targets {
+		select {
+		case jobs <- cfg:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+type codeBuddyCheckinResult struct {
+	Status string             `json:"status"`
+	Usage  *oauthUsageSummary `json:"usage"`
+}
+
+func (s *Server) checkInCodeBuddy(ctx context.Context, cfg *model.Config) (*codeBuddyCheckinResult, error) {
+	if cfg == nil || !cfg.UsesCodeBuddyOAuth() {
+		return nil, errOAuthUsageUnsupported
+	}
+	if s == nil || s.codeBuddyService == nil || s.codeBuddyCredentials == nil {
+		return nil, errCodeBuddyUsageManagerUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, codeBuddyCheckinTimeout)
+	defer cancel()
+	cred, err := s.codeBuddyCredentials.credential(operationCtx, cfg, false, "")
+	if err != nil {
+		return nil, err
+	}
+	if !cred.SupportsDailyCheckin() {
+		return nil, errOAuthUsageUnsupported
+	}
+	service := *s.codeBuddyService
+	service.Client = s.getClientForChannel(cfg)
+	checkinErr := service.DailyCheckin(operationCtx, cred)
+	status := "success"
+	if codebuddyauth.IsAlreadyCheckedIn(checkinErr) {
+		status = "already_checked"
+	}
+	summary, err := requestCodeBuddyUsage(operationCtx, &service, cred)
+	if err != nil {
+		if checkinErr != nil && status != "already_checked" {
+			return nil, errors.Join(fmt.Errorf("CodeBuddy check-in failed: %w", checkinErr), err)
+		}
+		return nil, err
+	}
+	requestedAt := time.Now().UTC()
+	sampledAt := requestedAt
+	summary, err = s.persistOAuthUsage(operationCtx, cfg, summary, requestedAt, sampledAt)
+	if err != nil {
+		return nil, errOAuthUsagePersistFailed
+	}
+	result := &codeBuddyCheckinResult{Status: status, Usage: summary}
+	if checkinErr != nil && status != "already_checked" {
+		return result, fmt.Errorf("CodeBuddy check-in failed: %w", checkinErr)
+	}
+	return result, nil
+}
+
+func isInternationalCodeBuddyConfig(cfg *model.Config) bool {
+	if cfg == nil || !cfg.UsesCodeBuddyOAuth() {
+		return false
+	}
+	credential, err := codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential))
+	return err == nil && credential.IsInternational()
+}
+
+func (s *Server) runCodeBuddyCheckin(ctx context.Context, cfg *model.Config) {
+	if cfg == nil || ctx == nil || ctx.Err() != nil {
+		return
+	}
+	result, err := s.checkInCodeBuddy(ctx, cfg)
+	if err != nil && ctx.Err() == nil {
+		log.Printf("[WARN] CodeBuddy 签到失败 channel=%d: %v", cfg.ID, err)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if auditErr := s.addCodeBuddyCheckinAuditLog(ctx, cfg, result, err); auditErr != nil {
+		log.Printf("[WARN] CodeBuddy 签到审计日志写入失败（channel=%d）: %v", cfg.ID, auditErr)
+	}
+	if result != nil && result.Usage != nil && result.Usage.CodeBuddyCredits != nil {
+		log.Printf("[INFO] CodeBuddy 余额 channel=%d remain=%g", cfg.ID, result.Usage.CodeBuddyCredits.Remain)
+	}
+}
+
+func (s *Server) addCodeBuddyCheckinAuditLog(
+	ctx context.Context,
+	cfg *model.Config,
+	result *codeBuddyCheckinResult,
+	operationErr error,
+) error {
+	if s == nil || s.store == nil || cfg == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	status := ""
+	statusCode := http.StatusOK
+	var balance *channelCheckinAuditBalance
+	if result != nil {
+		status = result.Status
+		if result.Usage != nil && result.Usage.CodeBuddyCredits != nil {
+			balance = &channelCheckinAuditBalance{
+				Remaining: result.Usage.CodeBuddyCredits.Remain,
+				Unit:      "credits",
+			}
+		}
+	}
+	if operationErr != nil || status == "" {
+		status = "failed"
+		statusCode = http.StatusBadGateway
+	}
+
+	message, err := json.Marshal(channelCheckinAuditMessage{
+		Profile: codebuddyauth.ChannelType,
+		Status:  status,
+		Balance: balance,
+	})
+	if err != nil {
+		return err
+	}
+	return s.store.AddLog(ctx, &model.LogEntry{
+		Time:       model.JSONTime{Time: time.Now()},
+		ChannelID:  cfg.ID,
+		StatusCode: statusCode,
+		LogSource:  model.LogSourceCheckin,
+		Message:    string(message),
+	})
+}
+
+func codeBuddyCheckinSlot(now time.Time) string {
+	if now.Hour() < 9 {
+		return ""
+	}
+	slot := "09"
+	if now.Hour() >= 21 {
+		slot = "21"
+	}
+	return now.Format("2006-01-02") + "-" + slot
 }
 
 // runDueManagementCheckins claims all channels due at now and waits for their
@@ -61,7 +260,9 @@ func (s *Server) runDueManagementCheckins(ctx context.Context, now time.Time) er
 		return err
 	}
 
-	day := now.In(time.Local).Format("2006-01-02")
+	// 和 isManagementCheckinDue 用同一个日历：day 是 CAS claim 的幂等键，
+	// 两处若按不同时区取日期，claim 的日子和判定的日子会错位。
+	day := now.Format("2006-01-02")
 	channelIDs := make([]int64, 0, len(configs))
 	var scanErr error
 	for _, cfg := range configs {
@@ -203,22 +404,27 @@ func (s *Server) writeManagementCheckinAudit(ctx context.Context, cfg *model.Con
 
 // isManagementCheckinDue interprets the configured HH:MM in the server's local
 // calendar and intentionally ignores manual check-in state.
+//
+// 时区取自 now 自身而不是包级 time.Local：调用方传的 now 来自 ticker（即
+// time.Now()），两者在生产中是同一个 Location。读全局会让这个本可以是纯函数的
+// 判定挂上进程级依赖，测试为了控制时区只能去写 time.Local，那是真实的数据竞争
+// ——同包里任何并行测试的 time.Now() 都在读它。
 func isManagementCheckinDue(envelope *model.ChannelManagementEnvelope, now time.Time) bool {
 	if envelope == nil || !envelope.Settings.DailyCheckinEnabled ||
 		(envelope.Profile != model.ChannelManagementProfileNewAPI && envelope.Profile != model.ChannelManagementProfileSub2APIPro) {
 		return false
 	}
-	localNow := now.In(time.Local)
-	if envelope.State.LastScheduledDay == localNow.Format("2006-01-02") {
+	location := now.Location()
+	if envelope.State.LastScheduledDay == now.Format("2006-01-02") {
 		return false
 	}
-	scheduledClock, err := time.ParseInLocation("15:04", envelope.Settings.DailyCheckinTime, time.Local)
+	scheduledClock, err := time.ParseInLocation("15:04", envelope.Settings.DailyCheckinTime, location)
 	if err != nil {
 		return false
 	}
 	scheduled := time.Date(
-		localNow.Year(), localNow.Month(), localNow.Day(),
-		scheduledClock.Hour(), scheduledClock.Minute(), 0, 0, time.Local,
+		now.Year(), now.Month(), now.Day(),
+		scheduledClock.Hour(), scheduledClock.Minute(), 0, 0, location,
 	)
-	return !localNow.Before(scheduled)
+	return !now.Before(scheduled)
 }

@@ -19,6 +19,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/cursorauth"
@@ -32,6 +33,8 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== 渠道测试功能 ====================
@@ -102,7 +105,7 @@ func (s *Server) HandleChannelWebsocketProbe(c *gin.Context) {
 	applyHeaderRules(upstreamHeaders, cfg.HeaderRules())
 	probeRequest := &http.Request{Header: upstreamHeaders}
 	injectCodexHeaders(probeRequest, cfg, probe.APIKey, true)
-	copyCodexWebsocketInputHeaders(upstreamHeaders, headers)
+	prepareCodexWebsocketInputHeaders(upstreamHeaders, headers, cfg.HeaderRules())
 	websocketURL, err := codexWebsocketURL(fullURL)
 	if err != nil {
 		RespondError(c, http.StatusBadRequest, err)
@@ -145,6 +148,7 @@ type channelTestRequestPlan struct {
 	clientProtocol    string
 	upstreamProtocol  string
 	upstreamStreaming bool
+	codeBuddyOAuth    bool
 	apiKey            string
 	xaiOAuth          bool
 	xaiConversationID string
@@ -394,25 +398,30 @@ func patchUpstreamTestFields(translatedBody, upstreamBody []byte, upstreamProtoc
 		return translatedBody
 	}
 
-	var translated, upstream map[string]any
-	if err := sonic.Unmarshal(translatedBody, &translated); err != nil {
+	if !isMutableJSONObject(translatedBody) || !isMutableJSONObject(upstreamBody) {
 		return translatedBody
 	}
-	if err := sonic.Unmarshal(upstreamBody, &upstream); err != nil {
-		return translatedBody
-	}
-
+	result := translatedBody
 	for _, key := range keys {
-		if val, ok := upstream[key]; ok {
-			translated[key] = val
-		} else {
-			delete(translated, key)
+		// 读写指向同一个字面键，但两套路径语法不同：sjson 靠 `:` 前缀强制对象键，
+		// gjson 不认 `:`，只认 `\` 转义。共用一份转义结果才能保证二者定位一致。
+		escaped := sjsonPathEscape(key)
+		path := sjsonObjectPathJoin("", key)
+		if value := gjson.GetBytes(upstreamBody, escaped); value.Exists() {
+			var err error
+			result, err = sjson.SetRawBytes(result, path, []byte(value.Raw))
+			if err != nil {
+				return translatedBody
+			}
+			continue
 		}
-	}
-
-	result, err := sonic.ConfigStd.Marshal(translated)
-	if err != nil {
-		return translatedBody
+		if gjson.GetBytes(result, escaped).Exists() {
+			var err error
+			result, err = sjson.DeleteBytes(result, path)
+			if err != nil {
+				return translatedBody
+			}
+		}
 	}
 	return result
 }
@@ -506,7 +515,13 @@ func (s *Server) buildChannelTestRequestPlan(
 	}
 
 	// 协议转换负责消息和工具的格式变换；上游测试器负责系统提示、请求选项和协议默认值。
-	translatedBody = patchUpstreamTestFields(translatedBody, upstreamBody, upstreamProtocol)
+	// Zed 的上游协议名义上是 Codex，实际发出的是 provider_request，Codex 测试模板对任何
+	// Zed provider 都不成立，所以对全部 Zed 渠道跳过——不只 Anthropic。具体到 Anthropic：
+	// 模板的 instructions/reasoning.medium 会变成 Anthropic system + thinking.budget_tokens，
+	// 再和保守的 max_tokens 默认值撞成上游 400。Zed 测试只保留客户端转换结果。
+	if !cfgForBuild.UsesZedOAuth() {
+		translatedBody = patchUpstreamTestFields(translatedBody, upstreamBody, upstreamProtocol)
+	}
 
 	plan.fullURL = upstreamURL
 	plan.headers = cloneHeaders(upstreamHeaders)
@@ -615,14 +630,22 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		}
 		testReq.BaseURL = normalizedBaseURL
 	}
-	if !cfg.SupportsModel(model.RoutingModelName(testReq.Model)) {
-		RespondJSON(c, http.StatusOK, gin.H{
-			"success":          false,
-			"error":            "模型 " + testReq.Model + " 不在此渠道的支持列表中",
-			"model":            testReq.Model,
-			"supported_models": cfg.GetModels(),
-		})
-		return
+	routedModel := model.RoutingModelName(testReq.Model)
+	testCfg := cfg
+	if !cfg.SupportsModel(routedModel) {
+		// Disabled models remain excluded from normal routing, but the admin test
+		// endpoint must be able to probe the configured upstream model explicitly.
+		testCfg = cfg.Clone()
+		if !enableDisabledChannelTestModel(testCfg, routedModel) {
+			RespondJSON(c, http.StatusOK, gin.H{
+				"success":          false,
+				"error":            "模型 " + testReq.Model + " 不在此渠道的支持列表中",
+				"model":            testReq.Model,
+				"supported_models": cfg.GetModels(),
+			})
+			return
+		}
+		cfg = testCfg
 	}
 
 	apiKeys, err := s.store.GetAPIKeys(c.Request.Context(), id)
@@ -681,6 +704,22 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 	testResult["total_keys"] = len(apiKeys)
 
 	RespondJSON(c, http.StatusOK, testResult)
+}
+
+// enableDisabledChannelTestModel enables one configured model on a cloned
+// config so the admin test can exercise it without changing normal routing.
+func enableDisabledChannelTestModel(cfg *model.Config, routedModel string) bool {
+	if cfg == nil || routedModel == "" {
+		return false
+	}
+	for index := range cfg.ModelEntries {
+		entry := &cfg.ModelEntries[index]
+		if entry.Disabled && model.RoutingModelName(entry.Model) == routedModel {
+			entry.Disabled = false
+			return true
+		}
+	}
+	return false
 }
 
 func channelTestActualModel(result map[string]any, fallback string) string {
@@ -809,6 +848,21 @@ func (s *Server) prepareOAuthChannelTestAuthForRejectedToken(
 			return runtimeCfg, selection, true, fmt.Errorf("加载 Codex OAuth 凭证失败: %w", err)
 		}
 		return runtimeCfg, selection, true, nil
+	case cfg.UsesCodeBuddyOAuth():
+		var credential *codebuddyauth.Credential
+		var err error
+		if mode == oauthCredentialUseCurrent {
+			credential, err = codebuddyauth.ParseCredential([]byte(cfg.OAuthCredential))
+		} else {
+			credential, err = s.codeBuddyCredentials.credential(ctx, cfg, mode == oauthCredentialForceRefresh, rejectedAccessToken)
+		}
+		if err != nil {
+			return nil, selection, true, err
+		}
+		runtime := cfg.Clone()
+		runtime.OAuthCredential, _ = credential.JSON()
+		selection.requestCredential = credential.AccessToken
+		return runtime, selection, true, nil
 	case cfg.UsesAntigravityOAuth():
 		var credential *antigravityauth.Credential
 		var err error
@@ -1180,19 +1234,32 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 		selector = s.urlSelector
 	}
 	orderedURLs := orderChannelAttemptURLs(selector, cfg, urls)
-	switch cfg.GetProtocolTransformMode() {
-	case model.ProtocolTransformModeAuto:
-		orderedURLs = prioritizeAutomaticProtocolURLs(orderedURLs, cfg.URLs)
-	case model.ProtocolTransformModeLocal:
+	if testReq.UseURLProtocol {
 		orderedURLs = prioritizeDeclaredProtocolURLs(orderedURLs, cfg.URLs)
+	} else {
+		switch cfg.GetProtocolTransformMode() {
+		case model.ProtocolTransformModeAuto:
+			orderedURLs = prioritizeAutomaticProtocolURLs(orderedURLs, cfg.URLs)
+		case model.ProtocolTransformModeLocal:
+			orderedURLs = prioritizeDeclaredProtocolURLs(orderedURLs, cfg.URLs)
+		}
 	}
 
 	var lastResult map[string]any
 	var urlPolicy channelURLAttemptPolicy
 	for idx, entry := range orderedURLs {
-		upstreamProtocols := resolveConfiguredURLUpstreamProtocols(
-			cfg, configuredURLAt(cfg, entry.idx, entry.url), clientProtocol,
-		)
+		configuredURL := configuredURLAt(cfg, entry.idx, entry.url)
+		var upstreamProtocols []string
+		if testReq.UseURLProtocol {
+			upstreamProtocols = configuredURL.Protocols
+			if len(upstreamProtocols) == 0 {
+				for _, candidate := range automaticFallbackProtocolOrder {
+					upstreamProtocols = append(upstreamProtocols, string(candidate))
+				}
+			}
+		} else {
+			upstreamProtocols = resolveConfiguredURLUpstreamProtocols(cfg, configuredURL, clientProtocol)
+		}
 		if len(upstreamProtocols) == 0 {
 			lastResult = map[string]any{
 				"success":  false,
@@ -1204,6 +1271,9 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 
 		capabilityExhausted := false
 		for protocolIdx, upstreamProtocol := range upstreamProtocols {
+			if testReq.UseURLProtocol {
+				clientProtocol = upstreamProtocol
+			}
 			lastResult = s.testChannelAPIWithURLForProtocol(
 				reqCtx, cfg, apiKey, testReq, clientProtocol, upstreamProtocol, entry.url,
 			)
@@ -1241,7 +1311,7 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 		if !hasNextURL {
 			break
 		}
-		if capabilityExhausted && cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream {
+		if capabilityExhausted && (testReq.UseURLProtocol || cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream) {
 			continue
 		}
 
@@ -1480,7 +1550,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	useNativeCodexWebsocket := cfg.Websockets && !requestPlan.xaiOAuth && !cfg.UsesZedOAuth() && testReq.Stream &&
 		clientProtocol == string(protocol.Codex) && requestPlan.upstreamProtocol == string(protocol.Codex)
 	if useNativeCodexWebsocket {
-		copyCodexWebsocketInputHeaders(req.Header, requestPlan.upstreamHeaders)
+		prepareCodexWebsocketInputHeaders(req.Header, requestPlan.upstreamHeaders, cfg.HeaderRules())
 		preparedBody, prepareErr := buildCodexWebsocketRequestBody(requestPlan.requestBody)
 		if prepareErr != nil {
 			if capacityRelease != nil {
@@ -1564,7 +1634,8 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 		result["is_streaming"] = testReq.Stream
 		return attachTestDebugData(requestPlan, nil, result)
 	}
-	s.persistCodexPassiveUsage(ctx, cfg, resp)
+	s.persistDetectionCodexPassiveUsage(ctx, cfg, resp, gjson.GetBytes(requestPlan.requestBody, "model").String())
+	s.persistDetectionAnthropicPassiveUsage(ctx, cfg, resp)
 	defer func() { _ = resp.Body.Close() }()
 	if cfg.UsesZedOAuth() {
 		if zedErr := prepareZedResponsesResponse(resp, requestPlan.zedWire, s.protocolRegistry); zedErr != nil {
@@ -1597,6 +1668,13 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	// 判断是否为SSE响应，以及是否请求了流式
 	contentType := resp.Header.Get("Content-Type")
 	isEventStream := responseIsSSE(resp, requestPlan.upstreamStreaming)
+	if requestPlan.codeBuddyOAuth && resp.StatusCode >= 200 && resp.StatusCode < 300 && !isEventStream {
+		return attachTestDebugData(requestPlan, resp, map[string]any{
+			"success": false, "status_code": http.StatusBadGateway,
+			"error": "CodeBuddy requires an SSE completion", "is_streaming": testReq.Stream,
+		})
+	}
+	wrapCodexSSEResponseBody(resp, protocol.Protocol(requestPlan.upstreamProtocol), isEventStream)
 
 	// 通用结果初始化
 	result = map[string]any{
@@ -1628,7 +1706,19 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	}
 
 	if isEventStream {
-		if requestPlan.clientProtocol != requestPlan.upstreamProtocol || requestPlan.antigravityOAuth {
+		if cfg.UsesCodeBuddyOAuth() && !testReq.Stream {
+			body, _, collectErr := collectCodeBuddyCompletion(ctx, resp.Body, func(parser *sseUsageParser) {
+				if testStreamParserHasFirstContent(parser) {
+					markTestFirstStreamContent(requestPlan, result, start)
+				}
+			})
+			if collectErr != nil {
+				result["success"], result["error"] = false, collectErr.Error()
+				return attachTestDebugData(requestPlan, resp, result)
+			}
+			return attachTestDebugData(requestPlan, resp, s.parseTestNonStreamResponse(ctx, requestPlan, testReq, resp, "application/json", start, body, result))
+		}
+		if requestPlan.clientProtocol != requestPlan.upstreamProtocol || requestPlan.antigravityOAuth || requestPlan.codeBuddyOAuth {
 			return attachTestDebugData(requestPlan, resp, s.parseTestTranslatedSSEResponse(ctx, requestPlan, testReq, resp, start, result))
 		}
 		return attachTestDebugData(requestPlan, resp, s.parseTestNativeSSEResponse(ctx, requestPlan, testReq, resp, contentType, start, result))
@@ -1699,7 +1789,7 @@ func (s *Server) doChannelTestCodexWebsocket(
 			s.persistCodexPassiveUsage(ctx, cfg, &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     headers,
-			})
+			}, gjson.GetBytes(body, "model").String())
 		},
 	)
 	if err != nil || resp == nil || resp.Body == nil {
@@ -1871,9 +1961,15 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		requestPlan.fullURL = buildAnthropicOAuthURL(selectedURL, requestPath, "")
 	}
 	requestedStreaming := isStreamingRequest(requestPath, requestPlan.requestBody)
+	// 与代理链路一致：Anthropic CCH 签名按上游 origin 分流，最终化前必须先有 URL。
+	parsedTestURL, err := neturl.Parse(requestPlan.fullURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse test upstream URL: %w", err)
+	}
 	requestPlan.requestBody, err = s.prepareTranslatedUpstreamBody(
 		cfgForBuild, upstreamProtocolValue, requestPath, requestPlan.requestBody, requestPlan.clientBody,
-		requestPlan.apiKey, requestPlan.headers, false,
+		requestPlan.apiKey, requestPlan.headers, false, parsedTestURL,
+		false,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("finalize test request body: %w", err)
@@ -1905,17 +2001,17 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		ensureCodexSessionHeader(requestPlan.headers, sessionID)
 	}
 	if cfgForBuild.UsesZedOAuth() {
-		var originalAnthropicRequest []byte
-		if protocol.Protocol(requestPlan.clientProtocol) == protocol.Anthropic {
-			originalAnthropicRequest = requestPlan.clientBody
-		}
-		requestPlan.requestBody, requestPlan.zedWire, err = finalizeZedResponsesBody(s.protocolRegistry, requestPlan.requestBody, originalAnthropicRequest)
+		requestPlan.requestBody, requestPlan.zedWire, err = finalizeZedResponsesBodyWithOptions(
+			s.protocolRegistry, requestPlan.requestBody, requestPlan.clientBody,
+			zedBodyRulesPreserveThinking(cfgForBuild.BodyRules()),
+		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("finalize Zed test request body: %w", err)
 		}
 		requestPlan.upstreamStreaming = true
 	}
 	requestPlan.endpointPath = requestPath
+	requestPlan.codeBuddyOAuth = cfgForBuild.UsesCodeBuddyOAuth()
 	return cfgForBuild, requestPlan, nil
 }
 
@@ -1925,7 +2021,7 @@ func (s *Server) newTestUpstreamRequest(
 	testReq *testutil.TestChannelRequest,
 	requestPlan *channelTestRequestPlan,
 ) (*http.Request, context.CancelFunc, error) {
-	ctx, timeout := s.newChannelTestTimeoutContextWithTimeouts(reqCtx, testReq.Stream, s.resolveProtocolTimeouts(protocol.TransformPlan{
+	ctx, timeout := s.newChannelTestTimeoutContextWithTimeouts(reqCtx, testReq.Stream || cfgForBuild.UsesCodeBuddyOAuth(), s.resolveProtocolTimeouts(protocol.TransformPlan{
 		UpstreamProtocol: protocol.Protocol(requestPlan.upstreamProtocol),
 	}))
 	requestPlan.timeout = timeout
@@ -1952,7 +2048,14 @@ func (s *Server) newTestUpstreamRequest(
 	}
 	applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
 	wireRebuilt := false
-	if cfgForBuild.UsesZedOAuth() {
+	if cfgForBuild.UsesCodeBuddyOAuth() {
+		if err := injectCodeBuddyHeaders(req, cfgForBuild, requestPlan.apiKey); err != nil {
+			timeout.cancelAll()
+			return nil, nil, err
+		}
+		requestPlan.fullURL = req.URL.String()
+		wireRebuilt = true
+	} else if cfgForBuild.UsesZedOAuth() {
 		injectZedResponsesHeaders(req, requestPlan.apiKey)
 		wireRebuilt = true
 	} else if requestPlan.xaiOAuth {
@@ -1981,6 +2084,13 @@ func (s *Server) newTestUpstreamRequest(
 	// anyrouter 渠道：确保 anthropic-beta 包含 context-1m，与代理链路步骤 6.2 对齐。
 	if requestProtocol == protocol.Anthropic && isAnyrouterChannel(cfgForBuild) {
 		injectAnthropicBetaFlag(req, "context-1m-2025-08-07")
+	}
+	if isOpenCodeChannel(cfgForBuild) {
+		executionIdentity := ""
+		if testReq != nil {
+			executionIdentity = testReq.ResolveSessionID()
+		}
+		ensureOpenCodeSessionHeader(req.Header, sourceHeaders, executionIdentity)
 	}
 	// Some compatibility gateways decompress the response but leave the gzip marker.
 	// Admin tests need the wire body for diagnostics, so never negotiate compression.
@@ -2046,6 +2156,7 @@ func (s *Server) parseTestTranslatedSSEResponse(
 	firstContentCaptured := false
 	upstreamParser := newSSEUsageParser(requestPlan.upstreamProtocol)
 	var translatedComplete bool
+	var codeBuddyDone bool
 	var state any
 
 	streamErr := streamTransformSSEEventsUntil(
@@ -2057,6 +2168,10 @@ func (s *Server) parseTestTranslatedSSEResponse(
 				return nil
 			}
 			parserEvent := rawEvent
+			if requestPlan.codeBuddyOAuth {
+				codeBuddyDone = bytes.Equal(sseEventData(parserEvent), sseDoneMarker)
+				parserEvent = normalizeCodeBuddySSEEvent(parserEvent)
+			}
 			if requestPlan.antigravityOAuth {
 				var err error
 				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
@@ -2075,6 +2190,9 @@ func (s *Server) parseTestTranslatedSSEResponse(
 		},
 		func(rawEvent []byte) ([][]byte, error) {
 			translatedRequestBody := requestPlan.requestBody
+			if requestPlan.codeBuddyOAuth {
+				rawEvent = normalizeCodeBuddySSEEvent(rawEvent)
+			}
 			if requestPlan.antigravityOAuth {
 				var err error
 				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
@@ -2105,6 +2223,9 @@ func (s *Server) parseTestTranslatedSSEResponse(
 			return chunks, nil
 		},
 		func() bool {
+			if requestPlan.codeBuddyOAuth {
+				return codeBuddyDone
+			}
 			return upstreamParser.IsStreamComplete() && translatedComplete
 		},
 	)

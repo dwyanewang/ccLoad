@@ -19,29 +19,31 @@ import (
 
 // ChannelRequest 渠道创建/更新请求结构
 type ChannelRequest struct {
-	Name                    string                        `json:"name" binding:"required"`
-	AuthType                string                        `json:"auth_type,omitempty"`
-	APIKey                  string                        `json:"api_key"`
-	APIKeys                 []ChannelAPIKeyRequest        `json:"api_keys,omitempty"`
-	Websockets              bool                          `json:"websockets,omitempty"`
-	ProtocolTransformMode   string                        `json:"protocol_transform_mode,omitempty"`
-	KeyStrategy             string                        `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
-	URLs                    model.ChannelURLs             `json:"urls" binding:"required,min=1"`
-	Priority                int                           `json:"priority"`
-	RPMLimit                int                           `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
-	MaxConcurrency          int                           `json:"max_concurrency"`                 // 最大并发请求数，0表示无限制
-	Models                  []model.ModelEntry            `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
-	Enabled                 bool                          `json:"enabled"`
-	ScheduledCheckEnabled   bool                          `json:"scheduled_check_enabled"`
-	ScheduledCheckModel     string                        `json:"scheduled_check_model"`
-	DailyCostLimit          float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
-	CustomRequestRules      *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
-	CooldownDetectionRules  *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
-	ProxyURL                string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
-	AvailableTimeStart      string                        `json:"available_time_start,omitempty"`
-	AvailableTimeEnd        string                        `json:"available_time_end,omitempty"`
-	RetryOtherKeysOnFailure bool                          `json:"retry_other_keys_on_failure"`
-	ManagementAccount       *channelManagementInput       `json:"management_account,omitempty"`
+	Name                          string                        `json:"name" binding:"required"`
+	AuthType                      string                        `json:"auth_type,omitempty"`
+	APIKey                        string                        `json:"api_key"`
+	APIKeys                       []ChannelAPIKeyRequest        `json:"api_keys,omitempty"`
+	Websockets                    bool                          `json:"websockets,omitempty"`
+	ProtocolTransformMode         string                        `json:"protocol_transform_mode,omitempty"`
+	KeyStrategy                   string                        `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
+	URLs                          model.ChannelURLs             `json:"urls" binding:"required,min=1"`
+	Priority                      int                           `json:"priority"`
+	RPMLimit                      int                           `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
+	MaxConcurrency                int                           `json:"max_concurrency"`                 // 最大并发请求数，0表示无限制
+	Models                        []model.ModelEntry            `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
+	Enabled                       bool                          `json:"enabled"`
+	ScheduledCheckEnabled         bool                          `json:"scheduled_check_enabled"`
+	ScheduledCheckModel           string                        `json:"scheduled_check_model"`
+	ScheduledCheckIntervalMinutes *int                          `json:"scheduled_check_interval_minutes,omitempty"`
+	ScheduledCheckStartTime       *string                       `json:"scheduled_check_start_time,omitempty"`
+	DailyCostLimit                float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
+	CustomRequestRules            *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
+	CooldownDetectionRules        *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
+	ProxyURL                      string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
+	AvailableTimeStart            string                        `json:"available_time_start,omitempty"`
+	AvailableTimeEnd              string                        `json:"available_time_end,omitempty"`
+	RetryOtherKeysOnFailure       bool                          `json:"retry_other_keys_on_failure"`
+	ManagementAccount             *channelManagementInput       `json:"management_account,omitempty"`
 
 	managementAccountSet      bool
 	forbiddenCredentialFields bool
@@ -78,6 +80,7 @@ type ChannelAPIKeyRequest struct {
 	// CostMultiplier 用指针区分「未提交」：nil 保留现值（Key 更新）或取默认 1（创建）；
 	// 0 是合法的「免费 Key」。OAuth 渠道的合成 Key 行也用它携带渠道倍率。
 	CostMultiplier *float64 `json:"cost_multiplier,omitempty"`
+	Priority       *int     `json:"priority,omitempty"`
 	// allowedModelsSet distinguishes an omitted field from an explicit empty list.
 	// Updates preserve an existing scope when old clients do not send the new field.
 	allowedModelsSet bool
@@ -91,6 +94,7 @@ func (r *ChannelAPIKeyRequest) UnmarshalJSON(data []byte) error {
 		AllowedModels   json.RawMessage `json:"allowed_models"`
 		ModelScopeEmpty bool            `json:"model_scope_empty,omitempty"`
 		CostMultiplier  *float64        `json:"cost_multiplier"`
+		Priority        *int            `json:"priority"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -100,6 +104,7 @@ func (r *ChannelAPIKeyRequest) UnmarshalJSON(data []byte) error {
 	r.Note = raw.Note
 	r.ModelScopeEmpty = raw.ModelScopeEmpty
 	r.CostMultiplier = raw.CostMultiplier
+	r.Priority = raw.Priority
 	r.AllowedModels = nil
 	r.allowedModelsSet = raw.AllowedModels != nil
 	if !r.allowedModelsSet || string(raw.AllowedModels) == "null" {
@@ -116,9 +121,16 @@ func apiKeyCostMultiplier(entry ChannelAPIKeyRequest) float64 {
 	return *entry.CostMultiplier
 }
 
+func apiKeyPriority(entry ChannelAPIKeyRequest) int {
+	if entry.Priority == nil {
+		return 0
+	}
+	return *entry.Priority
+}
+
 const (
 	maxAPIKeyNoteLength              = 512
-	maxAPIKeyAllowedModelsJSONLength = 2000
+	maxAPIKeyAllowedModelsJSONLength = 8000
 )
 
 func (cr *ChannelRequest) normalizeAPIKeys() []ChannelAPIKeyRequest {
@@ -135,6 +147,7 @@ func (cr *ChannelRequest) normalizeAPIKeys() []ChannelAPIKeyRequest {
 				AllowedModels:    append([]string(nil), item.AllowedModels...),
 				ModelScopeEmpty:  item.ModelScopeEmpty,
 				CostMultiplier:   item.CostMultiplier,
+				Priority:         item.Priority,
 				allowedModelsSet: item.allowedModelsSet,
 			})
 		}
@@ -283,6 +296,14 @@ func (cr *ChannelRequest) Validate() error {
 		if key.ModelScopeEmpty && len(key.AllowedModels) != 0 {
 			return fmt.Errorf("api_keys[%d].model_scope_empty requires empty allowed_models", i)
 		}
+		if key.Priority != nil {
+			if authType != model.AuthTypeAPIKey {
+				return fmt.Errorf("OAuth channel API key priority is read-only")
+			}
+			if *key.Priority < -99999 || *key.Priority > 9999999 {
+				return fmt.Errorf("api_keys[%d].priority must be between -99999 and 9999999", i)
+			}
+		}
 		if key.CostMultiplier != nil && (math.IsNaN(*key.CostMultiplier) || math.IsInf(*key.CostMultiplier, 0) || *key.CostMultiplier < 0) {
 			return fmt.Errorf("api_keys[%d].cost_multiplier must be finite and >= 0 (got %v)", i, *key.CostMultiplier)
 		}
@@ -326,6 +347,10 @@ func (cr *ChannelRequest) Validate() error {
 	cr.APIKeys = apiKeys
 	cr.APIKey = strings.Join(apiKeyStrings(apiKeys), ",")
 
+	minutes, start := cr.scheduledCheckSchedule()
+	if err := model.ValidateScheduledCheckSchedule(minutes, start); err != nil {
+		return err
+	}
 	cr.ScheduledCheckModel = strings.TrimSpace(cr.ScheduledCheckModel)
 	if cr.ScheduledCheckModel != "" {
 		if _, exists := canonicalModels[strings.ToLower(model.RoutingModelName(cr.ScheduledCheckModel))]; !exists {
@@ -429,9 +454,21 @@ func normalizeAPIKeyAllowedModels(values []string, canonicalModels map[string]st
 	return result, nil
 }
 
+func (cr *ChannelRequest) scheduledCheckSchedule() (int, string) {
+	minutes, start := model.DefaultScheduledCheckIntervalMinutes, model.DefaultScheduledCheckStartTime
+	if cr.ScheduledCheckIntervalMinutes != nil {
+		minutes = *cr.ScheduledCheckIntervalMinutes
+	}
+	if cr.ScheduledCheckStartTime != nil {
+		start = strings.TrimSpace(*cr.ScheduledCheckStartTime)
+	}
+	return minutes, start
+}
+
 // ToConfig 转换为Config结构(不包含API Key,API Key单独处理)
 // 规范化重定向模型：如果 RedirectModel == Model 则清空（透传语义，节省存储）
 func (cr *ChannelRequest) ToConfig() *model.Config {
+	minutes, start := cr.scheduledCheckSchedule()
 	// 规范化模型条目：同名重定向清空为透传
 	normalizedModels := make([]model.ModelEntry, len(cr.Models))
 	for i, m := range cr.Models {
@@ -449,26 +486,28 @@ func (cr *ChannelRequest) ToConfig() *model.Config {
 	}
 
 	return &model.Config{
-		Name:                    strings.TrimSpace(cr.Name),
-		AuthType:                cr.AuthType,
-		Websockets:              cr.Websockets,
-		ProtocolTransformMode:   cr.ProtocolTransformMode,
-		URLs:                    cr.URLs.Clone(),
-		Priority:                cr.Priority,
-		RPMLimit:                cr.RPMLimit,
-		MaxConcurrency:          cr.MaxConcurrency,
-		ModelEntries:            normalizedModels,
-		Enabled:                 cr.Enabled,
-		ScheduledCheckEnabled:   cr.ScheduledCheckEnabled,
-		ScheduledCheckModel:     cr.ScheduledCheckModel,
-		DailyCostLimit:          cr.DailyCostLimit,
-		CostMultiplier:          costMultiplier,
-		CustomRequestRules:      cr.CustomRequestRules.Clone(),
-		CooldownDetectionRules:  cr.CooldownDetectionRules.Clone(),
-		ProxyURL:                cr.ProxyURL,
-		AvailableTimeStart:      cr.AvailableTimeStart,
-		AvailableTimeEnd:        cr.AvailableTimeEnd,
-		RetryOtherKeysOnFailure: cr.RetryOtherKeysOnFailure,
+		Name:                          strings.TrimSpace(cr.Name),
+		AuthType:                      cr.AuthType,
+		Websockets:                    cr.Websockets,
+		ProtocolTransformMode:         cr.ProtocolTransformMode,
+		URLs:                          cr.URLs.Clone(),
+		Priority:                      cr.Priority,
+		RPMLimit:                      cr.RPMLimit,
+		MaxConcurrency:                cr.MaxConcurrency,
+		ModelEntries:                  normalizedModels,
+		Enabled:                       cr.Enabled,
+		ScheduledCheckEnabled:         cr.ScheduledCheckEnabled,
+		ScheduledCheckModel:           cr.ScheduledCheckModel,
+		ScheduledCheckIntervalMinutes: minutes,
+		ScheduledCheckStartTime:       start,
+		DailyCostLimit:                cr.DailyCostLimit,
+		CostMultiplier:                costMultiplier,
+		CustomRequestRules:            cr.CustomRequestRules.Clone(),
+		CooldownDetectionRules:        cr.CooldownDetectionRules.Clone(),
+		ProxyURL:                      cr.ProxyURL,
+		AvailableTimeStart:            cr.AvailableTimeStart,
+		AvailableTimeEnd:              cr.AvailableTimeEnd,
+		RetryOtherKeysOnFailure:       cr.RetryOtherKeysOnFailure,
 	}
 }
 
@@ -549,8 +588,7 @@ func validateCustomRequestRules(r *model.CustomRequestRules) error {
 		if len(b.Value) > maxCustomRuleValue {
 			return fmt.Errorf("custom_request_rules.body[%d]: value too long (max %d bytes)", i, maxCustomRuleValue)
 		}
-		var parsed any
-		if err := json.Unmarshal(b.Value, &parsed); err != nil {
+		if err := json.Unmarshal(b.Value, new(json.RawMessage)); err != nil {
 			return fmt.Errorf("custom_request_rules.body[%d]: value is not valid JSON (%v)", i, err)
 		}
 	}
@@ -607,6 +645,8 @@ type ChannelWithCooldown struct {
 	XAIEmail                      string                 `json:"xai_email,omitempty"`
 	XAISubscriptionTier           string                 `json:"xai_subscription_tier,omitempty"`
 	XAIEntitlementStatus          string                 `json:"xai_entitlement_status,omitempty"`
+	CodeBuddyEnterprise           bool                   `json:"codebuddy_enterprise,omitempty"`
+	CodeBuddyInternational        bool                   `json:"codebuddy_international,omitempty"`
 	KeyStrategy                   string                 `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
 	CooldownUntil                 *time.Time             `json:"cooldown_until,omitempty"`
 	CooldownRemainingMS           int64                  `json:"cooldown_remaining_ms,omitempty"`

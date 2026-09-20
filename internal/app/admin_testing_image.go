@@ -488,11 +488,9 @@ func withCodexImageGenerationRuntime(cfg *model.Config) *model.Config {
 	if len(cfg.URLs) > 0 && strings.TrimSpace(cfg.URLs[0].URL) != "" {
 		responsesURL = strings.TrimSpace(cfg.URLs[0].URL)
 	}
-	baseURL := strings.TrimRight(responsesURL, "/")
-	baseURL = strings.TrimSuffix(baseURL, "/responses")
 	runtimeCfg := cfg.Clone()
 	runtimeCfg.URLs = model.ChannelURLs{{
-		URL:       baseURL + directImageGenerationPath,
+		URL:       codexImagesURL(responsesURL, directImageGenerationPath, ""),
 		Exact:     true,
 		Protocols: []string{util.ProtocolOpenAI},
 	}}
@@ -595,10 +593,17 @@ func (s *Server) testChannelImageGenerationWithURL(
 		}
 		actualModel = canonicalModel
 	}
+	if cfg.UsesCodexOAuth() && codexImageUsesResponses(actualModel) {
+		selectedURL = strings.TrimSuffix(strings.TrimRight(model.StripExactUpstreamURLMarker(selectedURL), "/"), directImageGenerationPath) + "/responses" + model.ExactUpstreamURLMarker
+		return s.testResponsesImageGeneration(parent, cfg, apiKey, imageReq, selectedURL, actualModel)
+	}
 	if cfg.UsesXAIOAuth() && xaiSupportsImageGeneration(actualModel) {
-		return s.testXAIResponsesImageGeneration(parent, cfg, apiKey, imageReq, selectedURL, actualModel)
+		return s.testResponsesImageGeneration(parent, cfg, apiKey, imageReq, selectedURL, actualModel)
 	}
 	body, err := imageGenerationRequestBody(cfg, actualModel, imageReq)
+	if err == nil && cfg.UsesCodexOAuth() {
+		body, err = prepareCodexDirectImagesBody(body, "application/json", actualModel)
+	}
 	if err != nil {
 		result := imageGenerationErrorResult(start, err)
 		result["error"] = err.Error()
@@ -744,7 +749,7 @@ func imageGenerationRequestBody(cfg *model.Config, actualModel string, imageReq 
 	return sonic.Marshal(payload)
 }
 
-func (s *Server) testXAIResponsesImageGeneration(
+func (s *Server) testResponsesImageGeneration(
 	parent context.Context,
 	cfg *model.Config,
 	apiKey string,
@@ -766,11 +771,20 @@ func (s *Server) testXAIResponsesImageGeneration(
 	if err != nil {
 		return annotateImageGenerationResult(imageGenerationErrorResult(start, err), actualModel)
 	}
-	body, err := buildXAIImagesResponsesRequest(raw, actualModel)
+	var body []byte
+	if cfg.UsesCodexOAuth() {
+		body, err = buildCodexImagesResponsesRequest(raw, actualModel)
+	} else {
+		body, err = buildXAIImagesResponsesRequest(raw, actualModel)
+	}
 	if err != nil {
 		result := imageGenerationErrorResult(start, err)
 		result["error"] = err.Error()
 		return annotateImageGenerationResult(result, actualModel)
+	}
+	if cfg.UsesCodexOAuth() {
+		body = prepareCodexOAuthResponsesBody(cfg, protocol.Codex, "/v1/responses", body, nil)
+		body = applyBodyRules("application/json", body, cfg.BodyRules())
 	}
 	ctx, timeout := s.newChannelTestTimeoutContextWithTimeouts(parent, false, s.resolveProtocolTimeouts(protocol.TransformPlan{
 		UpstreamProtocol: protocol.Codex,
@@ -780,7 +794,12 @@ func (s *Server) testXAIResponsesImageGeneration(
 	if err != nil {
 		return annotateImageGenerationResult(imageGenerationErrorResult(start, err), actualModel)
 	}
-	injectXAIAPIResponsesHeaders(req, apiKey)
+	if cfg.UsesCodexOAuth() {
+		applyHeaderRules(req.Header, cfg.HeaderRules())
+		injectCodexHeaders(req, cfg, apiKey, true)
+	} else {
+		injectXAIAPIResponsesHeaders(req, apiKey)
+	}
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := s.doUpstreamRequest(cfg, req)
 	if err != nil {
@@ -807,9 +826,20 @@ func (s *Server) testXAIResponsesImageGeneration(
 		}
 		return annotateImageGenerationResult(result, actualModel)
 	}
+	wrapCodexSSEResponseBody(resp, protocol.Codex, true)
 	collector := newCodexNonStreamCollector(newSSEUsageParser(string(protocol.Codex)))
 	streamErr := streamTransformSSEEventsUntil(ctx, resp.Body, discardHTTPResponseWriter{}, collector.consume,
-		func([]byte) ([][]byte, error) { return nil, nil }, collector.doneForXAIImages)
+		func([]byte) ([][]byte, error) { return nil, nil }, collector.doneForImages)
+	if rawError := collector.parser.GetLastError(); len(rawError) > 0 {
+		var payload map[string]any
+		if err := sonic.Unmarshal(rawError, &payload); err == nil {
+			if message, apiError, matched := extractSSEErrorMessage(payload); matched {
+				result["error"] = message
+				result["api_error"] = apiError
+				return annotateImageGenerationResult(result, actualModel)
+			}
+		}
+	}
 	if collector.err != nil {
 		streamErr = collector.err
 	}
@@ -819,15 +849,15 @@ func (s *Server) testXAIResponsesImageGeneration(
 	}
 	terminal := collector.patchedTerminal()
 	if gjson.GetBytes(terminal, "type").String() != "response.completed" {
-		result["error"] = "xAI Responses image generation did not complete"
+		result["error"] = "Responses image generation did not complete"
 		return annotateImageGenerationResult(result, actualModel)
 	}
 	responseBody := gjson.GetBytes(terminal, "response")
 	if !responseBody.Exists() {
-		result["error"] = "xAI Responses completed event missing response"
+		result["error"] = "Responses completed event missing response"
 		return annotateImageGenerationResult(result, actualModel)
 	}
-	imagesBody, err := buildOpenAIImagesResponseFromXAIResponses([]byte(responseBody.Raw), raw)
+	imagesBody, err := buildOpenAIImagesResponseFromResponses([]byte(responseBody.Raw), raw)
 	if err != nil {
 		result["error"] = err.Error()
 		return annotateImageGenerationResult(result, actualModel)
@@ -838,23 +868,8 @@ func (s *Server) testXAIResponsesImageGeneration(
 	return annotateImageGenerationResult(result, actualModel)
 }
 
-func canonicalCodexImageModel(raw string) (string, bool) {
-	modelName := strings.TrimSpace(raw)
-	if slash := strings.LastIndex(modelName, "/"); slash >= 0 && slash < len(modelName)-1 {
-		modelName = strings.TrimSpace(modelName[slash+1:])
-	}
-	switch strings.ToLower(modelName) {
-	case "gpt-image-1.5":
-		return "gpt-image-1.5", true
-	case "gpt-image-2":
-		return "gpt-image-2", true
-	default:
-		return "", false
-	}
-}
-
 func codexImageUnsupportedModelError(modelName string) error {
-	return fmt.Errorf("模型 %s 不受 Codex Images API 支持；可用模型: gpt-image-1.5, gpt-image-2", modelName)
+	return fmt.Errorf("模型 %s 不受 Codex Images API 支持；可用模型: gpt-image-1.5, gpt-image-2, gpt-image-2.5, gpt-image-2.5-flare, gpt-image-2.5-sunburst", modelName)
 }
 
 func xaiImageGenerationRequestBody(actualModel string, imageReq *imageGenerationTestRequest) ([]byte, error) {

@@ -21,6 +21,7 @@
   <script defer src="/web/assets/js/web-auth.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/searchable-select.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/test-content.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/marked.min.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/purify.min.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/markdown-renderer.js?v=__VERSION__"></script>
@@ -121,6 +122,7 @@
                   <option value="zai" data-i18n="channels.oauth.providerZAI">Z.ai</option>
                   <option value="cursor" data-i18n="channels.oauth.providerCursor">Cursor</option>
                   <option value="zed" data-i18n="channels.oauth.providerZed">Zed</option>
+                  <option value="codebuddy" data-i18n="channels.oauth.providerCodeBuddy">CodeBuddy</option>
                 </select>
               </div>
               <div id="codexOAuthControls">
@@ -179,6 +181,31 @@
                   </div>
                 </div>
               </div>
+              <div id="codebuddyOAuthControls" hidden>
+                <div class="oauth-field">
+                  <label for="codebuddyOAuthEdition" data-i18n="channels.codebuddy.editionLabel">CodeBuddy 版本</label>
+                  <select id="codebuddyOAuthEdition" name="codebuddy_edition" class="form-input">
+                    <option value="domestic" data-i18n="channels.codebuddy.editionDomestic">国内版</option>
+                    <option value="international" data-i18n="channels.codebuddy.editionInternational">国际版</option>
+                  </select>
+                </div>
+                <div class="oauth-field">
+                  <label for="codebuddyOAuthMethod" data-i18n="channels.codebuddy.methodLabel">CodeBuddy 授权方式</label>
+                  <select id="codebuddyOAuthMethod" class="form-input">
+                    <option value="oauth" data-i18n="channels.codex.methodOAuth">浏览器 OAuth</option>
+                    <option value="file" data-i18n="channels.codebuddy.methodFile">认证文件</option>
+                  </select>
+                </div>
+                <div id="codebuddyCredentialFileField" class="oauth-field" hidden>
+                  <label for="codebuddyCredentialFile" data-i18n="channels.codebuddy.methodFile">认证文件</label>
+                  <input id="codebuddyCredentialFile" type="file" class="form-input" accept=".info,.json,application/json" aria-describedby="codebuddyCredentialFileHint">
+                  <label for="codebuddyCredentialContent" data-i18n="channels.codebuddy.contentLabel">认证文件内容（JSON）</label>
+                  <textarea id="codebuddyCredentialContent" class="form-input oauth-url" rows="8" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="codebuddyCredentialFileHint oauthLoginDialogStatus"></textarea>
+                  <div id="codebuddyCredentialFileHint" class="oauth-field-hint">
+                    <p data-i18n="channels.codebuddy.fileHint">选择文件自动填入内容，或直接粘贴认证 JSON。提交后清空内容，仅导入当前登录账号。</p>
+                  </div>
+                </div>
+              </div>
               <div id="anthropicOAuthControls" hidden>
                 <div class="oauth-field">
                   <label for="anthropicOAuthMethod" data-i18n="channels.anthropic.methodLabel">Anthropic 授权方式</label>
@@ -223,7 +250,7 @@
                     aria-describedby="cursorAPIKeyGetHint cursorAPIKeyHint oauthLoginDialogStatus">
                   <p id="cursorAPIKeyGetHint" class="oauth-field-hint">
                     <span data-i18n="channels.cursor.apiKeyGetHint">前往 Cursor Dashboard 的 Integrations → User API Keys，创建并复制密钥。</span>
-                    <a href="https://cursor.com/dashboard" target="_blank" rel="noopener noreferrer"
+                    <a href="https://cursor.com/dashboard?tab=integrations" target="_blank" rel="noopener noreferrer"
                       data-i18n="channels.cursor.openDashboard">打开 Cursor Dashboard</a>
                   </p>
                   <p id="cursorAPIKeyHint" class="oauth-field-hint"
@@ -232,13 +259,13 @@
               </div>
               <div id="zedOAuthControls" hidden>
                 <div class="oauth-field">
-                  <label for="zedSystemID" data-i18n="channels.zed.systemIDLabel">Zed system ID（可选）</label>
+                  <label for="zedSystemID" data-i18n="channels.zed.systemIDLabel">Zed system ID（可选；试用需要）</label>
                   <input id="zedSystemID" name="zed_system_id" type="text"
                     class="form-input" autocomplete="off" autocapitalize="none" spellcheck="false"
                     placeholder="9d4b8c17-12ae-4091-96bc-1a79ce2de601"
                     aria-describedby="zedSystemIDHint oauthLoginDialogStatus">
                   <p id="zedSystemIDHint" class="oauth-field-hint"
-                    data-i18n="channels.zed.systemIDHint">本机运行 ccLoad 时会自动读取 Zed；远程或容器部署需要填写本机 Zed 数据库中的 system_id。</p>
+                    data-i18n="channels.zed.systemIDHint">本机运行 ccLoad 时会自动读取 Zed。没有该值时仍可尝试登录，但 Zed 试用权限可能不可用；远程或容器部署可填写本机 Zed 数据库中的 system_id。</p>
                 </div>
               </div>
               <div id="oauthLoginActions" class="oauth-actions">
@@ -310,6 +337,7 @@
               <label for="oauthImportProviderSelect" data-i18n="channels.oauth.credentialType">认证类型</label>
               <select id="oauthImportProviderSelect" name="oauth_import_provider" class="form-input">
                 <option value="auto" data-i18n="channels.oauth.providerAuto">自动判断</option>
+                <option value="codebuddy" data-i18n="channels.oauth.providerCodeBuddy">CodeBuddy</option>
                 <option value="codex" data-i18n="channels.oauth.providerCodex">Codex</option>
                 <option value="antigravity" data-i18n="channels.oauth.providerAntigravity">Antigravity</option>
                 <option value="xai" data-i18n="channels.oauth.providerXAI">xAI</option>
@@ -388,6 +416,7 @@
                   <option value="zai_oauth">Z.ai</option>
                   <option value="cursor_oauth">Cursor</option>
                   <option value="zed_oauth">Zed</option>
+                  <option value="codebuddy_oauth">CodeBuddy</option>
                 </select>
               </div>
               <div class="oauth-field">
@@ -903,19 +932,7 @@
                     id="virtualScrollHint" style="display: none; color: var(--primary-600); font-weight: 600;"
                     data-i18n="channels.virtualScrollEnabled">· 虚拟滚动已启用</span></span>
               <div class="channel-editor-inline-strategy">
-                <label class="channel-editor-inline-label channel-editor-inline-label--muted"
-                  data-i18n="channels.keyStrategy">Key 策略</label>
-                <div class="channel-editor-radio-group channel-editor-radio-group--strategy" id="keyStrategyRadios">
-                  <label class="channel-editor-radio-option">
-                    <input type="radio" name="keyStrategy" value="sequential" checked>
-                    <span data-i18n="channels.keyStrategySequential">顺序</span>
-                  </label>
-                  <label class="channel-editor-radio-option">
-                    <input type="radio" name="keyStrategy" value="round_robin">
-                    <span data-i18n="channels.keyStrategyRoundRobin">轮询</span>
-                  </label>
-                </div>
-                <span class="models-hint" data-i18n="channels.keyDragSortHint">拖动API Key可排序</span>
+                <span class="models-hint channel-key-priority-hint" data-i18n="channels.keyPriorityHint">优先请求高优先级 Key，同优先级轮询</span>
                 <span id="codexCredentialReadOnlyNotice" class="models-hint channel-codex-key-hint" role="status"
                   data-i18n="channels.oauthCredentialReadOnly" hidden>AT 作为只读 Key 显示；完整 OAuth 凭证可在高级设置中查看，均由 ccLoad 在数据库中管理并自动刷新。</span>
               </div>
@@ -938,6 +955,12 @@
                   <path d="M2 2.5H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
                 </svg>
                 <span data-i18n="channels.exportKeys">导出</span>
+              </button>
+              <button type="button" id="sortKeysBtn" class="btn btn-secondary btn-sm" data-action="open-key-sort-modal" disabled>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M5 13V3M5 3L2 6M5 3L8 6M11 3V13M11 13L8 10M11 13L14 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <span data-i18n="channels.sortKeys">排序</span>
               </button>
               <button type="button" id="toggleInlineKeyBtn" class="channel-hover-key-toggle-btn" data-action="toggle-inline-key-visibility"
                 style="width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--surface-border-strong); background: var(--surface-bg-strong); color: var(--neutral-500); cursor: pointer; padding: 0; display: inline-flex; align-items: center; justify-content: center; transition: all 0.2s;"
@@ -987,6 +1010,8 @@
                   </th>
                   <th data-i18n="channels.tableApiKey">API Key</th>
                   <th style="width: 220px;" data-i18n="channels.tableApiKeyNote">备注</th>
+                  <th class="inline-key-col-multiplier" data-i18n="channels.costMultiplier">倍率</th>
+                  <th style="width: 100px;" data-i18n="channels.keyPriority" data-i18n-title="channels.keyPriorityHint" title="优先请求高优先级 Key，同优先级轮询">优先级</th>
                   <th style="width: 200px;">
                     <select id="keyStatusFilter" class="modal-inline-select" data-change-action="filter-keys-by-status">
                       <option value="all" data-i18n="channels.keyStatusAll">全部</option>
@@ -995,7 +1020,6 @@
                       <option value="disabled" data-i18n="channels.keyStatusDisabled">已禁用</option>
                     </select>
                   </th>
-                  <th style="width: 190px;" data-i18n="channels.costMultiplier">倍率</th>
                   <th style="width: 80px;"></th>
                 </tr>
               </thead>
@@ -1091,8 +1115,9 @@
                 <tr>
                   <th style="width: 70px;">
                     <div style="display: flex; align-items: center; gap: 6px;">
-                      <input type="checkbox" id="selectAllModels" data-change-action="toggle-select-all-models"
-                        style="width: 16px; height: 16px;" data-i18n-title="common.selectAll" title="全选/取消全选">
+                      <input type="checkbox" id="selectAllModels" data-change-action="invert-model-selection"
+                        style="width: 16px; height: 16px;" data-i18n-title="channels.invertVisibleModels" title="反选当前显示的模型"
+                        data-i18n-aria-label="channels.invertVisibleModels" aria-label="反选当前显示的模型">
                       <span>#</span>
                     </div>
                   </th>
@@ -1439,19 +1464,6 @@
       </section>
 
       <section id="advancedSettingsPanelCredential" class="advanced-settings-panel hidden" role="tabpanel">
-        <div id="codexQuotaOverdraftSettings" class="codex-quota-overdraft-settings" hidden>
-          <label class="channel-editor-checkbox-label" for="codexQuotaOverdraftEnabled">
-            <input type="checkbox" id="codexQuotaOverdraftEnabled">
-            <span>
-              <strong data-i18n="channels.codex.quotaOverdraftEnabled">启用配额超额使用(有未知风险谨慎使用)</strong>
-              <span class="advanced-settings-inline-help" data-i18n="channels.codex.quotaOverdraftHelp">遇到 usage_limit_reached 时追加一组已完成工具调用并重放一次；仍失败才进入冷却。</span>
-            </span>
-          </label>
-          <div class="codex-quota-overdraft-summary">
-            <span><span data-i18n="channels.codex.quotaOverdraftRequests">成功超额请求</span> <strong id="codexQuotaOverdraftRequests">0</strong></span>
-            <span><span data-i18n="channels.codex.quotaOverdraftCost">累计标准成本</span> <strong id="codexQuotaOverdraftCost">$0</strong></span>
-          </div>
-        </div>
         <div class="codex-credential-toolbar">
           <p id="codexCredentialViewDescription" class="codex-credential-description" data-i18n="channels.oauthCredentialFullDescription">默认显示解码视图；如需备份或复制用于重新导入，请切换到原始视图。</p>
           <div class="codex-credential-toolbar-actions">
@@ -1518,20 +1530,33 @@
             <input type="checkbox" id="channelRetryOtherKeysOnFailure">
             <span><span data-i18n="channels.retryOtherKeysOnFailure">渠道故障优先换 Key</span><span class="advanced-settings-inline-help" data-i18n="channels.retryOtherKeysOnFailureHelp">渠道级或模型级上游故障时，先冷却当前 Key 并尝试同渠道的其他 Key；适用于不同 Key 对应不同服务商的中转站。</span></span>
           </label>
-          <div class="advanced-settings-scheduled-row">
-            <label id="channelScheduledCheckEnabledWrapper" class="form-label channel-editor-checkbox-label" hidden>
-              <input type="checkbox" id="channelScheduledCheckEnabled">
-              <span data-i18n="channels.enableScheduledCheck">定时检测</span>
-            </label>
-            <div id="channelScheduledCheckModelWrapper" class="advanced-settings-other-field" hidden>
-              <div class="filter-combobox-wrapper channel-editor-scheduled-model-control">
-                <input id="channelScheduledCheckModelInput" class="filter-select filter-combobox" type="text"
-                  autocomplete="off" spellcheck="false" aria-label="检测模型"
-                  data-i18n-aria-label="channels.scheduledCheckModel">
-                <div id="channelScheduledCheckModelDropdown" class="filter-dropdown" role="listbox"></div>
-                <input type="hidden" id="channelScheduledCheckModel" value="">
+          <div class="advanced-settings-scheduled-group">
+            <div class="advanced-settings-scheduled-row">
+              <label id="channelScheduledCheckEnabledWrapper" class="form-label channel-editor-checkbox-label">
+                <input type="checkbox" id="channelScheduledCheckEnabled">
+                <span data-i18n="channels.enableScheduledCheck">每日定时检测</span>
+              </label>
+              <div id="channelScheduledCheckModelWrapper" class="advanced-settings-other-field">
+                <div class="filter-combobox-wrapper channel-editor-scheduled-model-control">
+                  <input id="channelScheduledCheckModelInput" class="filter-select filter-combobox" type="text"
+                    autocomplete="off" spellcheck="false" aria-label="检测模型"
+                    data-i18n-aria-label="channels.scheduledCheckModel">
+                  <div id="channelScheduledCheckModelDropdown" class="filter-dropdown" role="listbox"></div>
+                  <input type="hidden" id="channelScheduledCheckModel" value="">
+                </div>
+              </div>
+              <div id="channelScheduledCheckIntervalMinutesWrapper" class="advanced-settings-scheduled-field" hidden>
+                <label class="form-label" for="channelScheduledCheckIntervalMinutes" data-i18n="channels.scheduledCheckIntervalMinutes">检测间隔（分钟）</label>
+                <input id="channelScheduledCheckIntervalMinutes" class="form-input" type="number" min="1" max="1440" step="1" value="300" required disabled aria-describedby="channelScheduledCheckScheduleHint channelScheduledCheckIntervalMinutesError">
+                <small id="channelScheduledCheckIntervalMinutesError" class="advanced-settings-field-help" hidden></small>
+              </div>
+              <div id="channelScheduledCheckStartTimeWrapper" class="advanced-settings-scheduled-field advanced-settings-scheduled-time" hidden>
+                <label class="form-label" for="channelScheduledCheckStartTime" data-i18n="channels.scheduledCheckStartTime">开始时间</label>
+                <input id="channelScheduledCheckStartTime" class="form-input" type="time" step="60" value="00:00" required disabled aria-describedby="channelScheduledCheckScheduleHint channelScheduledCheckStartTimeError">
+                <small id="channelScheduledCheckStartTimeError" class="advanced-settings-field-help" hidden></small>
               </div>
             </div>
+            <p id="channelScheduledCheckScheduleHint" class="advanced-settings-inline-help" data-i18n="channels.scheduledCheckScheduleHint">按服务端时间，每天从开始时间按间隔执行至当天结束；错过的检测不补跑。</p>
           </div>
           <fieldset id="channelManagementGroup" class="advanced-settings-management" hidden>
             <legend class="advanced-settings-management-legend" data-i18n="channels.management.legend">管理账户</legend>
@@ -1663,8 +1688,8 @@
       </div>
       <div class="channel-test-grid">
         <div class="form-group channel-test-field">
-          <label class="form-label" for="testModelSelect" data-i18n="channels.selectTestModel">选择测试模型</label>
-          <select id="testModelSelect" class="model-select">
+          <label class="form-label" for="channelTestModelSelect" data-i18n="channels.selectTestModel">选择测试模型</label>
+          <select id="channelTestModelSelect" class="model-select">
             <!-- 动态填充模型选项 -->
           </select>
         </div>
@@ -1708,7 +1733,7 @@
       </div>
 
       <!-- 测试进度 -->
-      <div id="testProgress" class="test-progress">
+      <div id="channelTestProgress" class="test-progress">
         <div class="test-spinner"></div>
         <span id="testProgressText" data-i18n="channels.testingApi">正在测试API连接...</span>
       </div>
@@ -1735,7 +1760,7 @@
         <button type="button" id="testUpstreamDetailBtn" class="btn btn-secondary channel-test-upstream-btn hidden"
           data-action="show-upstream-detail" data-i18n="channels.test.viewUpstreamDetail">查看详情</button>
         <button type="button" class="btn btn-secondary" data-action="close-test-modal" data-i18n="common.close">关闭</button>
-        <button type="button" id="runTestBtn" class="btn btn-primary" data-action="run-channel-test"
+        <button type="button" id="channelRunTestBtn" class="btn btn-primary" data-action="run-channel-test"
           data-i18n="channels.singleTest">单个测试</button>
         <button type="button" id="batchTestBtn" class="btn btn-primary hidden" data-action="run-batch-test"
           data-i18n="channels.batchTestAllKeys">批量测试所有Key</button>
@@ -2005,9 +2030,44 @@
   </div>
 
 
+  <dialog id="keySortModal" class="key-sort-dialog" aria-labelledby="keySortTitle" aria-describedby="keySortHint">
+    <div class="modal-header">
+      <h2 id="keySortTitle" class="modal-title" data-i18n="channels.keySortTitle">Key 排序</h2>
+      <button type="button" class="close-btn" data-action="close-key-sort-modal" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+    </div>
+    <div class="channel-sort-modal-body">
+      <p id="keySortHint" class="channel-sort-hint" data-i18n="channels.keySortHint">拖动或点击箭头调整顺序；确认后优先级按顺序递减、间隔 10，保存渠道后生效。</p>
+      <div id="keySortList" class="channel-sort-list" role="list" aria-labelledby="keySortTitle"></div>
+    </div>
+    <div class="form-actions channel-sort-action-buttons">
+      <button type="button" class="btn btn-secondary" data-action="close-key-sort-modal" data-i18n="common.cancel">取消</button>
+      <button type="button" class="btn btn-primary" data-action="confirm-key-sort" data-i18n="common.confirm">确认</button>
+    </div>
+  </dialog>
+
   <!-- HTML模板定义 (分离HTML与JS) -->
+  <template id="tpl-key-sort-item">
+    <div class="sort-item" draggable="true" data-index="{{index}}" role="listitem">
+      <div class="sort-item-body">
+        <div class="sort-item-main">
+          <svg class="sort-item-handle" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="4" r="1"/><circle cx="11" cy="4" r="1"/><circle cx="5" cy="8" r="1"/><circle cx="11" cy="8" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="11" cy="12" r="1"/>
+          </svg>
+          <div class="key-sort-description">
+            <div class="sort-item-name">{{label}}</div>
+            <div class="sort-item-priority-label">{{priorityLabel}}: {{priority}}</div>
+          </div>
+        </div>
+        <div class="key-sort-move-buttons">
+          <button type="button" class="btn btn-secondary btn-sm" data-key-sort-move="-1" aria-label="{{moveUp}}">↑</button>
+          <button type="button" class="btn btn-secondary btn-sm" data-key-sort-move="1" aria-label="{{moveDown}}">↓</button>
+        </div>
+      </div>
+    </div>
+  </template>
+
   <template id="tpl-key-row">
-    <tr draggable="true" class="mobile-inline-row inline-key-row draggable-key-row" data-index="{{index}}"
+    <tr class="mobile-inline-row inline-key-row" data-index="{{index}}"
       style="border-bottom: 1px solid var(--neutral-200); height: 36px;">
       <td class="inline-key-col-select mobile-inline-no-label" style="padding: 4px 8px;">
         <div style="display: flex; align-items: center; gap: 6px;">
@@ -2034,7 +2094,6 @@
           </button>
         </div>
       </td>
-      <td class="inline-key-col-status" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelStatus}}">{{{cooldownHtml}}}</td>
       <td class="inline-key-col-multiplier" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelMultiplier}}">
         <div class="inline-key-multiplier-scope">
           <input type="number" value="{{costMultiplier}}" class="inline-key-multiplier-input modal-inline-input"
@@ -2046,13 +2105,19 @@
           </button>
         </div>
       </td>
+      <td class="inline-key-col-priority" style="padding: 4px 8px;" data-mobile-label="{{priorityLabel}}">
+        <input type="number" value="{{priority}}" class="inline-key-priority-input modal-inline-input"
+          data-index="{{index}}" min="-99999" max="9999999" step="1" aria-label="{{priorityLabel}}" title="{{priorityHint}}"
+          style="width: 90px; padding: 4px 5px; border: 1px solid var(--neutral-300); border-radius: 6px; font-size: 13px;">
+      </td>
+      <td class="inline-key-col-status" style="padding: 4px 8px;" data-mobile-label="{{mobileLabelStatus}}">{{{cooldownHtml}}}</td>
       <td class="inline-key-col-actions" style="padding: 4px 8px; text-align: center;" data-mobile-label="{{mobileLabelActions}}">{{{actionsHtml}}}</td>
     </tr>
   </template>
 
   <template id="tpl-key-empty">
     <tr>
-      <td colspan="6" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
+      <td colspan="7" style="padding: 30px; text-align: center; color: var(--neutral-500); font-size: 14px;">
         {{message}}
       </td>
     </tr>

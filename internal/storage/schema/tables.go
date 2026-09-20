@@ -17,6 +17,8 @@ func DefineChannelsTable() *TableBuilder {
 		Column("enabled TINYINT NOT NULL DEFAULT 1").
 		Column("scheduled_check_enabled TINYINT NOT NULL DEFAULT 0").
 		Column("scheduled_check_model VARCHAR(191) NOT NULL DEFAULT ''").
+		Column("scheduled_check_interval_minutes INT NOT NULL DEFAULT 300").
+		Column("scheduled_check_start_time VARCHAR(5) NOT NULL DEFAULT '00:00'").
 		Column("cooldown_until BIGINT NOT NULL DEFAULT 0").
 		Column("cooldown_duration_ms BIGINT NOT NULL DEFAULT 0").
 		Column("daily_cost_limit DOUBLE NOT NULL DEFAULT 0").
@@ -40,6 +42,7 @@ func DefineAPIKeysTable() *TableBuilder {
 		Column("id INT PRIMARY KEY AUTO_INCREMENT").
 		Column("channel_id INT NOT NULL").
 		Column("key_index INT NOT NULL").
+		Column("priority INT NOT NULL DEFAULT 0").
 		Column("api_key VARCHAR(255) NOT NULL").
 		Column("note VARCHAR(512) NOT NULL DEFAULT ''").
 		Column("allowed_models VARCHAR(2000) NOT NULL DEFAULT ''").

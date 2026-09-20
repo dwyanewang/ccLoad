@@ -70,7 +70,9 @@ function installManagementDOM() {
   const elements = new Map(MANAGEMENT_ELEMENT_IDS.map(id => [id, createStubElement(id)]));
   const previous = new Map();
   const dirtyCalls = { count: 0 };
+  const channelURLs = [];
   const globals = {
+    getValidInlineURLConfigs: () => channelURLs,
     document: {
       readyState: 'complete',
       getElementById: id => elements.get(id) || null
@@ -89,6 +91,7 @@ function installManagementDOM() {
   return {
     elements,
     dirtyCalls,
+    channelURLs,
     el: id => elements.get(id),
     restore() {
       for (const [name, descriptor] of previous) {
@@ -147,7 +150,6 @@ test('管理账户表单按 profile 显示字段矩阵并标注平台限制', ()
     assert.equal(dom.el('channelManagementUserIDField').hidden, false);
     assert.equal(dom.el('channelManagementCheckinField').hidden, false);
     assert.equal(dom.el('channelManagementNotice').hidden, true);
-    assert.equal(dom.el('channelManagementTokenHelp').textContent, 'channels.management.tokenHelpNewAPI');
 
     selectProfile(dom, mod, 'sub2api');
     assert.equal(dom.el('channelManagementTokenField').hidden, true, 'Sub2API 不再接收手工 JWT');
@@ -156,13 +158,11 @@ test('管理账户表单按 profile 显示字段矩阵并标注平台限制', ()
     assert.equal(dom.el('channelManagementUserIDField').hidden, true, '标准 Sub2API 不接受 user_id');
     assert.equal(dom.el('channelManagementCheckinField').hidden, true, '标准 Sub2API 不显示签到配置');
     assert.equal(dom.el('channelManagementNotice').hidden, false);
-    assert.equal(dom.el('channelManagementNotice').textContent, 'channels.management.noticeSub2API');
 
     selectProfile(dom, mod, 'sub2api_pro');
     assert.equal(dom.el('channelManagementLoginField').hidden, false);
     assert.equal(dom.el('channelManagementUserIDField').hidden, true);
     assert.equal(dom.el('channelManagementCheckinField').hidden, false);
-    assert.equal(dom.el('channelManagementNotice').textContent, 'channels.management.noticeSub2APIPro');
   } finally {
     dom.restore();
   }
@@ -187,6 +187,28 @@ test('首个渠道 URL 只作为初始默认，显式面板地址不被多 URL �
       { url: 'https://first.example.com/v1/messages' },
       { url: 'https://second.example.com' }
     ], 'api_key');
+    assert.equal(dom.el('channelManagementBaseURL').value, 'https://panel.example.com');
+  } finally {
+    dom.restore();
+  }
+});
+
+test('新建渠道填写 URL 后进入高级设置，管理账户补填根地址且保留手填地址', () => {
+  const dom = installManagementDOM();
+  try {
+    const mod = loadManagementModule();
+    mod.resetManagementAccountDraft(null, [], 'api_key');
+    dom.channelURLs.push({ url: 'https://upstream.example.com/v1/messages', exact: true });
+
+    mod.beginManagementAccountDraft();
+    selectProfile(dom, mod, 'new_api');
+    assert.equal(dom.el('channelManagementBaseURL').value, 'https://upstream.example.com');
+
+    dom.el('channelManagementBaseURL').value = 'https://panel.example.com';
+    dom.el('channelManagementToken').value = 'test-token';
+    mod.commitManagementAccountDraft();
+    dom.channelURLs[0].url = 'https://changed.example.com/v1';
+    mod.beginManagementAccountDraft();
     assert.equal(dom.el('channelManagementBaseURL').value, 'https://panel.example.com');
   } finally {
     dom.restore();

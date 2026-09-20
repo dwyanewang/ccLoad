@@ -19,6 +19,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 const anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
@@ -96,19 +97,13 @@ type fwResult struct {
 	Cache5mInputTokens       int // 5分钟缓存写入Token数（新增2025-12）
 	Cache1hInputTokens       int // 1小时缓存写入Token数（新增2025-12）
 	ToolCostUSD              float64
+	ImageUsage               *util.ImageGenerationToolUsage
 
 	// 转发诊断信息（2025-12新增）
 	StreamDiagMsg string // 诊断消息（例如：流中断/不完整、上游响应体读取失败），合并到日志的 Message 字段
 
 	// 重试策略（例如 Codex 400 后剥离 reasoning/thinking 再成功）
 	RetryStrategy string
-	// QuotaOverdraftReplayed marks a request that consumed the one-shot Codex
-	// usage-limit replay. A successful final response activates credential-wide
-	// overdraft accounting until the upstream quota reset.
-	QuotaOverdraftReplayed bool
-	// QuotaOverdraftActiveUntil is the upstream quota reset time captured from
-	// the usage_limit_reached response that caused the successful replay.
-	QuotaOverdraftActiveUntil int64
 
 	// 上游响应字节数（2026-02新增）
 	// 用于499场景诊断：区分客户端在首字节前取消还是接收部分数据后取消
@@ -128,8 +123,8 @@ type fwResult struct {
 	// 或心跳传输错误结束。该故障按物理连接连续计数，不得升级为模型冷却。
 	UpstreamWebsocketTransportFailure bool
 
-	// OpenAI service_tier（2026-03新增）。Codex 请求中的 priority 是 Fast 模式标记；
-	// 其他情况由上游响应中的 service_tier 决定。
+	// OpenAI service_tier（2026-03新增）。请求中的 priority 是 Fast 模式标记，
+	// 计费时不能被上游回显的 default/standard 降档。
 	ServiceTier string
 
 	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
@@ -154,38 +149,40 @@ type ForwardObserver struct {
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
-	clientModel                string // 客户端请求的原始模型基名；仅用于日志，避免被回退/重定向覆盖
-	originalModel              string // 当前用于选路的模型基名，可能已被多模态回退替换
-	requestedModel             string // 当前用于选路的字面模型名，可能带思考后缀
-	clientProtocol             protocol.Protocol
-	codexClient                bool
-	upstreamProtocol           protocol.Protocol
-	requestMethod              string
-	requestPath                string
-	rawQuery                   string
-	body                       []byte
-	translatedBody             []byte
-	header                     http.Header
-	isStreaming                bool
-	tokenHash                  string               // Token哈希值（用于统计）
-	tokenID                    int64                // Token ID（用于日志记录，0表示未使用token）
-	clientIP                   string               // 客户端IP地址（用于日志记录）
-	activeReqID                int64                // 活跃请求ID（用于更新渠道信息）
-	observer                   *ForwardObserver     // 转发观测回调（可选）
-	startTime                  time.Time            // 请求开始时间（用于统计）
-	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
-	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
-	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
-	attemptCostMultiplier      float64              // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
-	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
-	skipProxyLog               bool                 // 管理测试等外层会统一持久化日志的调用路径
-	thinkingEffort             string
-	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
-	nativeCodexWS              *codexUpstreamWebsocketSession
-	nativeCodexBody            []byte
-	quotaOverdraftTranscript   []byte
-	codexMultiAgentV2Optimized bool
-	codexMultiAgentV2Conflict  bool
+	abortChannel            context.CancelCauseFunc // 覆盖当前渠道所有 Key/URL 和重试等待
+	antigravityCreditsTried map[string]bool
+	antigravityRateRetried  map[string]bool
+	clientModel             string // 客户端请求的原始模型基名；仅用于日志，避免被回退/重定向覆盖
+	originalModel           string // 当前用于选路的模型基名，可能已被多模态回退替换
+	requestedModel          string // 当前用于选路的字面模型名，可能带思考后缀
+	clientProtocol          protocol.Protocol
+	codexClient             bool
+	upstreamProtocol        protocol.Protocol
+	requestMethod           string
+	requestPath             string
+	rawQuery                string
+	body                    []byte
+	translatedBody          []byte
+	header                  http.Header
+	isStreaming             bool
+	tokenHash               string               // Token哈希值（用于统计）
+	tokenID                 int64                // Token ID（用于日志记录，0表示未使用token）
+	clientIP                string               // 客户端IP地址（用于日志记录）
+	activeReqID             int64                // 活跃请求ID（用于更新渠道信息）
+	observer                *ForwardObserver     // 转发观测回调（可选）
+	startTime               time.Time            // 请求开始时间（用于统计）
+	channelStartTime        time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
+	attemptStartTime        time.Time            // 渠道内单次 Key/URL 尝试开始时间
+	attemptActualModel      string               // 上次尝试实际发往上游的模型（含后缀剥离/重定向后的结果）
+	attemptSelectedKey      string               // 上次尝试选中的 Key 或 OAuth access token
+	baseURL                 string               // 当前尝试使用的上游URL（多URL场景）
+	attemptCostMultiplier   float64              // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
+	debugData               *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	skipProxyLog            bool                 // 管理测试等外层会统一持久化日志的调用路径
+	thinkingEffort          string
+	routingSession          *responsesExecutionSession // 当前 Responses execution session 的首选渠道
+	nativeCodexWS           *codexUpstreamWebsocketSession
+	nativeCodexBody         []byte
 }
 
 func (r *proxyRequestContext) requestLogModel() string {
@@ -194,6 +191,18 @@ func (r *proxyRequestContext) requestLogModel() string {
 	}
 	if r.clientModel != "" {
 		return r.clientModel
+	}
+	return r.originalModel
+}
+
+// attemptModelOrOriginal 返回本渠道上次尝试实际发往上游的模型。
+// 中断可能落在 forwardAttempt 之前（凭证刷新、选 Key），此时尚无实际模型，退回选路模型。
+func (r *proxyRequestContext) attemptModelOrOriginal() string {
+	if r == nil {
+		return ""
+	}
+	if r.attemptActualModel != "" {
+		return r.attemptActualModel
 	}
 	return r.originalModel
 }
@@ -209,6 +218,7 @@ type proxyResult struct {
 	succeeded                 bool
 	isClientCanceled          bool // 客户端主动取消请求（context.Canceled）
 	isNetworkError            bool
+	operatorAborted           bool            // 管理员跳过当前渠道，不重试同渠道或施加冷却
 	nextAction                cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
 	deferredCooldown          *cooldown.ErrorInput
 	deferredLog               *model.LogEntry
@@ -436,7 +446,7 @@ func injectAnthropicBetaFlag(req *http.Request, flag string) {
 		return
 	}
 	h := req.Header
-	key, exists := existingHeaderKey(h, "anthropic-beta")
+	key, exists := mergeHeaderVariantsToKey(h, "anthropic-beta")
 	if !exists {
 		h.Set("anthropic-beta", flag)
 		return
@@ -485,35 +495,47 @@ func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, upstreamProtocol, req
 	if requestPath != "/v1/messages" {
 		return body
 	}
-	var obj map[string]any
-	if err := sonic.Unmarshal(body, &obj); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
-	thinking, hasThinking := obj["thinking"]
-	if hasThinking {
-		thinkMap, ok := thinking.(map[string]any)
-		if !ok {
-			return body
-		}
-		typ, _ := thinkMap["type"].(string)
-		if typ != "enabled" {
-			return body
-		}
-		effort := "high"
-		if budget, ok := thinkMap["budget_tokens"].(float64); ok && budget > 0 {
-			effort = anthropicBudgetToEffort(int(budget))
-		}
-		obj["thinking"] = map[string]string{"type": "adaptive"}
-		setAnthropicOutputEffort(obj, effort)
-	} else {
-		obj["thinking"] = map[string]string{"type": "adaptive"}
-		setAnthropicOutputEffort(obj, "high")
+	thinking := gjson.GetBytes(body, "thinking")
+	if thinking.Exists() && !thinking.IsObject() {
+		return body
 	}
-	newBody, err := sonic.Marshal(obj)
+	effort := "high"
+	if thinking.Exists() {
+		if gjson.GetBytes(body, "thinking.type").String() != "enabled" {
+			return body
+		}
+		if budget := gjson.GetBytes(body, "thinking.budget_tokens"); budget.Exists() && budget.Num > 0 {
+			effort = anthropicBudgetToEffort(int(budget.Num))
+		}
+	}
+
+	updated, err := sjson.SetRawBytes(body, "thinking", []byte(`{"type":"adaptive"}`))
 	if err != nil {
 		return body
 	}
-	return newBody
+	outputConfig := gjson.GetBytes(updated, "output_config")
+	if !outputConfig.Exists() || outputConfig.Type == gjson.Null {
+		updated, err = sjson.SetRawBytes(updated, "output_config", []byte(`{}`))
+		if err != nil {
+			return body
+		}
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	} else if outputConfig.IsObject() && !gjson.GetBytes(updated, "output_config.effort").Exists() {
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	} else if !outputConfig.IsObject() {
+		updated, err = sjson.SetRawBytes(updated, "output_config", []byte(`{}`))
+		if err != nil {
+			return body
+		}
+		updated, err = sjson.SetBytes(updated, "output_config.effort", effort)
+	}
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func isAnyrouterChannel(cfg *model.Config) bool {
@@ -524,18 +546,16 @@ func isAnyrouterChannel(cfg *model.Config) bool {
 	return strings.Contains(haystack, "anyrouter")
 }
 
-func setAnthropicOutputEffort(obj map[string]any, effort string) {
-	if effort == "" {
-		return
+// setAnthropicOutputEffort 写入 output_config.effort，已有值不覆盖。
+func setAnthropicOutputEffort(body []byte, effort string) []byte {
+	if effort == "" || gjson.GetBytes(body, "output_config.effort").Exists() {
+		return body
 	}
-	outputConfig, _ := obj["output_config"].(map[string]any)
-	if outputConfig == nil {
-		outputConfig = map[string]any{}
-		obj["output_config"] = outputConfig
+	updated, err := sjson.SetBytes(body, "output_config.effort", effort)
+	if err != nil {
+		return body
 	}
-	if _, exists := outputConfig["effort"]; !exists {
-		outputConfig["effort"] = effort
-	}
+	return updated
 }
 
 // anthropicBudgetToEffort 把旧 Anthropic budget_tokens 映射成 output_config.effort 档位。
@@ -696,10 +716,16 @@ func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) str
 // Gemini 的模型位于 URL 路径，body 规则不改变其路由模型。
 func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, originalModel string, upstreamProtocol string) string {
 	actualModel := s.resolveActualModel(cfg, originalModel)
-	if protocol.Protocol(util.NormalizeProtocol(upstreamProtocol)) == protocol.Gemini {
-		return actualModel
+	if protocol.Protocol(util.NormalizeProtocol(upstreamProtocol)) != protocol.Gemini {
+		actualModel = resolveModelAfterBodyRules(actualModel, cfg.BodyRules())
 	}
-	return resolveModelAfterBodyRules(actualModel, cfg.BodyRules())
+	if cfg.UsesCodexOAuth() {
+		if canonical, ok := canonicalCodexImageModel(actualModel); ok &&
+			(canonical == "gpt-image-2.5" || canonical == "gpt-image-2.5-flare" || canonical == "gpt-image-2.5-sunburst") {
+			return canonical
+		}
+	}
+	return actualModel
 }
 
 func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext, upstreamProtocol protocol.Protocol) (actualModel string, bodyToSend []byte) {
@@ -730,23 +756,17 @@ func replaceJSONRequestModel(body []byte, actualModel string) []byte {
 	if len(body) == 0 || actualModel == "" {
 		return body
 	}
-	var reqData map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &reqData); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
-	var current string
-	if raw, ok := reqData["model"]; ok {
-		_ = sonic.Unmarshal(raw, &current)
-	}
-	if strings.TrimSpace(current) == "" || current == actualModel {
+	current := gjson.GetBytes(body, "model")
+	if current.Type != gjson.String {
 		return body
 	}
-	modelRaw, err := sonic.Marshal(actualModel)
-	if err != nil {
+	if strings.TrimSpace(current.String()) == "" || current.String() == actualModel {
 		return body
 	}
-	reqData["model"] = modelRaw
-	modifiedBody, err := sonic.Marshal(reqData)
+	modifiedBody, err := sjson.SetBytes(body, "model", actualModel)
 	if err != nil {
 		return body
 	}
@@ -761,49 +781,37 @@ func stripAnthropicBillingHeaders(body []byte) []byte {
 	if !bytes.Contains(body, []byte(anthropicBillingHeaderPrefix)) {
 		return body
 	}
-
-	var reqData map[string]json.RawMessage
-	if err := sonic.Unmarshal(body, &reqData); err != nil {
+	if !gjson.ParseBytes(body).IsObject() {
 		return body
 	}
 
-	systemRaw, ok := reqData["system"]
-	if !ok {
+	system := gjson.GetBytes(body, "system")
+	if !system.IsArray() {
 		return body
 	}
-
-	var systemArr []json.RawMessage
-	if err := sonic.Unmarshal(systemRaw, &systemArr); err != nil {
-		return body // system 是 string，不处理
-	}
-
-	filtered := make([]json.RawMessage, 0, len(systemArr))
-	changed := false
-	for _, item := range systemArr {
-		if isAnthropicBillingHeaderSystemBlock(item) {
-			changed = true
-			continue
+	indices := make([]int, 0)
+	for index, item := range system.Array() {
+		if isAnthropicBillingHeaderSystemBlock(json.RawMessage(item.Raw)) {
+			indices = append(indices, index)
 		}
-		filtered = append(filtered, item)
 	}
-
-	if !changed {
+	if len(indices) == 0 {
 		return body
 	}
-
-	if len(filtered) == 0 {
-		delete(reqData, "system")
-	} else {
-		filteredSystemRaw, err := sonic.Marshal(filtered)
+	result := body
+	for index := len(indices) - 1; index >= 0; index-- {
+		var err error
+		result, err = sjson.DeleteBytes(result, fmt.Sprintf("system.%d", indices[index]))
 		if err != nil {
 			return body
 		}
-		reqData["system"] = filteredSystemRaw
 	}
-
-	result, err := sonic.Marshal(reqData)
-	if err != nil {
-		return body
+	if !gjson.GetBytes(result, "system").IsArray() || len(gjson.GetBytes(result, "system").Array()) == 0 {
+		var err error
+		result, err = sjson.DeleteBytes(result, "system")
+		if err != nil {
+			return body
+		}
 	}
 	return result
 }
@@ -1128,6 +1136,11 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 	if res == nil {
 		return 0
 	}
+	if res.ImageUsage != nil {
+		if cost := util.CalculateImageGenerationToolCost(model, *res.ImageUsage); cost > 0 {
+			return cost
+		}
+	}
 	return util.CalculateStandardCostBreakdown(
 		model,
 		serviceTier,
@@ -1185,9 +1198,9 @@ func serviceTierCostRank(value string) (int, bool) {
 }
 
 // resolveBillingServiceTier merges the requested tier with the upstream tier.
-// A response can lower the bill when it explicitly reports a cheaper tier. The
-// explicit auto/ultrafast response tiers are retained because they carry
-// priority/Fast (2.5x for GPT-5.6) or ultrafast (10x) charges.
+// priority is an explicit Fast-mode purchase and therefore a billing floor:
+// gateways that omit it or echo default/standard must not silently undercharge.
+// An explicit ultrafast response still wins because it carries a higher charge.
 func resolveBillingServiceTier(requested, observed string) string {
 	requested = normalizeBillingServiceTier(requested)
 	observed = normalizeBillingServiceTier(observed)
@@ -1196,6 +1209,9 @@ func resolveBillingServiceTier(requested, observed string) string {
 	// upstream charge is lost.
 	if observed == "auto" || observed == "ultrafast" {
 		return observed
+	}
+	if requested == "priority" {
+		return requested
 	}
 	if requested == "" {
 		if rank, ok := serviceTierCostRank(observed); ok && rank <= 1 {
@@ -1328,4 +1344,77 @@ func formatModelDisplayName(modelID string) string {
 		}
 	}
 	return strings.Join(words, " ")
+}
+
+func looksLikeJSONDocument(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+}
+
+// shouldValidateStrictJSONBody treats a declared JSON media type as a hard
+// contract, including scalar documents such as true, false and null. The
+// leading-byte heuristic remains only for bodies without a JSON declaration;
+// multipart payloads are framed data and must never be fed to the JSON parser.
+func shouldValidateStrictJSONBody(contentType string, raw []byte) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if index := strings.IndexByte(mediaType, ';'); index >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:index])
+	}
+	if mediaType == "multipart/form-data" {
+		return false
+	}
+	return isJSONContentType(contentType) || looksLikeJSONDocument(raw)
+}
+
+// sjsonPathJoin 拼接 sjson 路径段，用于数组索引或不带 `:` 前缀的键。
+func sjsonPathJoin(prefix, segment string) string {
+	escaped := sjsonPathEscape(segment)
+	if prefix == "" {
+		return escaped
+	}
+	return prefix + "." + escaped
+}
+
+// sjsonObjectPathJoin 拼接 sjson 路径段并加 `:` 前缀，强制按对象键寻址。
+func sjsonObjectPathJoin(prefix, segment string) string {
+	escaped := ":" + sjsonPathEscape(segment)
+	if prefix == "" {
+		return escaped
+	}
+	return prefix + "." + escaped
+}
+
+var sjsonPathEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`.`, `\.`,
+	`|`, `\|`,
+	`#`, `\#`,
+	`@`, `\@`,
+	`*`, `\*`,
+	`?`, `\?`,
+	`:`, `\:`,
+)
+
+// sjsonPathEscape 转义 sjson 路径中的特殊字符。
+func sjsonPathEscape(segment string) string {
+	return sjsonPathEscaper.Replace(segment)
+}
+
+// isMutableJSONObject 判定 raw 能否安全交给 gjson/sjson 做就地改写。
+//
+// 两个条件缺一不可，这不是重复防御：
+//   - sonic.Valid 拦语法错误。gjson 对残缺输入是宽松的——`gjson.ParseBytes([]byte("{\"a\":1")).IsObject()`
+//     返回 true，而 sjson.SetBytes 对同一份字节会静默返回 `,"z":1}` 且 err == nil，
+//     等于把损坏的字节发给上游。
+//   - IsObject 拦顶层类型。数组、字符串、null 都能通过语法校验，但按对象键去 set/delete
+//     的结果没有意义。
+//
+// 注意它守的是"能被 sjson 安全改写"，不是"能被 encoding/json 解析"：sonic.Valid 接受
+// 非法 `\u` 转义（`{"a":"\u00"}`），这类字节经 sjson 是原样透传的，不产生新的损坏。
+// 需要 encoding/json 语义的调用方（如 parseOrderedJSON）必须自己用 gjson.ValidBytes。
+func isMutableJSONObject(raw []byte) bool {
+	return sonic.Valid(raw) && gjson.ParseBytes(raw).IsObject()
 }

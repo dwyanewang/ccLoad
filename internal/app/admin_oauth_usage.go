@@ -17,6 +17,7 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
@@ -45,17 +46,18 @@ const (
 )
 
 var (
-	errOAuthUsageUnsupported         = errors.New("usage: channel does not use a supported OAuth provider")
-	errZAIUsageManagerUnavailable    = errors.New("usage: Z.ai credential manager is unavailable")
-	errCursorUsageManagerUnavailable = errors.New("usage: Cursor credential manager is unavailable")
-	errZedUsageManagerUnavailable    = errors.New("usage: Zed credential manager is unavailable")
-	errCodexUsageManagerUnavailable  = errors.New("usage: Codex credential manager is unavailable")
-	errAnthropicManagerUnavailable   = errors.New("usage: Anthropic credential manager is unavailable")
-	errAntigravityManagerUnavailable = errors.New("usage: Antigravity credential manager is unavailable")
-	errXAIUsageManagerUnavailable    = errors.New("usage: xAI credential manager is unavailable")
-	errXAIBillingBadCredential       = errors.New("usage: xAI credential was rejected")
-	errOAuthUsageChannelNotFound     = errors.New("channel not found")
-	errOAuthUsagePersistFailed       = errors.New("usage: persist OAuth quota failed")
+	errOAuthUsageUnsupported            = errors.New("usage: channel does not use a supported OAuth provider")
+	errCodeBuddyUsageManagerUnavailable = errors.New("usage: CodeBuddy credential manager is unavailable")
+	errZAIUsageManagerUnavailable       = errors.New("usage: Z.ai credential manager is unavailable")
+	errCursorUsageManagerUnavailable    = errors.New("usage: Cursor credential manager is unavailable")
+	errZedUsageManagerUnavailable       = errors.New("usage: Zed credential manager is unavailable")
+	errCodexUsageManagerUnavailable     = errors.New("usage: Codex credential manager is unavailable")
+	errAnthropicManagerUnavailable      = errors.New("usage: Anthropic credential manager is unavailable")
+	errAntigravityManagerUnavailable    = errors.New("usage: Antigravity credential manager is unavailable")
+	errXAIUsageManagerUnavailable       = errors.New("usage: xAI credential manager is unavailable")
+	errXAIBillingBadCredential          = errors.New("usage: xAI credential was rejected")
+	errOAuthUsageChannelNotFound        = errors.New("channel not found")
+	errOAuthUsagePersistFailed          = errors.New("usage: persist OAuth quota failed")
 )
 
 type oauthUsageBatchRequest struct {
@@ -194,6 +196,13 @@ type oauthUsageWindow struct {
 }
 
 type oauthUsageSummary struct {
+	Credits *antigravityauth.Credits `json:"credits,omitempty"`
+	// CodeBuddyCredits is the absolute remaining balance returned by the
+	// billing meter. CodeBuddy does not expose a percentage window like the
+	// other OAuth providers, so retain the provider-native value.
+	CodeBuddyCredits *codeBuddyCredits `json:"codebuddy_credits,omitempty"`
+	// Partial means omitted windows were not observed, rather than retired.
+	Partial               bool                    `json:"-"`
 	Provider              string                  `json:"provider"`
 	PlanType              string                  `json:"plan_type,omitempty"`
 	SubscriptionTier      string                  `json:"subscription_tier,omitempty"`
@@ -207,6 +216,8 @@ type oauthUsageSummary struct {
 	XAIBilling     *xaiBillingSummary `json:"xai_billing,omitempty"`
 	QuotaCostUsage *oauthcost.Usage   `json:"quota_cost_usage,omitempty"`
 }
+
+type codeBuddyCredits = codebuddyauth.ResourceUsage
 
 type persistedOAuthUsageSnapshot struct {
 	RequestedAt string            `json:"requested_at"`
@@ -851,7 +862,11 @@ func requestAntigravityUsage(
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, errors.New("usage: Antigravity response is invalid")
 	}
-	return normalizeAntigravityUsage(&payload)
+	summary, err := normalizeAntigravityUsage(&payload)
+	if summary != nil {
+		summary.Credits = credential.Credits.Clone()
+	}
+	return summary, err
 }
 
 func executeOAuthUsageRequest(client *http.Client, req *http.Request, provider string) ([]byte, error) {
@@ -913,6 +928,7 @@ func requestXAIUsage(
 
 	summary := &oauthUsageSummary{
 		Provider:          xaiauth.ChannelType,
+		Partial:           !credits.recognized || !monthly.recognized,
 		SubscriptionTier:  strings.TrimSpace(credential.SubscriptionTier),
 		EntitlementStatus: strings.TrimSpace(credential.EntitlementStatus),
 		Windows:           make([]oauthUsageWindow, 0, len(credits.windows)+len(monthly.windows)),
@@ -1442,6 +1458,7 @@ func (s *Server) activeChannelUsageIDs(ctx context.Context, requestedIDs []int64
 			continue
 		}
 		if cfg.UsesAntigravityOAuth() || cfg.UsesZAIOAuth() ||
+			cfg.UsesCodeBuddyOAuth() ||
 			cfg.UsesCursorOAuth() || cfg.UsesZedOAuth() {
 			channelIDs = append(channelIDs, cfg.ID)
 		}
@@ -1484,6 +1501,7 @@ func oauthUsageHTTPStatus(err error) int {
 	case errors.Is(err, errCodexUsageManagerUnavailable),
 		errors.Is(err, errAnthropicManagerUnavailable),
 		errors.Is(err, errAntigravityManagerUnavailable),
+		errors.Is(err, errCodeBuddyUsageManagerUnavailable),
 		errors.Is(err, errXAIUsageManagerUnavailable),
 		errors.Is(err, errZAIUsageManagerUnavailable),
 		errors.Is(err, errCursorUsageManagerUnavailable),
@@ -1559,6 +1577,10 @@ func (s *Server) refreshChannelUsage(ctx context.Context, channelID int64) (stri
 		return "", nil, nil, errOAuthUsageChannelNotFound
 	}
 	if cfg.GetAuthType() == model.AuthTypeAPIKey {
+		if isOpenCodeChannel(cfg) {
+			usage, err := s.refreshOAuthUsage(ctx, channelID)
+			return "oauth", usage, nil, err
+		}
 		if s.channelManagement == nil {
 			return "management", nil, nil, errChannelManagementProviderUnavailable
 		}
@@ -1579,8 +1601,11 @@ func (s *Server) persistOAuthUsage(
 	if s == nil || s.store == nil || cfg == nil || summary == nil {
 		return nil, errors.New("OAuth usage persistence is unavailable")
 	}
+	if cfg.GetAuthType() == model.AuthTypeAPIKey {
+		return summary, nil
+	}
 
-	for {
+	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1604,7 +1629,7 @@ func (s *Server) persistOAuthUsage(
 		}
 
 		var nextQuotaCostUsage *oauthcost.Usage
-		if state.tracksQuotaCost {
+		if state.tracksQuotaCost() {
 			nextQuotaCostUsage = reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
 		}
 		storedSummary := *summary
@@ -1624,19 +1649,22 @@ func (s *Server) persistOAuthUsage(
 		if len(payload) > maxOAuthCredentialBytes {
 			return nil, errors.New("OAuth credential exceeds persistence limit")
 		}
-		updated, err := s.store.CompareAndSwapOAuthCredential(
+		updated, persistedCosts, err := s.store.CompareAndSwapOAuthUsage(
 			ctx, currentCfg.ID, state.authType, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {
 			return nil, err
 		}
 		if !updated {
+			if err := waitOAuthCASRetry(ctx, attempt); err != nil {
+				return nil, err
+			}
 			continue
 		}
 
 		s.invalidateOAuthCredential(currentCfg.ID, summary.Provider)
 		s.InvalidateChannelListCache()
-		return attachOAuthQuotaCostUsage(summary, nextQuotaCostUsage), nil
+		return attachOAuthQuotaCostUsage(summary, persistedCosts), nil
 	}
 }
 
@@ -1699,7 +1727,7 @@ func latestOAuthUsage(
 	passiveTime, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(passiveSampledAt))
 	if err == nil && passiveTime.After(activeSampledAt) {
 		if strings.EqualFold(strings.TrimSpace(active.Provider), codexauth.ChannelType) {
-			return mergeLatestCodexOAuthUsage(active, passive)
+			return mergeLatestCodexOAuthUsage(active, activeSampledAt, passive, passiveTime)
 		}
 		merged := *passive
 		merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
@@ -1714,7 +1742,7 @@ func latestOAuthUsage(
 // the official endpoint stopped returning it); allowing those groups to
 // replace the whole snapshot makes the admin page display phantom windows.
 // The official window identities therefore define the result set.
-func mergeLatestCodexOAuthUsage(active, passive *oauthUsageSummary) *oauthUsageSummary {
+func mergeLatestCodexOAuthUsage(active *oauthUsageSummary, activeSampledAt time.Time, passive *oauthUsageSummary, passiveSampledAt time.Time) *oauthUsageSummary {
 	if active == nil {
 		return passive
 	}
@@ -1729,22 +1757,69 @@ func mergeLatestCodexOAuthUsage(active, passive *oauthUsageSummary) *oauthUsageS
 	}
 	merged.Windows = make([]oauthUsageWindow, 0, len(active.Windows))
 	for _, window := range active.Windows {
+		windowSampledAt := window.SampledAt
+		if windowSampledAt.IsZero() {
+			windowSampledAt = activeSampledAt
+		}
 		key := oauthcost.Key(window.LimitName, window.Kind)
 		candidates := passiveByKey[key]
-		if len(candidates) > 0 {
-			passiveWindow := candidates[0]
-			// The official snapshot owns the window identity, duration, and
-			// reset boundary. The passive stream contributes only fresher usage.
+		for i, passiveWindow := range candidates {
+			if window.LimitWindowSeconds <= 0 || passiveWindow.LimitWindowSeconds <= 0 ||
+				window.ResetAt <= 0 || passiveWindow.ResetAt <= 0 {
+				continue
+			}
+			sampledAt := passiveWindow.SampledAt
+			if sampledAt.IsZero() {
+				sampledAt = passiveSampledAt
+			}
+			if !sampledAt.After(windowSampledAt) {
+				continue
+			}
+			if passiveWindow.LimitWindowSeconds != window.LimitWindowSeconds {
+				// Plans and upstream quota policies can change the duration before
+				// the official snapshot expires. Accept only a currently sampled
+				// period, and move its duration and boundary together.
+				at := sampledAt.Unix()
+				if at < passiveWindow.ResetAt-passiveWindow.LimitWindowSeconds || at >= passiveWindow.ResetAt {
+					continue
+				}
+				// A duration change can also be a primary/secondary layout change.
+				// Without a complete scope snapshot, do not create a duplicate of
+				// a sibling or infer that the sibling has been retired.
+				conflictsWithSibling := false
+				for _, sibling := range active.Windows {
+					if strings.EqualFold(strings.TrimSpace(sibling.LimitName), strings.TrimSpace(window.LimitName)) &&
+						oauthcost.Key(sibling.LimitName, sibling.Kind) != key &&
+						sibling.LimitWindowSeconds == passiveWindow.LimitWindowSeconds {
+						conflictsWithSibling = true
+						break
+					}
+				}
+				if conflictsWithSibling {
+					continue
+				}
+				window.LimitWindowSeconds = passiveWindow.LimitWindowSeconds
+				window.ResetAt = passiveWindow.ResetAt
+			} else if !oauthQuotaCostMatchesSampledWindow(passiveWindow, &oauthcost.Window{
+				WindowSeconds: window.LimitWindowSeconds, ResetAt: window.ResetAt,
+			}) {
+				// A completed official period cannot pin the display forever.
+				// Accept a forward rollover only once both periods' boundaries
+				// and the passive sample prove the new period is current.
+				at := sampledAt.Unix()
+				if passiveWindow.ResetAt <= window.ResetAt || at < window.ResetAt ||
+					at < passiveWindow.ResetAt-passiveWindow.LimitWindowSeconds || at >= passiveWindow.ResetAt {
+					continue
+				}
+				window.ResetAt = passiveWindow.ResetAt
+			}
+			// Same-period jitter retains the official boundary; a new period
+			// uses its own boundary so its accumulated cost can also be attached.
 			window.UsedPercent = passiveWindow.UsedPercent
 			window.RemainingPercent = passiveWindow.RemainingPercent
-			window.SampledAt = passiveWindow.SampledAt
-			merged.Windows = append(merged.Windows, window)
-			if len(candidates) == 1 {
-				delete(passiveByKey, key)
-			} else {
-				passiveByKey[key] = candidates[1:]
-			}
-			continue
+			window.SampledAt = sampledAt
+			passiveByKey[key] = append(candidates[:i], candidates[i+1:]...)
+			break
 		}
 		merged.Windows = append(merged.Windows, window)
 	}
@@ -1755,6 +1830,17 @@ func mergeLatestCodexOAuthUsage(active, passive *oauthUsageSummary) *oauthUsageS
 func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oauthUsageSummary, error) {
 	cfg = s.withOAuthBaseURLOverride(cfg)
 	switch {
+	case cfg.UsesCodeBuddyOAuth():
+		if s.codeBuddyCredentials == nil || s.codeBuddyService == nil {
+			return nil, errCodeBuddyUsageManagerUnavailable
+		}
+		credential, err := s.codeBuddyCredentials.credential(ctx, cfg, false, "")
+		if err != nil {
+			return nil, oauthUsageCredentialRefreshError(err, "usage: CodeBuddy credential refresh failed")
+		}
+		service := *s.codeBuddyService
+		service.Client = s.getClientForChannel(cfg)
+		return requestCodeBuddyUsage(ctx, &service, credential)
 	case cfg.UsesCodexOAuth():
 		if s.codexCredentials == nil {
 			return nil, errCodexUsageManagerUnavailable
@@ -1793,10 +1879,15 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 			return nil, errAntigravityManagerUnavailable
 		}
 		credential, err := s.antigravityCredentials.credentialWithMetadata(ctx, cfg)
-		if err != nil {
+		var refreshErr *codexCredentialRefreshError
+		if err != nil && (credential == nil || credential.ProjectID == "" || credential.AccessToken == "" || errors.As(err, &refreshErr)) {
 			return nil, oauthUsageCredentialRefreshError(err, "usage: Antigravity credential refresh failed")
 		}
-		return requestAntigravityUsage(ctx, s.getClientForChannel(cfg), credential, s.antigravityUserAgent())
+		summary, usageErr := requestAntigravityUsage(ctx, s.getClientForChannel(cfg), credential, s.antigravityUserAgent())
+		if summary != nil && err != nil {
+			summary.Warnings = append(summary.Warnings, "Antigravity subscription refresh failed")
+		}
+		return summary, usageErr
 	case cfg.UsesXAIOAuth():
 		if s.xaiCredentials == nil {
 			return nil, errXAIUsageManagerUnavailable
@@ -1856,6 +1947,8 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 			}
 		}
 		return nil, errors.New("usage: Cursor session token was rejected")
+	case isOpenCodeChannel(cfg):
+		return s.requestOpenCodeGoUsage(ctx, cfg)
 	case cfg.UsesZedOAuth():
 		if s.zedCredentials == nil {
 			return nil, errZedUsageManagerUnavailable
@@ -1878,6 +1971,25 @@ func (s *Server) oauthUsageSummary(ctx context.Context, cfg *model.Config) (*oau
 	default:
 		return nil, errOAuthUsageUnsupported
 	}
+}
+
+func requestCodeBuddyUsage(
+	ctx context.Context,
+	service *codebuddyauth.Service,
+	credential *codebuddyauth.Credential,
+) (*oauthUsageSummary, error) {
+	if service == nil || credential == nil {
+		return nil, errors.New("usage: CodeBuddy resource request is unavailable")
+	}
+	usage, err := service.UserResource(ctx, credential)
+	if err != nil {
+		return nil, fmt.Errorf("usage: CodeBuddy resource request failed: %w", err)
+	}
+	return &oauthUsageSummary{
+		Provider:         codebuddyauth.ChannelType,
+		Windows:          []oauthUsageWindow{},
+		CodeBuddyCredits: usage,
+	}, nil
 }
 
 // zaiUsageService reuses the channel's transport so a channel proxy applies to

@@ -8,7 +8,112 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// cancelableResponseWriter 把请求取消传递到下游阻塞写入。
+// 尚未提交时保留下游连接，以便下一渠道继续使用；结束前等待取消回调退出，
+// 防止旧 attempt 的回调影响后续响应。
+type cancelableResponseWriter struct {
+	http.ResponseWriter
+	ctx       context.Context
+	mu        sync.Mutex
+	started   bool
+	writing   atomic.Bool
+	headerErr error // 最近一次 WriteHeader 被取消守卫拒绝的原因；由响应写入协程读写。
+}
+
+func newCancelableResponseWriter(ctx context.Context, target http.ResponseWriter) (*cancelableResponseWriter, func()) {
+	w := &cancelableResponseWriter{ResponseWriter: target, ctx: ctx}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if !w.started {
+			return
+		}
+		if bridge, ok := target.(*responsesWebsocketBridgeWriter); ok {
+			// Gorilla 的 SetWriteDeadline 不能与 WriteMessage 并发，Close 可以。
+			if w.writing.Load() {
+				_ = bridge.conn.Close()
+			}
+			return
+		}
+		_ = http.NewResponseController(target).SetWriteDeadline(time.Now())
+	})
+	return w, func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
+func (w *cancelableResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *cancelableResponseWriter) startWrite() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := context.Cause(w.ctx); err != nil {
+		return err
+	}
+	w.started = true
+	return nil
+}
+
+func (w *cancelableResponseWriter) WriteHeader(status int) {
+	w.headerErr = w.startWrite()
+	if w.headerErr == nil {
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *cancelableResponseWriter) Write(p []byte) (int, error) {
+	w.writing.Store(true)
+	defer w.writing.Store(false)
+	if err := w.startWrite(); err != nil {
+		return 0, err
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *cancelableResponseWriter) Flush() {
+	if w.startWrite() == nil {
+		_ = http.NewResponseController(w.ResponseWriter).Flush()
+	}
+}
+
+func (w *cancelableResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// disableResponseWriteTimeout 不能覆盖取消回调已设置的截止时间。
+	if err := context.Cause(w.ctx); err != nil {
+		return err
+	}
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
+}
+
+// responseHeaderWriteError 在 WriteHeader 返回后读取实际写头结果。
+// 不能读取当前取消状态：写头成功后发生的取消不应撤销提交。
+func responseHeaderWriteError(w http.ResponseWriter) error {
+	for range 8 { // 防御异常包装链导致的无限循环
+		if cw, ok := w.(*cancelableResponseWriter); ok {
+			return cw.headerErr
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		next := unwrapper.Unwrap()
+		if next == nil {
+			return nil
+		}
+		w = next
+	}
+	return nil
+}
 
 const maxSSEEventBytes = 50 * 1024 * 1024
 
@@ -39,14 +144,21 @@ type streamReadStats struct {
 	totalBytes         int64
 	firstByteSec       float64 // 上游首个有效事件耗时（秒），用于首字超时控制
 	clientFirstByteSec float64 // 首个客户端可见事件耗时（秒），用于实时状态和日志
+	lastReadSec        float64 // 从本次请求开始到上游最近一次读取数据的耗时（秒）
+	lastWriteSec       float64 // 从本次请求开始到下游最近一次写入数据的耗时（秒）
+	lastFlushSec       float64 // 从本次请求开始到下游最近一次Flush的耗时（秒）
+	downstreamBytes    int64   // 实际写入下游的字节数（不含仅缓冲在网关内的数据）
+	downstreamWrites   int     // 下游实际写入调用次数（用于区分未写出与零字节响应）
+	downstreamFlushes  int     // 下游实际Flush调用次数
 }
 
 // firstByteDetector 检测首字节读取时间和传输统计的Reader包装器
 type firstByteDetector struct {
 	io.ReadCloser
-	stats       *streamReadStats
-	onFirstRead func()
-	onBytesRead func(int64) // 可选：每次读取后的回调（nil 时不触发）
+	stats        *streamReadStats
+	requestStart time.Time
+	onFirstRead  func()
+	onBytesRead  func(int64) // 可选：每次读取后的回调（nil 时不触发）
 }
 
 // Read 实现io.Reader接口，记录读取统计
@@ -57,6 +169,7 @@ func (r *firstByteDetector) Read(p []byte) (n int, err error) {
 		if r.stats != nil {
 			r.stats.readCount++
 			r.stats.totalBytes += int64(n)
+			r.stats.lastReadSec = streamElapsedSeconds(r.requestStart)
 		}
 		// 触发首次读取回调
 		if r.onFirstRead != nil {
@@ -69,6 +182,71 @@ func (r *firstByteDetector) Read(p []byte) (n int, err error) {
 		}
 	}
 	return
+}
+
+// streamResponseWriter 记录实际写到客户端的流量及时间。
+// 它只包裹流式响应路径；数据仍由底层 ResponseWriter 原样写出，不缓存、不记录正文。
+type streamResponseWriter struct {
+	target       http.ResponseWriter
+	stats        *streamReadStats
+	requestStart time.Time
+}
+
+func newStreamResponseWriter(target http.ResponseWriter, stats *streamReadStats, requestStart time.Time) *streamResponseWriter {
+	return &streamResponseWriter{target: target, stats: stats, requestStart: requestStart}
+}
+
+func wrapStreamResponseWriter(target http.ResponseWriter, stats *streamReadStats, requestStart time.Time) http.ResponseWriter {
+	if target == nil {
+		return nil
+	}
+	if _, ok := target.(*streamResponseWriter); ok {
+		return target
+	}
+	return newStreamResponseWriter(target, stats, requestStart)
+}
+
+func (w *streamResponseWriter) Header() http.Header {
+	return w.target.Header()
+}
+
+func (w *streamResponseWriter) WriteHeader(statusCode int) {
+	w.target.WriteHeader(statusCode)
+}
+
+func (w *streamResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.target.Write(p)
+	if w.stats != nil && n > 0 {
+		w.stats.downstreamWrites++
+		w.stats.downstreamBytes += int64(n)
+		w.stats.lastWriteSec = streamElapsedSeconds(w.requestStart)
+	}
+	return n, err
+}
+
+func (w *streamResponseWriter) Flush() {
+	flusher, ok := w.target.(http.Flusher)
+	if !ok {
+		return
+	}
+	flusher.Flush()
+	if w.stats != nil {
+		w.stats.downstreamFlushes++
+		w.stats.lastFlushSec = streamElapsedSeconds(w.requestStart)
+	}
+}
+
+// Unwrap lets http.ResponseController reach the original writer for deadlines
+// and other optional ResponseWriter capabilities.
+func (w *streamResponseWriter) Unwrap() http.ResponseWriter {
+	return w.target
+}
+
+func streamElapsedSeconds(requestStart time.Time) float64 {
+	if requestStart.IsZero() {
+		return 0
+	}
+	return positiveDuration(time.Since(requestStart)).Seconds()
 }
 
 // ============================================================================
@@ -211,6 +389,9 @@ func (w *deferredResponseWriter) Commit() error {
 		status = http.StatusOK
 	}
 	w.target.WriteHeader(status)
+	if err := responseHeaderWriteError(w.target); err != nil {
+		return err
+	}
 	w.committed = true
 	if w.buffer.Len() > 0 {
 		if _, err := w.target.Write(w.buffer.Bytes()); err != nil {

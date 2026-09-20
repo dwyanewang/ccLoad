@@ -154,6 +154,11 @@ func TestPostgres(t *testing.T) {
 	env := setupPostgresEnv(t)
 	ctx := context.Background()
 
+	t.Run("SequentialKeyPriorities", func(t *testing.T) {
+		cleanupPostgresTables(t, env.db)
+		testSequentialKeyPrioritiesMigration(t, env.db, DialectPostgres)
+	})
+
 	t.Run("FullMigration", func(t *testing.T) {
 		cleanupPostgresTables(t, env.db)
 
@@ -171,6 +176,18 @@ func TestPostgres(t *testing.T) {
 			}
 			t.Logf("表 %s 存在（行数: %d）", table, count)
 		}
+	})
+
+	t.Run("OAuthQuotaRounding", func(t *testing.T) {
+		cleanupPostgresTables(t, env.db)
+
+		store, err := CreatePostgresStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatalf("CreatePostgresStore 失败: %v", err)
+		}
+		defer func() { _ = store.Close() }()
+
+		assertOAuthQuotaRoundingMatchesGo(t, store)
 	})
 
 	t.Run("StructuredChannelURLs", func(t *testing.T) {
@@ -277,7 +294,7 @@ func TestPostgres(t *testing.T) {
 		} {
 			checkCol("auth_tokens", col)
 		}
-		for _, col := range []string{"allowed_models", "model_scope_empty"} {
+		for _, col := range []string{"allowed_models", "model_scope_empty", "priority"} {
 			checkCol("api_keys", col)
 		}
 		for _, col := range []string{"daily_cost_limit", "scheduled_check_model", "cost_multiplier"} {

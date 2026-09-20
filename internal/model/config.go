@@ -22,6 +22,7 @@ const (
 	AuthTypeZAIOAuth         = "zai_oauth"
 	AuthTypeCursorOAuth      = "cursor_oauth"
 	AuthTypeZedOAuth         = "zed_oauth"
+	AuthTypeCodeBuddyOAuth   = "codebuddy_oauth"
 
 	// ProtocolTransformModeAuto tries the client protocol first, then falls back through
 	// Anthropic, OpenAI, Codex, Gemini while skipping the native protocol already attempted.
@@ -54,9 +55,30 @@ func NormalizeAuthType(value string) string {
 		return AuthTypeCursorOAuth
 	case AuthTypeZedOAuth:
 		return AuthTypeZedOAuth
+	case AuthTypeCodeBuddyOAuth:
+		return AuthTypeCodeBuddyOAuth
 	default:
 		return ""
 	}
+}
+
+// TracksQuotaCost 报告该认证方式是否按令牌窗口累计标准成本。
+//
+// 唯一真值表：凭证层（决定是否解码/写回 quota_cost_usage）与存储层（决定事务里
+// 是否对账日志成本）必须读同一份。两边各写一份 switch 的话，新增提供商漏改任一
+// 侧都不会报错，只会让管理端的标准成本静默变成 0。
+func TracksQuotaCost(authType string) bool {
+	switch NormalizeAuthType(authType) {
+	case AuthTypeCodexOAuth, AuthTypeAnthropicOAuth, AuthTypeAntigravityOAuth, AuthTypeXAIOAuth:
+		return true
+	default:
+		return false
+	}
+}
+
+// UsesCodeBuddyOAuth reports whether this channel uses CodeBuddy credentials.
+func (c *Config) UsesCodeBuddyOAuth() bool {
+	return c != nil && c.GetAuthType() == AuthTypeCodeBuddyOAuth
 }
 
 // NormalizeProtocolTransformMode normalizes persisted/admin values.
@@ -482,18 +504,22 @@ type ChannelInfo struct {
 
 // Config 渠道配置
 type Config struct {
-	ID                    int64       `json:"id"`
-	Name                  string      `json:"name"`
-	AuthType              string      `json:"auth_type"`
-	Websockets            bool        `json:"websockets,omitempty"`
-	ProtocolTransformMode string      `json:"protocol_transform_mode"`
-	URLs                  ChannelURLs `json:"urls"`
-	Priority              int         `json:"priority"`
-	RPMLimit              int         `json:"rpm_limit"`       // 每分钟请求数限制，0表示无限制
-	MaxConcurrency        int         `json:"max_concurrency"` // 最大并发请求数，0表示无限制
-	Enabled               bool        `json:"enabled"`
-	ScheduledCheckEnabled bool        `json:"scheduled_check_enabled"`
-	ScheduledCheckModel   string      `json:"scheduled_check_model"`
+	// AntigravityCredits is request-local; never accepted or persisted by admin APIs.
+	AntigravityCredits            bool        `json:"-"`
+	ID                            int64       `json:"id"`
+	Name                          string      `json:"name"`
+	AuthType                      string      `json:"auth_type"`
+	Websockets                    bool        `json:"websockets,omitempty"`
+	ProtocolTransformMode         string      `json:"protocol_transform_mode"`
+	URLs                          ChannelURLs `json:"urls"`
+	Priority                      int         `json:"priority"`
+	RPMLimit                      int         `json:"rpm_limit"`       // 每分钟请求数限制，0表示无限制
+	MaxConcurrency                int         `json:"max_concurrency"` // 最大并发请求数，0表示无限制
+	Enabled                       bool        `json:"enabled"`
+	ScheduledCheckEnabled         bool        `json:"scheduled_check_enabled"`
+	ScheduledCheckModel           string      `json:"scheduled_check_model"`
+	ScheduledCheckIntervalMinutes int         `json:"scheduled_check_interval_minutes"`
+	ScheduledCheckStartTime       string      `json:"scheduled_check_start_time"`
 
 	// 模型配置（统一管理模型和重定向）
 	ModelEntries []ModelEntry `json:"models"`
@@ -559,39 +585,42 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	dst := &Config{
-		ID:                      c.ID,
-		Name:                    c.Name,
-		AuthType:                c.AuthType,
-		Websockets:              c.Websockets,
-		ProtocolTransformMode:   c.ProtocolTransformMode,
-		URLs:                    c.URLs.Clone(),
-		Priority:                c.Priority,
-		RPMLimit:                c.RPMLimit,
-		MaxConcurrency:          c.MaxConcurrency,
-		Enabled:                 c.Enabled,
-		ScheduledCheckEnabled:   c.ScheduledCheckEnabled,
-		ScheduledCheckModel:     c.ScheduledCheckModel,
-		CooldownUntil:           c.CooldownUntil,
-		CooldownDurationMs:      c.CooldownDurationMs,
-		DailyCostLimit:          c.DailyCostLimit,
-		CostMultiplier:          c.CostMultiplier,
-		CustomRequestRules:      c.CustomRequestRules.Clone(),
-		CooldownDetectionRules:  c.CooldownDetectionRules.Clone(),
-		ProxyURL:                c.ProxyURL,
-		AvailableTimeStart:      c.AvailableTimeStart,
-		AvailableTimeEnd:        c.AvailableTimeEnd,
-		RetryOtherKeysOnFailure: c.RetryOtherKeysOnFailure,
-		OAuthCredential:         c.OAuthCredential,
-		CodexAccessToken:        c.CodexAccessToken,
-		CodexAccountID:          c.CodexAccountID,
-		CodexAccountFedRAMP:     c.CodexAccountFedRAMP,
-		AntigravityAccessToken:  c.AntigravityAccessToken,
-		AntigravityProjectID:    c.AntigravityProjectID,
-		ZAIDeviceID:             c.ZAIDeviceID,
-		CreatedAt:               c.CreatedAt,
-		UpdatedAt:               c.UpdatedAt,
-		KeyCount:                c.KeyCount,
-		CooldownFallback:        c.CooldownFallback,
+		AntigravityCredits:            c.AntigravityCredits,
+		ID:                            c.ID,
+		Name:                          c.Name,
+		AuthType:                      c.AuthType,
+		Websockets:                    c.Websockets,
+		ProtocolTransformMode:         c.ProtocolTransformMode,
+		URLs:                          c.URLs.Clone(),
+		Priority:                      c.Priority,
+		RPMLimit:                      c.RPMLimit,
+		MaxConcurrency:                c.MaxConcurrency,
+		Enabled:                       c.Enabled,
+		ScheduledCheckEnabled:         c.ScheduledCheckEnabled,
+		ScheduledCheckModel:           c.ScheduledCheckModel,
+		ScheduledCheckIntervalMinutes: c.ScheduledCheckIntervalMinutes,
+		ScheduledCheckStartTime:       c.ScheduledCheckStartTime,
+		CooldownUntil:                 c.CooldownUntil,
+		CooldownDurationMs:            c.CooldownDurationMs,
+		DailyCostLimit:                c.DailyCostLimit,
+		CostMultiplier:                c.CostMultiplier,
+		CustomRequestRules:            c.CustomRequestRules.Clone(),
+		CooldownDetectionRules:        c.CooldownDetectionRules.Clone(),
+		ProxyURL:                      c.ProxyURL,
+		AvailableTimeStart:            c.AvailableTimeStart,
+		AvailableTimeEnd:              c.AvailableTimeEnd,
+		RetryOtherKeysOnFailure:       c.RetryOtherKeysOnFailure,
+		OAuthCredential:               c.OAuthCredential,
+		CodexAccessToken:              c.CodexAccessToken,
+		CodexAccountID:                c.CodexAccountID,
+		CodexAccountFedRAMP:           c.CodexAccountFedRAMP,
+		AntigravityAccessToken:        c.AntigravityAccessToken,
+		AntigravityProjectID:          c.AntigravityProjectID,
+		ZAIDeviceID:                   c.ZAIDeviceID,
+		CreatedAt:                     c.CreatedAt,
+		UpdatedAt:                     c.UpdatedAt,
+		KeyCount:                      c.KeyCount,
+		CooldownFallback:              c.CooldownFallback,
 	}
 	if c.ModelEntries != nil {
 		dst.ModelEntries = make([]ModelEntry, len(c.ModelEntries))
@@ -831,7 +860,8 @@ type APIKey struct {
 	AllowedModels   []string `json:"allowed_models,omitempty"`    // 空表示该 Key 不限制模型
 	ModelScopeEmpty bool     `json:"model_scope_empty,omitempty"` // true 表示该 Key 当前不允许任何模型
 
-	KeyStrategy string `json:"key_strategy"` // "sequential" | "round_robin"
+	Priority    int    `json:"priority"`     // 数值越大越优先，仅在渠道内比较
+	KeyStrategy string `json:"key_strategy"` // 历史配置字段，保留读写；同优先级统一轮询
 	Disabled    bool   `json:"disabled"`
 
 	// 成本倍率：api_key 渠道的权威倍率存在每条 Key 上（OAuth 渠道仍用 Config.CostMultiplier）。

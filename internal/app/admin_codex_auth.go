@@ -34,26 +34,23 @@ const (
 
 // 导入凭证和模型获取必须共享这一份 Codex 模型目录，并按订阅计划过滤。
 var codexOAuthDefaultModels = []string{
+	"gpt-6-astra",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
 	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.4-mini",
-	"gpt-5.3-codex-spark",
 	"codex-auto-review",
 	"gpt-image-1.5",
 	"gpt-image-2",
+	"gpt-image-2.5",
+	"gpt-image-2.5-flare",
+	"gpt-image-2.5-sunburst",
 }
 
 var codexOAuthExcludedModelsByPlan = map[string]map[string]struct{}{
 	"free": {
-		"gpt-5.6-sol":         {},
-		"gpt-5.4":             {},
-		"gpt-5.3-codex-spark": {},
-	},
-	"team": {
-		"gpt-5.3-codex-spark": {},
+		"gpt-6-astra": {},
+		"gpt-5.6-sol": {},
 	},
 }
 
@@ -677,10 +674,22 @@ func updateExistingCodexChannel(
 		// Quota snapshots are channel runtime state. Reauthorization replaces
 		// secrets, but must neither erase that state nor lose the new credential
 		// when a concurrent quota sample wins the first CAS.
-		next.PassiveUsage = codexauth.ClonePassiveUsage(current.PassiveUsage)
-		next.OAuthUsage = append([]byte(nil), current.OAuthUsage...)
-		next.QuotaCostUsage = oauthcost.Clone(current.QuotaCostUsage)
-		next.QuotaOverdraft = codexauth.CloneQuotaOverdraft(current.QuotaOverdraft)
+		//
+		// Plan tier change (e.g. team→free) invalidates accumulated cost: the
+		// old cost was counted against a different upstream limit, and keeping
+		// it produces nonsensical estimates. Clear all quota state so the next
+		// upstream sample bootstraps fresh windows under the new plan.
+		planTierChanged := codexOAuthPlanTier(current.PlanType) != codexOAuthPlanTier(credential.PlanType) &&
+			credential.PlanType != ""
+		if planTierChanged {
+			next.PassiveUsage = nil
+			next.OAuthUsage = nil
+			next.QuotaCostUsage = nil
+		} else {
+			next.PassiveUsage = codexauth.ClonePassiveUsage(current.PassiveUsage)
+			next.OAuthUsage = append([]byte(nil), current.OAuthUsage...)
+			next.QuotaCostUsage = oauthcost.Clone(current.QuotaCostUsage)
+		}
 		if next.Email == "" {
 			next.Email = current.Email
 		}
@@ -698,11 +707,6 @@ func updateExistingCodexChannel(
 			return nil, false, err
 		}
 		if credentialUpdated {
-			if _, err := persistCodexModelState(
-				ctx, store, currentCfg, current.PlanType, next, nextJSON,
-			); err != nil {
-				return nil, false, err
-			}
 			if err := store.ResetChannelCooldown(ctx, currentCfg.ID); err != nil {
 				return nil, false, fmt.Errorf("clear Codex channel cooldown after reauthorization: %w", err)
 			}
@@ -765,63 +769,6 @@ func findCodexOAuthChannel(
 	return nil, nil, codexIdentityNone
 }
 
-func persistCodexModelState(
-	ctx context.Context,
-	store storage.Store,
-	cfg *model.Config,
-	previousPlanType string,
-	credential *codexauth.Credential,
-	credentialJSON string,
-) (*codexauth.Credential, error) {
-	models := reconcileCodexOAuthModelEntries(cfg.ModelEntries, previousPlanType, credential.PlanType)
-	scheduledCheckModel := cfg.ScheduledCheckModel
-	if !codexOAuthModelAllowed(scheduledCheckModel, credential.PlanType) {
-		scheduledCheckModel = ""
-	}
-	updated, err := store.UpdateOAuthModelStateIfCredentialMatches(
-		ctx, cfg.ID, model.AuthTypeCodexOAuth, credentialJSON, models, scheduledCheckModel,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("reconcile Codex models for plan %q: %w", credential.PlanType, err)
-	}
-	if updated {
-		return credential, nil
-	}
-	winnerCfg, err := store.GetConfig(ctx, cfg.ID)
-	if err != nil {
-		return nil, fmt.Errorf("reload Codex winner for model reconciliation: %w", err)
-	}
-	winner, err := codexauth.ParseCredential([]byte(winnerCfg.OAuthCredential))
-	if err != nil {
-		return nil, fmt.Errorf("parse Codex winner for model reconciliation: %w", err)
-	}
-	return applyCodexWinnerModelState(ctx, store, winnerCfg, previousPlanType, winner)
-}
-
-func applyCodexWinnerModelState(
-	ctx context.Context,
-	store storage.Store,
-	cfg *model.Config,
-	previousPlanType string,
-	credential *codexauth.Credential,
-) (*codexauth.Credential, error) {
-	models := reconcileCodexOAuthModelEntries(cfg.ModelEntries, previousPlanType, credential.PlanType)
-	scheduledCheckModel := cfg.ScheduledCheckModel
-	if !codexOAuthModelAllowed(scheduledCheckModel, credential.PlanType) {
-		scheduledCheckModel = ""
-	}
-	updated, err := store.UpdateOAuthModelStateIfCredentialMatches(
-		ctx, cfg.ID, model.AuthTypeCodexOAuth, cfg.OAuthCredential, models, scheduledCheckModel,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("repair Codex models for winning plan %q: %w", credential.PlanType, err)
-	}
-	if !updated {
-		return nil, errors.New("codex credential changed during model reconciliation")
-	}
-	return credential, nil
-}
-
 func newCodexOAuthChannel(name, credentialJSON, planType string) *model.Config {
 	return &model.Config{
 		Name: name, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
@@ -836,7 +783,7 @@ func codexOAuthPlanTier(planType string) string {
 	switch strings.ToLower(strings.TrimSpace(planType)) {
 	case "free":
 		return "free"
-	case "team", "business", "go":
+	case "team", "business", "go", "self_serve_business_prolite":
 		return "team"
 	case "plus":
 		return "plus"
@@ -871,47 +818,6 @@ func codexOAuthModelEntries(planType string) []model.ModelEntry {
 	}
 	sortOAuthModelEntries(entries)
 	return entries
-}
-
-func filterCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
-	filtered := make([]model.ModelEntry, 0, len(entries))
-	for _, entry := range entries {
-		if codexOAuthModelAllowed(entry.Model, planType) {
-			filtered = append(filtered, entry)
-		}
-	}
-	return filtered
-}
-
-func mergeCodexOAuthModelEntries(entries []model.ModelEntry, planType string) []model.ModelEntry {
-	existing := make(map[string]model.ModelEntry, len(entries))
-	for _, entry := range entries {
-		existing[entry.Model] = entry
-	}
-	models := codexOAuthModelEntries(planType)
-	for i := range models {
-		if entry, ok := existing[models[i].Model]; ok {
-			models[i] = entry
-		}
-	}
-	return models
-}
-
-func reconcileCodexOAuthModelEntries(entries []model.ModelEntry, previousPlanType, planType string) []model.ModelEntry {
-	models := filterCodexOAuthModelEntries(entries, planType)
-	if hasWildcardCodexModel(entries) || codexOAuthPlanTier(previousPlanType) != codexOAuthPlanTier(planType) || len(models) == 0 {
-		return mergeCodexOAuthModelEntries(entries, planType)
-	}
-	return models
-}
-
-func hasWildcardCodexModel(entries []model.ModelEntry) bool {
-	for _, entry := range entries {
-		if strings.TrimSpace(entry.Model) == "*" {
-			return true
-		}
-	}
-	return false
 }
 
 type codexIdentityMatch uint8

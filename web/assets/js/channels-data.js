@@ -1,3 +1,5 @@
+let channelsLoadSequence = 0;
+
 function buildChannelsListParams() {
   const params = new URLSearchParams();
   if (filters.search) {
@@ -18,17 +20,23 @@ function buildChannelsListParams() {
 }
 
 async function loadChannels(options = {}) {
+  const loadSequence = ++channelsLoadSequence;
+  const usageStates = typeof snapshotOAuthUsageStates === 'function' ? snapshotOAuthUsageStates() : null;
   try {
     const params = buildChannelsListParams();
     const listBase = channelsReadURL('/admin/channels', '/dashboard/channels');
     params.set('range', channelStatsRange);
     const url = listBase + '?' + params.toString();
     const resp = await fetchAPIWithAuth(url);
+    if (loadSequence !== channelsLoadSequence) return;
     if (!resp.success) {
       throw new Error(resp.error || window.t('channels.loadChannelsFailed'));
     }
 
     channels = Array.isArray(resp.data) ? resp.data : [];
+    if (typeof syncOAuthUsageFromChannels === 'function') {
+      syncOAuthUsageFromChannels(channels, usageStates);
+    }
     channelsTotalCount = Number.isFinite(resp.count) ? resp.count : channels.length;
     channelsTotalPages = Math.max(1, Math.ceil(channelsTotalCount / channelsPageSize));
 
@@ -45,10 +53,11 @@ async function loadChannels(options = {}) {
     if (typeof updateChannelsPagination === 'function') {
       updateChannelsPagination();
     }
-    if (typeof maybeAutoRefreshActiveChannelUsage === 'function') {
+    if (options.refreshUsage !== false && typeof maybeAutoRefreshActiveChannelUsage === 'function') {
       void maybeAutoRefreshActiveChannelUsage(channels.map(channel => channel.id));
     }
   } catch (e) {
+    if (loadSequence !== channelsLoadSequence) return;
     console.error('Failed to load channels', e);
     if (options.throwOnError) throw e;
     if (window.showError) window.showError(window.t('channels.loadChannelsFailed'));
@@ -228,18 +237,6 @@ function toPositiveNumber(value) {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return 0;
   return num;
-}
-
-// 加载默认测试内容（从系统设置）
-async function loadDefaultTestContent() {
-  try {
-    const setting = await fetchDataWithAuth('/admin/settings/channel_test_content');
-    if (setting && setting.value) {
-      defaultTestContent = setting.value;
-    }
-  } catch (e) {
-    console.warn('Failed to load default test content, using built-in default', e);
-  }
 }
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -22,11 +22,13 @@ import (
 
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codebuddyauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/testutil"
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
@@ -38,6 +40,120 @@ import (
 )
 
 const antigravityCapacityBodyForAdminTest = `{"error":{"code":503,"message":"No capacity available for model gemini-3-flash on the server","status":"UNAVAILABLE","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"error_number":"2010","model":"gemini-3-flash"}}]}}`
+
+func TestCodeBuddySystemSensitiveWordsOnWire(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled=%v", enabled), func(t *testing.T) {
+			t.Parallel()
+			messages := []map[string]any{
+				{"role": "system", "content": "Claude API"},
+				{"role": "developer", "content": []any{map[string]any{"type": "text", "text": "claude API"}}},
+				{"role": "user", "content": "Claude API"},
+				{"role": "assistant", "content": "Claude API", "tool_calls": []any{map[string]any{"id": "call-1", "type": "function", "function": map[string]any{"name": "API", "arguments": `{"text":"Claude"}`}}}},
+				{"role": "tool", "tool_call_id": "call-1", "content": "Claude API"},
+			}
+			raw, err := json.Marshal(messages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					Messages []map[string]any `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				var want []map[string]any
+				if err := json.Unmarshal(raw, &want); err != nil {
+					t.Error(err)
+				}
+				if enabled {
+					want[0]["content"] = "C\u200blaude A\u200bPI"
+					want[1]["content"].([]any)[0].(map[string]any)["text"] = "c\u200blaude A\u200bPI"
+				}
+				if !reflect.DeepEqual(request.Messages, want) {
+					t.Errorf("wire messages = %+v, want %+v", request.Messages, want)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+			}))
+			defer upstream.Close()
+			srv := newInMemoryServer(t)
+			srv.antigravityPromptMatcher = nil
+			if enabled {
+				srv.antigravityPromptMatcher = buildAntigravitySensitiveWordMatcher([]string{"Claude", "API"})
+			}
+			credential, _ := (&codebuddyauth.Credential{AccessToken: "access"}).JSON()
+			cfg := newCodeBuddyChannel("CodeBuddy", credential)
+			cfg.URLs[0].URL = upstream.URL + "/v2/chat/completions"
+			cfg.CustomRequestRules = &model.CustomRequestRules{Body: []model.CustomBodyRule{{Action: model.RuleActionOverride, Path: "messages", Value: raw}}}
+			result := srv.testChannelAPI(context.Background(), cfg, "access", &testutil.TestChannelRequest{Model: "hy3", ClientProtocol: "openai", Content: "test"})
+			if result["success"] != true {
+				t.Fatalf("test failed: %+v", result)
+			}
+		})
+	}
+}
+
+func TestCodeBuddyAdminWireAndTemplateCompatibility(t *testing.T) {
+	for _, effort := range []string{"", "low", "none", "high"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("effort=%s/stream=%v", effort, stream), func(t *testing.T) {
+				t.Parallel()
+				upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, _ := io.ReadAll(r.Body)
+					if !gjson.GetBytes(body, "stream").Bool() {
+						t.Error("admin upstream not streaming")
+					}
+					actual := gjson.GetBytes(body, "reasoning_effort").String()
+					want := effort
+					if want == "" {
+						want = "high"
+					}
+					if actual != want {
+						t.Errorf("effort=%q want=%q body=%s", actual, want, body)
+					}
+					messages := gjson.GetBytes(body, "messages").Array()
+					if len(messages) == 0 {
+						t.Error("missing messages")
+					}
+					if role := messages[0].Get("role").String(); role != "system" {
+						t.Errorf("first message role = %q, want system", role)
+					}
+					if prompt := messages[0].Get("content").String(); prompt != codeBuddyDefaultSystemPrompt {
+						t.Errorf("default system prompt = %q, want %q", prompt, codeBuddyDefaultSystemPrompt)
+					}
+					var texts []string
+					for _, message := range messages {
+						texts = append(texts, message.Get("content").String())
+					}
+					joined := strings.Join(texts, "\n")
+					if !strings.Contains(joined, "official CLI tool for Claude.") || !strings.Contains(joined, "Default branch (you will usually use this for PRs)") {
+						t.Errorf("template not rewritten: %s", body)
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"id\":\"c\",\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+				}))
+				defer upstream.Close()
+				srv := newInMemoryServer(t)
+				credential, _ := (&codebuddyauth.Credential{AccessToken: "access", RefreshToken: "refresh"}).JSON()
+				cfg := newCodeBuddyChannel("CodeBuddy", credential)
+				cfg.URLs[0].URL = upstream.URL + "/v2/chat/completions"
+				if effort != "" {
+					cfg.CustomRequestRules = &model.CustomRequestRules{Body: []model.CustomBodyRule{{Action: model.RuleActionOverride, Path: "reasoning_effort", Value: json.RawMessage(fmt.Sprintf("%q", effort))}}}
+				}
+				result := srv.testChannelAPI(context.Background(), cfg, "access", &testutil.TestChannelRequest{Model: "hy3", ClientProtocol: "openai", Stream: stream, Content: "You are Claude Code, Anthropic's official CLI for Claude.\nMain branch (you will usually use this for PRs)"})
+				if result["success"] != true {
+					t.Fatalf("test failed: %+v", result)
+				}
+				headers, _ := result["upstream_request_headers"].(map[string]string)
+				if headers["X-Refresh-Token"] == "refresh" {
+					t.Error("refresh token leaked in debug response")
+				}
+			})
+		}
+	}
+}
 
 func createCodexOAuthChannelForAdminTest(t testing.TB, srv *Server, upstreamURL string) *model.Config {
 	t.Helper()
@@ -1081,6 +1197,72 @@ func TestOAuthCredentialRefreshTrackerOwnsDetachedRefreshLifetime(t *testing.T) 
 	timeoutDone()
 }
 
+func TestOAuthDetectionPersistsUsageAndCost(t *testing.T) {
+	for _, mode := range []string{"manual", "manual-stream", "chat-stream", "scheduled"} {
+		t.Run(mode, func(t *testing.T) {
+			resetAt := time.Now().Add(time.Hour).Unix()
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(anthropicRateLimit5hStatus, "allowed")
+				w.Header().Set(anthropicRateLimit5hUtilization, "0.42")
+				w.Header().Set(anthropicRateLimit5hReset, strconv.FormatInt(resetAt, 10))
+				if strings.HasSuffix(mode, "-stream") {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-test\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":1000,\"output_tokens\":0}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":100}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"msg-test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-5","stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":100}}`)
+			}))
+			srv := newInMemoryServer(t)
+			cfg := createAnthropicOAuthChannelForAdminTest(t, srv, upstream.URL)
+			var previousCost int64
+			for i := 0; i < 2; i++ {
+				if mode == "scheduled" {
+					srv.runScheduledChannelCheck(context.Background(), cfg, nil, "hello")
+				} else {
+					recorder := httptest.NewRecorder()
+					c, _ := gin.CreateTestContext(recorder)
+					c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(cfg.ID, 10)}}
+					c.Request = httptest.NewRequest(http.MethodPost, "/admin/channels/1/test", strings.NewReader(fmt.Sprintf(`{"model":"claude-sonnet-4-5","client_protocol":"anthropic","stream":%t}`, strings.HasSuffix(mode, "-stream"))))
+					c.Request.Header.Set("Content-Type", "application/json")
+					if mode == "chat-stream" {
+						srv.HandleChannelChat(c)
+					} else {
+						srv.HandleChannelTest(c)
+						var response struct {
+							Data struct {
+								Success bool `json:"success"`
+							} `json:"data"`
+						}
+						if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || !response.Data.Success {
+							t.Fatalf("test response: %s, error: %v", recorder.Body.String(), err)
+						}
+					}
+				}
+				stored, err := srv.store.GetConfig(context.Background(), cfg.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				credential, err := anthropicauth.ParseCredential([]byte(stored.OAuthCredential))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if credential.PassiveUsage == nil || credential.PassiveUsage.FiveHour == nil || credential.PassiveUsage.FiveHour.Utilization == nil || *credential.PassiveUsage.FiveHour.Utilization != 0.42 {
+					t.Fatalf("missing persisted progress: %+v", credential.PassiveUsage)
+				}
+				if credential.QuotaCostUsage == nil || len(credential.QuotaCostUsage.Windows) != 1 {
+					t.Fatalf("missing cost window: %+v", credential.QuotaCostUsage)
+				}
+				cost := credential.QuotaCostUsage.Windows[0].StandardCostMicroUSD
+				if cost <= 0 || (i == 1 && cost != 2*previousCost) {
+					t.Fatalf("cost=%d previous=%d", cost, previousCost)
+				}
+				previousCost = cost
+			}
+		})
+	}
+}
+
 func TestAnthropicOAuthChannelTestDecodesAdvertisedCompression(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		var compressed bytes.Buffer
@@ -1190,9 +1372,9 @@ func TestHandleChannelTest(t *testing.T) {
 	}
 }
 
-func TestChannelTestCodexStopsAfterResponseCompleted(t *testing.T) {
-	streamBody := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\"}}\n\n" +
-		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+func TestChannelTestCodexRepairsMalformedFramesAndStopsAfterResponseCompleted(t *testing.T) {
+	streamBody := []byte("\xef\xbb\xbf : ping\nevent: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\"}}\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n" +
 		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"created_at\":1784768634,\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n")
 
 	tests := []struct {
@@ -2303,11 +2485,13 @@ func TestHandleChannelTest_CodexOAuthWithoutQuotaHeadersLeavesUsageEmpty(t *test
 
 func TestHandleChannelTest_CodexOAuthPersistsQuotaFromSSE(t *testing.T) {
 	const rateLimitEvent = `{"type":"codex.rate_limits","plan_type":"pro","rate_limits":{"allowed":true,"limit_reached":false,"primary":{"used_percent":10,"window_minutes":10080,"reset_after_seconds":571277,"reset_at":1786851417},"secondary":null},"code_review_rate_limits":null,"additional_rate_limits":{"GPT-5.3-Codex-Spark":{"allowed":true,"limit_reached":false,"primary":{"used_percent":0,"window_minutes":10080,"reset_after_seconds":604800,"reset_at":1786884940},"secondary":null}},"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"promo":null}`
+	resetAt := time.Now().Add(24 * time.Hour).Unix()
+	currentRateLimitEvent := strings.NewReplacer("1786851417", strconv.FormatInt(resetAt, 10), "1786884940", strconv.FormatInt(resetAt, 10)).Replace(rateLimitEvent)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: "+rateLimitEvent+"\n\n")
+		_, _ = io.WriteString(w, "data: "+currentRateLimitEvent+"\n\n")
 		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
-		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_admin\",\"status\":\"completed\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_admin\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":100}}}\n\n")
 	}))
 
 	srv := newInMemoryServer(t)
@@ -2328,38 +2512,160 @@ func TestHandleChannelTest_CodexOAuthPersistsQuotaFromSSE(t *testing.T) {
 	if success, _ := response.Data["success"].(bool); !response.Success || !success {
 		t.Fatalf("Codex OAuth channel test failed: %+v", response)
 	}
-	if raw, _ := response.Data["raw_response"].(string); !strings.Contains(raw, rateLimitEvent) {
+	if raw, _ := response.Data["raw_response"].(string); !strings.Contains(raw, currentRateLimitEvent) {
 		t.Fatalf("raw_response lost codex.rate_limits event: %q", raw)
 	}
-	var credential *codexauth.Credential
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		persisted, err := srv.store.GetConfig(context.Background(), created.ID)
-		if err != nil {
-			t.Fatalf("GetConfig: %v", err)
+	persisted, err := srv.store.GetConfig(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.PassiveUsage == nil || len(credential.PassiveUsage.Windows) != 2 {
+		t.Fatalf("missing persisted Codex SSE quota: %#v", credential)
+	}
+	if credential.QuotaCostUsage == nil || len(credential.QuotaCostUsage.Windows) != 2 {
+		t.Fatalf("missing cost windows: %+v", credential.QuotaCostUsage)
+	}
+	for _, window := range credential.QuotaCostUsage.Windows {
+		if window.Family == oauthcost.FamilyCodex && window.StandardCostMicroUSD <= 0 {
+			t.Fatalf("first detection cost was lost: %+v", window)
 		}
-		credential, err = codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-		if err != nil {
-			t.Fatalf("ParseCredential: %v", err)
+		if window.Family == oauthcost.FamilySpark && window.StandardCostMicroUSD != 0 {
+			t.Fatalf("non-Spark detection charged Spark window: %+v", window)
 		}
-		if credential.PassiveUsage != nil && len(credential.PassiveUsage.Windows) == 2 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for persisted Codex SSE quota: %#v", credential)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	primary := credential.PassiveUsage.Windows[0]
 	if primary.Scope != "codex" || primary.LimitName != "codex" || primary.Kind != "primary" ||
-		primary.UsedPercent != 10 || primary.LimitWindowSeconds != 10080*60 || primary.ResetAt != 1786851417 {
+		primary.UsedPercent != 10 || primary.LimitWindowSeconds != 10080*60 || primary.ResetAt != resetAt {
 		t.Fatalf("persisted Codex primary SSE quota window = %#v", primary)
 	}
 	additional := credential.PassiveUsage.Windows[1]
 	if additional.Scope != "gpt-5.3-codex-spark" || additional.LimitName != "GPT-5.3-Codex-Spark" ||
 		additional.Kind != "primary" || additional.UsedPercent != 0 ||
-		additional.LimitWindowSeconds != 10080*60 || additional.ResetAt != 1786884940 {
+		additional.LimitWindowSeconds != 10080*60 || additional.ResetAt != resetAt {
 		t.Fatalf("persisted Codex additional SSE quota window = %#v", additional)
+	}
+}
+
+func TestHandleChannelTest_CodexReserveAliasPreservesQuotaCost(t *testing.T) {
+	for _, tc := range []struct {
+		name, active, group, transport string
+		weeklySecondary                bool
+		// Generic reserve fields are sufficient when the active identity is known.
+		noReserveBlock bool
+		// genericResetSkew shifts the generic reset_at away from the named
+		// block so the two are no longer byte-identical.
+		genericResetSkew int64
+	}{
+		{name: "header direct group", active: "gpt-reserve", group: "gpt-reserve", transport: "header"},
+		{name: "header prefixed group", active: "codex_reserve", group: "reserve", transport: "header"},
+		{name: "header limit name", active: "gpt-reserve", group: "reserve", transport: "header"},
+		{name: "header keeps main secondary", active: "gpt-reserve", group: "reserve", transport: "header", weeklySecondary: true},
+		{name: "header active without group headers", active: "gpt-reserve", transport: "header", noReserveBlock: true},
+		{name: "header reserve metered feature", active: "base_model_inference", transport: "header", noReserveBlock: true},
+		{name: "header named reserve overrides generic alias", active: "base_model_inference", group: "reserve", transport: "header", genericResetSkew: 1},
+		{name: "SSE metered limit", active: "gpt-reserve", transport: "sse"},
+		{name: "SSE metered without additional block", active: "gpt-reserve", transport: "sse", noReserveBlock: true},
+		{name: "SSE metered with skewed generic reset", active: "gpt-reserve", transport: "sse", genericResetSkew: 1},
+		{name: "SSE metered by internal codename", active: "codex_bengalfox", transport: "sse"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := time.Now().UTC().Add(-time.Minute)
+			mainReset := base.Add(6 * 24 * time.Hour).Unix()
+			// reserve 刚进入新周期：reset 比主窗口晚约一天，使用率远低于主额度。
+			reserveReset := mainReset + 24*3600
+			mainKind := "primary"
+			mainEvent := fmt.Sprintf(`{"type":"codex.rate_limits","metered_limit_name":"premium","rate_limits":{"primary":{"used_percent":50,"window_minutes":10080,"reset_at":%d}}}`, mainReset)
+			if tc.weeklySecondary {
+				mainKind = "secondary"
+				mainEvent = fmt.Sprintf(`{"type":"codex.rate_limits","metered_limit_name":"premium","rate_limits":{"primary":{"used_percent":20,"window_minutes":300,"reset_at":%d},"secondary":{"used_percent":50,"window_minutes":10080,"reset_at":%d}}}`, base.Add(4*time.Hour).Unix(), mainReset)
+			}
+			reserveBlock := fmt.Sprintf(`,"additional_rate_limits":{"gpt-reserve":{"primary":{"used_percent":8,"window_minutes":10080,"reset_at":%d}}}`, reserveReset)
+			if tc.noReserveBlock {
+				reserveBlock = ""
+			}
+			reserveEvent := fmt.Sprintf(`{"type":"codex.rate_limits","plan_type":"pro","metered_limit_name":%q,"rate_limits":{"primary":{"used_percent":8,"window_minutes":10080,"reset_at":%d},"secondary":null}%s}`, tc.active, reserveReset+tc.genericResetSkew, reserveBlock)
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if tc.transport == "header" {
+					w.Header().Set("X-Codex-Active-Limit", tc.active)
+					w.Header().Set("X-Codex-Primary-Used-Percent", "8")
+					w.Header().Set("X-Codex-Primary-Window-Minutes", "10080")
+					w.Header().Set("X-Codex-Primary-Reset-At", strconv.FormatInt(reserveReset+tc.genericResetSkew, 10))
+					if !tc.noReserveBlock {
+						prefix := "X-Codex-" + tc.group
+						w.Header().Set(prefix+"-Limit-Name", "gpt-reserve")
+						w.Header().Set(prefix+"-Primary-Used-Percent", "8")
+						w.Header().Set(prefix+"-Primary-Window-Minutes", "10080")
+						w.Header().Set(prefix+"-Primary-Reset-At", strconv.FormatInt(reserveReset, 10))
+					}
+					_, _ = io.WriteString(w, "data: "+mainEvent+"\n\n")
+				} else {
+					_, _ = io.WriteString(w, "data: "+reserveEvent+"\n\n")
+				}
+				_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"quota-alias\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":100}}}\n\n")
+			}))
+			defer upstream.Close()
+			srv := newInMemoryServer(t)
+			srv.client = upstream.Client()
+			created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+			summary := &oauthUsageSummary{Provider: "codex", Windows: []oauthUsageWindow{
+				{LimitName: "codex", Kind: mainKind, UsedPercent: 50, RemainingPercent: 50, LimitWindowSeconds: 604800, ResetAt: mainReset, SampledAt: base},
+				{LimitName: "gpt-reserve", Kind: "primary", UsedPercent: 6, RemainingPercent: 94, LimitWindowSeconds: 604800, ResetAt: reserveReset, SampledAt: base},
+			}}
+			if tc.weeklySecondary {
+				summary.Windows = append(summary.Windows, oauthUsageWindow{LimitName: "codex", Kind: "primary", UsedPercent: 20, RemainingPercent: 80, LimitWindowSeconds: 18000, ResetAt: base.Add(4 * time.Hour).Unix(), SampledAt: base})
+			}
+			if _, err := srv.persistOAuthUsage(context.Background(), created, summary, base, base); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.store.AddLog(context.Background(), &model.LogEntry{
+				Time: model.JSONTime{Time: base}, ChannelID: created.ID, Model: "gpt-5.6-sol", StatusCode: http.StatusOK, Cost: 12,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			lastCost := int64(12_000_000)
+			wantReserveUsed := 8.0
+			channelID := strconv.FormatInt(created.ID, 10)
+			for attempt := range 2 {
+				c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+					"model": "gpt-5.6-sol", "client_protocol": "codex", "stream": true,
+				}))
+				c.Params = gin.Params{{Key: "id", Value: channelID}}
+				srv.HandleChannelTest(c)
+				response := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+				if success, _ := response.Data["success"].(bool); w.Code != http.StatusOK || !response.Success || !success {
+					t.Fatalf("detection %d failed: status=%d response=%+v", attempt, w.Code, response)
+				}
+				cfg, err := srv.store.GetConfig(context.Background(), created.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+				if err != nil {
+					t.Fatal(err)
+				}
+				main := oauthcost.Find(credential.QuotaCostUsage, "codex|"+mainKind)
+				if main == nil || main.StandardCostMicroUSD <= lastCost || main.CountFromAt != 0 || main.ResetAt != mainReset || main.SampledUpstreamUsedPercent == nil || *main.SampledUpstreamUsedPercent != 50 {
+					t.Fatalf("unexpected main quota after detection %d: %+v; previous cost=%d", attempt, main, lastCost)
+				}
+				lastCost = main.StandardCostMicroUSD
+				reserve := oauthcost.Find(credential.QuotaCostUsage, "gpt-reserve|primary")
+				if reserve == nil || reserve.StandardCostMicroUSD != 0 || reserve.ResetAt != reserveReset || reserve.SampledUpstreamUsedPercent == nil || *reserve.SampledUpstreamUsedPercent != wantReserveUsed {
+					t.Fatalf("reserve quota = %+v, want used=%g reset=%d", reserve, wantReserveUsed, reserveReset)
+				}
+				if tc.transport == "sse" && credential.PassiveUsage != nil {
+					for _, window := range credential.PassiveUsage.Windows {
+						if strings.EqualFold(window.Scope, "codex") {
+							t.Fatalf("reserve-metered response wrote passive main window: %+v", window)
+						}
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -2858,8 +3164,8 @@ func TestHandleChannelTest_CodexOAuthTransformsOpenAIWithoutSSEContentType(t *te
 		if err != nil {
 			t.Errorf("read upstream body: %v", err)
 		}
-		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
-		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"translated answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"translated answer\"}\n")
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
 	}))
 
@@ -2991,6 +3297,78 @@ func TestHandleChannelTest_UnsupportedModel(t *testing.T) {
 	dataSuccess, _ := resp.Data["success"].(bool)
 	if dataSuccess {
 		t.Fatal("data.success 应为 false（模型不支持）")
+	}
+}
+
+func TestHandleChannelTest_AllowsDisabledConfiguredModel(t *testing.T) {
+	var gotPath string
+	var gotModel string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream body: %v", err)
+		} else {
+			gotModel, _ = body["model"].(string)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-disabled-test","object":"chat.completion","model":"disabled-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	srv.modelFuzzyMatch = true
+	ctx := context.Background()
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name: "disabled-model-test-channel", URLs: model.ChannelURLs{{URL: upstream.URL}}, Priority: 1,
+		ModelEntries: []model.ModelEntry{
+			{Model: "disabled-model", Disabled: true},
+			{Model: "disabled-model-backup"},
+		}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-disabled-test",
+	}}); err != nil {
+		t.Fatalf("添加 API key 失败: %v", err)
+	}
+
+	channelID := fmt.Sprintf("%d", created.ID)
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/test", map[string]any{
+		"model": "disabled-model", "client_protocol": "openai",
+	}))
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelTest(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200, 实际 %d, 响应: %s", w.Code, w.Body.String())
+	}
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if !resp.Success {
+		t.Fatalf("外层 APIResponse.Success 应为 true, error=%q data=%+v", resp.Error, resp.Data)
+	}
+	if success, _ := resp.Data["success"].(bool); !success {
+		t.Fatalf("禁用模型测试应继续执行并成功, data=%+v", resp.Data)
+	}
+	if gotPath != "/v1/chat/completions" || gotModel != "disabled-model" {
+		t.Fatalf("上游请求 path=%q model=%q, want /v1/chat/completions disabled-model", gotPath, gotModel)
+	}
+	persisted, err := srv.store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("读取测试渠道失败: %v", err)
+	}
+	foundDisabled := false
+	for _, entry := range persisted.ModelEntries {
+		if entry.Model == "disabled-model" {
+			foundDisabled = entry.Disabled
+			break
+		}
+	}
+	if !foundDisabled {
+		t.Fatalf("测试不应持久化启用禁用模型: %+v", persisted.ModelEntries)
 	}
 }
 
@@ -3239,7 +3617,7 @@ func TestHandleChannelTest_UsesSelectedCodexProtocolWithBasePathPrefix(t *testin
 	}
 	if gotHeaders.Get("User-Agent") != codexUserAgent ||
 		gotHeaders.Get("Originator") != codexOriginator ||
-		gotHeaders.Get("Version") != codexVersion {
+		gotHeaders.Get("Version") != "" {
 		t.Fatalf("Codex identity headers=%v", gotHeaders)
 	}
 	if got := gotHeaders.Get("X-Codex-Turn-State"); got != "turn-state" {
@@ -5146,7 +5524,10 @@ func TestHandleChannelImageGeneration_CodexOAuthUsesDirectImagesAPI(t *testing.T
 		gotOriginator = r.Header.Get("Originator")
 		gotVersion = r.Header.Get("Version")
 		gotUserAgent = r.Header.Get("User-Agent")
-		gotSessionID = r.Header.Get("Session_id")
+		gotSessionID = r.Header.Get("Session-Id")
+		if r.Header.Get("Session_id") != "" || r.Header.Get("Conversation_id") != "" {
+			t.Errorf("legacy session headers were generated: %v", r.Header)
+		}
 		gotAcceptEncoding = r.Header.Get("Accept-Encoding")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Errorf("decode Codex Images request: %v", err)
@@ -5188,7 +5569,7 @@ func TestHandleChannelImageGeneration_CodexOAuthUsesDirectImagesAPI(t *testing.T
 		t.Fatalf("Codex auth headers: Authorization=%q Account-ID=%q", gotAuthorization, gotAccountID)
 	}
 	if gotOriginator != codexOriginator || gotVersion != codexVersion || gotUserAgent != codexUserAgent || gotSessionID == "" {
-		t.Fatalf("Codex identity headers: Originator=%q Version=%q User-Agent=%q Session_id=%q", gotOriginator, gotVersion, gotUserAgent, gotSessionID)
+		t.Fatalf("Codex identity headers: Originator=%q Version=%q User-Agent=%q Session-Id=%q", gotOriginator, gotVersion, gotUserAgent, gotSessionID)
 	}
 	if gotAcceptEncoding != "identity" {
 		t.Fatalf("Accept-Encoding=%q, want identity", gotAcceptEncoding)
@@ -5206,6 +5587,68 @@ func TestHandleChannelImageGeneration_CodexOAuthUsesDirectImagesAPI(t *testing.T
 	}
 	if response.Data["actual_model"] != "gpt-image-2" || response.Data["tested_key_index"] != float64(cooldown.NoKeyIndex) {
 		t.Fatalf("Codex response routing metadata=%v", response.Data)
+	}
+}
+
+func TestHandleChannelImageGeneration_CodexImage25(t *testing.T) {
+	for _, tc := range []struct {
+		model  string
+		failed bool
+	}{
+		{model: "gpt-image-2.5"},
+		{model: "gpt-image-2.5-flare"},
+		{model: "gpt-image-2.5-sunburst"},
+		{model: "gpt-image-2.5-flare", failed: true},
+	} {
+		imageModel := tc.model
+		t.Run(fmt.Sprintf("%s/failed=%t", imageModel, tc.failed), func(t *testing.T) {
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				if r.URL.Path != "/backend-api/codex/images/generations" || r.Header.Get("Authorization") != "Bearer at-admin-test" {
+					t.Errorf("upstream request: %s %v", r.URL.Path, r.Header)
+				}
+				if gjson.GetBytes(body, "model").String() != imageModel ||
+					gjson.GetBytes(body, "quality").String() != "xhigh" ||
+					gjson.GetBytes(body, "stream").Bool() {
+					t.Errorf("image request: %s", body)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				if tc.failed {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"error":{"code":"invalid_request_error","message":"image generation rejected"}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"data":[{"b64_json":"aW1hZ2U="}],"output_format":"png"}`)
+			}))
+			defer upstream.Close()
+			srv := newInMemoryServer(t)
+			srv.client = upstream.Client()
+			created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+			updated := created.Clone()
+			updated.ModelEntries = []model.ModelEntry{{Model: imageModel}}
+			if _, err := srv.store.UpdateConfig(context.Background(), created.ID, updated); err != nil {
+				t.Fatal(err)
+			}
+			req := newJSONRequest(t, http.MethodPost, fmt.Sprintf("/admin/channels/%d/images/generations", created.ID), map[string]any{
+				"generation_api": "images", "model": "codex/" + imageModel, "prompt": "draw a cat", "quality": "xhigh",
+			})
+			c, w := newTestContext(t, req)
+			c.Params = gin.Params{{Key: "id", Value: fmt.Sprint(created.ID)}}
+			srv.HandleChannelImageGeneration(c)
+			response := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+			if tc.failed {
+				if response.Data["success"] != false || response.Data["error"] != "image generation rejected" {
+					t.Fatalf("upstream error lost: %s", w.Body.String())
+				}
+				return
+			}
+			if w.Code != http.StatusOK || response.Data["success"] != true || response.Data["actual_model"] != imageModel {
+				t.Fatalf("image result: %s", w.Body.String())
+			}
+		})
 	}
 }
 
@@ -5322,11 +5765,8 @@ func TestHandleChannelImageGeneration_AntigravityNoImagePersistsDebugBody(t *tes
 	}))
 	defer upstream.Close()
 
-	srv := newInMemoryServer(t)
+	srv := newInMemoryServerWithSettings(t, map[string]string{"debug_log_enabled": "true"})
 	srv.client = upstream.Client()
-	srv.configService.mu.Lock()
-	srv.configService.cache["debug_log_enabled"] = &model.SystemSetting{Key: "debug_log_enabled", Value: "true"}
-	srv.configService.mu.Unlock()
 	created := createAntigravityOAuthChannelForAdminTest(t, srv, upstream.URL)
 	created.ModelEntries = []model.ModelEntry{{Model: "gemini-3.1-flash-image"}}
 	updated, err := srv.store.UpdateConfig(context.Background(), created.ID, created)
@@ -5533,8 +5973,8 @@ func TestHandleChannelImageGeneration_XAIOAuthGrok46UsesResponsesImageTool(t *te
 			t.Errorf("decode xAI Responses request: %v", err)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"created_at":1770000000,"output":[],"tool_usage":{"image_gen":{"total_tokens":9}}}}`+"\n\n")
-		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"aW1hZ2U=","output_format":"png"}}`+"\n\n")
+		_, _ = io.WriteString(w, `event: response.completed`+"\n"+`data: {"type":"response.completed","response":{"created_at":1770000000,"output":[],"tool_usage":{"image_gen":{"total_tokens":9}}}}`+"\n")
+		_, _ = io.WriteString(w, `event: response.output_item.done`+"\n"+`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","result":"aW1hZ2U=","output_format":"png"}}`+"\n\n")
 	}))
 	defer upstream.Close()
 
@@ -5957,6 +6397,100 @@ func TestBuildTestUpstreamRequestPlanKeepsThinkingSuffixAcrossCodexTransform(t *
 	}
 }
 
+func TestBuildTestUpstreamRequestPlanZedHaikuDoesNotInheritCodexThinkingBudget(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1485, Name: "zed-haiku", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "2025 年 1 月 20 日发生了什么大事？不允许联网", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, testReq.Model,
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	provider := gjson.GetBytes(plan.requestBody, "provider_request")
+	if gjson.GetBytes(plan.requestBody, "provider").String() != "anthropic" {
+		t.Fatalf("provider=%s body=%s", gjson.GetBytes(plan.requestBody, "provider").Raw, plan.requestBody)
+	}
+	system := provider.Get("system").Raw
+	if strings.Contains(system, "You are Codex") {
+		t.Fatalf("Zed Anthropic test inherited Codex tester instructions: %s", plan.requestBody)
+	}
+	if thinking := provider.Get("thinking"); thinking.Exists() {
+		t.Fatalf("openai client test must not inherit Codex template thinking: %s", provider.Raw)
+	}
+}
+
+func TestBuildTestUpstreamRequestPlanZedPreservesThinkingBodyRule(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1487, Name: "zed-haiku-body-rule", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+		CustomRequestRules: &model.CustomRequestRules{Body: []model.CustomBodyRule{{
+			Action: model.RuleActionOverride, Path: "reasoning.effort", Value: json.RawMessage(`"high"`),
+		}}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "hello", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, testReq.Model,
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	thinking := gjson.GetBytes(plan.requestBody, "provider_request.thinking")
+	if thinking.Get("type").String() != "enabled" || thinking.Get("budget_tokens").Int() <= 0 {
+		t.Fatalf("body rule thinking was dropped: %s", plan.requestBody)
+	}
+}
+
+func TestBuildTestUpstreamRequestPlanZedHaikuKeepsExplicitThinkingSuffix(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID: 1486, Name: "zed-haiku-suffix", AuthType: model.AuthTypeZedOAuth,
+		URLs:                  model.ChannelURLs{{URL: "https://cloud.zed.dev/completions#", Exact: true, Protocols: []string{util.ProtocolCodex}}},
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		ModelEntries:          []model.ModelEntry{{Model: "claude-haiku-4-5"}},
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model: "claude-haiku-4-5", Content: "hello", ClientProtocol: util.ProtocolOpenAI,
+	}
+
+	_, plan, err := srv.buildTestUpstreamRequestPlan(
+		cfg, "zed-jwt", testReq, "claude-haiku-4-5(medium)",
+		util.ProtocolOpenAI, util.ProtocolCodex, "https://cloud.zed.dev/completions#",
+	)
+	if err != nil {
+		t.Fatalf("buildTestUpstreamRequestPlan: %v", err)
+	}
+	provider := gjson.GetBytes(plan.requestBody, "provider_request")
+	budget := provider.Get("thinking.budget_tokens").Int()
+	maxTokens := provider.Get("max_tokens").Int()
+	if provider.Get("thinking.type").String() != "enabled" || budget <= 0 {
+		t.Fatalf("explicit thinking suffix missing: %s", provider.Raw)
+	}
+	if maxTokens <= budget {
+		t.Fatalf("max_tokens=%d must be greater than thinking.budget_tokens=%d; body=%s", maxTokens, budget, provider.Raw)
+	}
+	// budget+1 曾经满足 > 检查但只留 1 token 可见输出——收紧到有意义的预算。
+	if visible := maxTokens - budget; visible < 1024 {
+		t.Fatalf("visible output budget=%d is too small (max_tokens=%d budget=%d)", visible, maxTokens, budget)
+	}
+}
+
 func TestChannelTestLogIdentityStripsThinkingSuffix(t *testing.T) {
 	t.Parallel()
 
@@ -6040,10 +6574,10 @@ func TestAdminTestNativeAnthropicDoesNotDoubleAppendHeaderRules(t *testing.T) {
 		apiKey:           "oauth-access",
 		fullURL:          "https://api.anthropic.com/v1/messages",
 		endpointPath:     "/v1/messages",
-		requestBody: []byte(fmt.Sprintf(
+		requestBody: fmt.Appendf(nil,
 			`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`,
 			userID,
-		)),
+		),
 		headers: http.Header{
 			"Accept": {"application/json"}, "Accept-Encoding": {"gzip"}, "Content-Type": {"application/json"},
 			"User-Agent": {"claude-cli/2.1.220 (external, cli)"}, "X-App": {"cli"}, "Anthropic-Beta": {helperBetas},
@@ -6140,7 +6674,7 @@ func TestHandleChannelTestCursorWritesOneManualLogWithDebug(t *testing.T) {
 		t.Fatalf("response=%v", response.Data)
 	}
 	// 等待异步代理日志的完整刷新周期，确保没有迟到的重复记录。
-	time.Sleep(config.LogBatchTimeout + 250*time.Millisecond)
+	time.Sleep(srv.logService.batchTimeout + 250*time.Millisecond)
 	logs, err := srv.store.ListLogs(context.Background(), time.Time{}, 10, 0, &model.LogFilter{LogSource: model.LogSourceAll})
 	if err != nil {
 		t.Fatalf("ListLogs() error = %v", err)

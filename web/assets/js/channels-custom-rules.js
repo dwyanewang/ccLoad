@@ -16,7 +16,7 @@
   const MAX_VALUE_BYTES = 8 * 1024;
   const MAX_NAME = 256;
   const PATH_REGEX = /^[A-Za-z0-9_.\-]+$/;
-  const AUTH_BLACKLIST = new Set(['authorization', 'x-api-key', 'x-goog-api-key']);
+  const AUTH_BLACKLIST = new Set(['authorization', 'x-api-key', 'x-goog-api-key', 'x-refresh-token']);
 
   const HEADER_ACTIONS = ['override', 'append', 'remove'];
   const BODY_ACTIONS = ['override', 'remove'];
@@ -239,9 +239,6 @@
     updateAnyrouterHint();
     if (hasWindow && typeof window.beginCooldownDetectionDraft === 'function') {
       window.beginCooldownDetectionDraft();
-    }
-    if (hasWindow && typeof window.resetCodexQuotaOverdraftDraft === 'function') {
-      window.resetCodexQuotaOverdraftDraft();
     }
     if (hasWindow && typeof window.beginManagementAccountDraft === 'function') {
       window.beginManagementAccountDraft();
@@ -502,7 +499,9 @@
     return true;
   }
 
-  async function applyAdvancedSettingsFromForm() {
+  function applyAdvancedSettingsFromForm() {
+    if (hasWindow && typeof window.validateChannelScheduledCheckSchedule === 'function'
+        && !window.validateChannelScheduledCheckSchedule()) return false;
     const customRulesValid = validateCustomRulesDraft();
     const cooldownRulesValid = !hasWindow || typeof window.validateCooldownDetectionDraft !== 'function'
       || window.validateCooldownDetectionDraft();
@@ -525,41 +524,16 @@
       window.validateManagementAccountDraft();
       return false;
     }
-    const confirmButton = hasDocument
-      ? document.querySelector('[data-action="apply-advanced-settings"]')
-      : null;
-    try {
-      if (confirmButton) {
-        confirmButton.disabled = true;
-        confirmButton.setAttribute('aria-busy', 'true');
-      }
-      if (hasWindow && typeof window.saveCodexQuotaOverdraftFromAdvancedSettings === 'function') {
-        await window.saveCodexQuotaOverdraftFromAdvancedSettings();
-      }
-      if (!commitCustomRulesDraft()) return false;
-      if (hasWindow && typeof window.commitCooldownDetectionRules === 'function' && !window.commitCooldownDetectionRules()) {
-        return false;
-      }
-      if (hasWindow && typeof window.commitManagementAccountDraft === 'function'
-          && !window.commitManagementAccountDraft()) {
-        return false;
-      }
-      closeCustomRulesModal();
-      return true;
-    } catch (error) {
-      switchAdvancedSettingsTab('credential');
-      const message = error?.message || t(
-        'channels.codex.quotaOverdraftSaveFailed',
-        'Failed to save quota overage setting'
-      );
-      if (hasWindow && typeof window.showError === 'function') window.showError(message);
+    if (!commitCustomRulesDraft()) return false;
+    if (hasWindow && typeof window.commitCooldownDetectionRules === 'function' && !window.commitCooldownDetectionRules()) {
       return false;
-    } finally {
-      if (confirmButton) {
-        confirmButton.disabled = false;
-        confirmButton.removeAttribute('aria-busy');
-      }
     }
+    if (hasWindow && typeof window.commitManagementAccountDraft === 'function'
+        && !window.commitManagementAccountDraft()) {
+      return false;
+    }
+    closeCustomRulesModal();
+    return true;
   }
 
   function showCustomRulesHelp(target) {
@@ -579,7 +553,7 @@
   }
 
   function defaultHelpHeaders() {
-    return 'Rewrite HTTP headers sent to upstream.\nActions: remove / override / append.\nremove: empty value deletes the header; non-empty value removes only that comma-separated token (e.g. remove "context-1m-2025-08-07" from Anthropic-Beta).\nAuth headers (Authorization / x-api-key / x-goog-api-key) are protected.';
+    return 'Rewrite HTTP headers sent to upstream.\nActions: remove / override / append.\nremove: empty value deletes the header; non-empty value removes only that comma-separated token (e.g. remove "context-1m-2025-08-07" from Anthropic-Beta).\nAuth headers (Authorization / x-api-key / x-goog-api-key / x-refresh-token) are protected.';
   }
   function defaultHelpBody() {
     return 'Rewrite JSON body fields.\nActions: remove / override.\nPath uses dots + integer indices (messages.0.role).\nValues are JSON literals — strings need quotes.';

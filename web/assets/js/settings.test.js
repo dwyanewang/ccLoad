@@ -7,12 +7,17 @@ function flushAsyncWork() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function loadSettingsPage(t, settings, inputValues) {
+async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } = {}) {
   const clickListeners = [];
   const bodyListeners = new Map();
   const multimodalModalListeners = new Map();
   const multimodalModalClasses = new Set();
+  const customPricingModalListeners = new Map();
+  const customPricingModalClasses = new Set();
   let multimodalRows = [];
+  let customPricingRows = [];
+  let renderedMultimodalHTML = '';
+  let renderedCustomPricingHTML = '';
   const saveButton = {
     dataset: {},
     addEventListener(type, listener) {
@@ -67,6 +72,21 @@ async function loadSettingsPage(t, settings, inputValues) {
       this.attributes.delete(name);
     }
   };
+  const multimodalAddButton = {
+    dataset: { action: 'add-multimodal-fallback-row' },
+    closest(selector) {
+      return selector === '[data-action]' ? this : null;
+    }
+  };
+  const multimodalFallbackButton = {
+    dataset: {},
+    addEventListener(type, listener) {
+      if (type === 'click') this.clickListener = listener;
+    },
+    click() {
+      this.clickListener?.({ currentTarget: this });
+    }
+  };
   const multimodalModal = {
     dataset: {},
     attributes: new Map(),
@@ -92,7 +112,74 @@ async function loadSettingsPage(t, settings, inputValues) {
       this.attributes.set(name, String(value));
     }
   };
+  const customPricingCloseButton = {
+    focus() {
+      global.document.activeElement = this;
+    }
+  };
+  const customPricingButton = {
+    dataset: {},
+    disabled: false,
+    addEventListener(type, listener) {
+      if (type === 'click') this.clickListener = listener;
+    },
+    click() {
+      this.clickListener?.({ currentTarget: this });
+    }
+  };
+  const customPricingModal = {
+    dataset: {},
+    attributes: new Map(),
+    classList: {
+      add(name) {
+        customPricingModalClasses.add(name);
+      },
+      remove(name) {
+        customPricingModalClasses.delete(name);
+      },
+      contains(name) {
+        return customPricingModalClasses.has(name);
+      }
+    },
+    addEventListener(type, listener) {
+      customPricingModalListeners.set(type, listener);
+    },
+    querySelector(selector) {
+      if (selector === '.close-btn') return customPricingCloseButton;
+      return null;
+    },
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    }
+  };
+  const customPricingRowsContainer = {
+    get innerHTML() {
+      return renderedCustomPricingHTML;
+    },
+    set innerHTML(value) {
+      renderedCustomPricingHTML = String(value);
+    }
+  };
+  const customPricingSearch = { value: '' };
+  const customPricingEmpty = { hidden: true };
+  const customPricingError = { textContent: '', hidden: true };
+  const customPricingSummary = { textContent: '' };
+  const appContainer = {
+    attributes: new Map(),
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+    },
+    removeAttribute(name) {
+      this.attributes.delete(name);
+    }
+  };
   const multimodalRowsContainer = {
+    get innerHTML() {
+      return renderedMultimodalHTML;
+    },
+    set innerHTML(value) {
+      renderedMultimodalHTML = String(value);
+    },
     querySelectorAll(selector) {
       if (selector !== '.multimodal-fallback-row') return [];
       return multimodalRows.map(({ from, to }) => ({
@@ -111,9 +198,17 @@ async function loadSettingsPage(t, settings, inputValues) {
   const elements = new Map([
     ['save-all-btn', saveButton],
     ['settings-tbody', settingsBody],
+    ['model-multimodal-fallback-btn', multimodalFallbackButton],
     ['multimodalFallbackModal', multimodalModal],
     ['multimodalFallbackRows', multimodalRowsContainer],
-    ['multimodalFallbackError', multimodalError]
+    ['multimodalFallbackError', multimodalError],
+    ['model-custom-pricing-btn', customPricingButton],
+    ['model-custom-pricing-summary', customPricingSummary],
+    ['customPricingModal', customPricingModal],
+    ['customPricingRows', customPricingRowsContainer],
+    ['customPricingSearch', customPricingSearch],
+    ['customPricingEmpty', customPricingEmpty],
+    ['customPricingError', customPricingError]
   ]);
   const definitions = new Map(settings.map((setting) => [setting.key, setting]));
   for (const [key, value] of Object.entries(inputValues)) {
@@ -174,6 +269,7 @@ async function loadSettingsPage(t, settings, inputValues) {
   let nextSaveError = null;
   let nextUpdateError = null;
   let nextUpdateResult = { has_update: false, latest_version: 'v1.0.0' };
+  let resolveModelPricingRequest = null;
 
   global.window = {
     t(key, params = {}) {
@@ -196,10 +292,14 @@ async function loadSettingsPage(t, settings, inputValues) {
       return elements.get(id) || null;
     },
     querySelectorAll(selector) {
+      if (selector === '#customPricingRows .custom-pricing-model-row') return customPricingRows;
       const match = selector.match(/^input\[name="(.+)"\]$/);
       return match ? (radioGroups.get(match[1]) || []) : [];
     },
     querySelector(selector) {
+      if (selector === '.app-container') return appContainer;
+      const customRowMatch = selector.match(/^#customPricingRows \.custom-pricing-model-row\[data-model-index="(\d+)"\]$/);
+      if (customRowMatch) return customPricingRows[Number(customRowMatch[1])] || null;
       const match = selector.match(/^input\[name="(.+)"\]:checked$/);
       return match ? (radioGroups.get(match[1]) || []).find((radio) => radio.checked) || null : null;
     }
@@ -219,6 +319,11 @@ async function loadSettingsPage(t, settings, inputValues) {
   };
   global.fetchDataWithAuth = async (url, options) => {
     requests.push({ url, options });
+    if (url.startsWith('/admin/model-pricing?')) {
+      return new Promise((resolve) => {
+        resolveModelPricingRequest = resolve;
+      });
+    }
     if (!options) return settings;
     if (url === '/admin/update/check') {
       if (nextUpdateError) {
@@ -227,6 +332,9 @@ async function loadSettingsPage(t, settings, inputValues) {
         throw error;
       }
       return nextUpdateResult;
+    }
+    if (url === '/admin/channels/filter-options?status=enabled') {
+      return { models: filterModels };
     }
     if (nextSaveError) {
       const error = nextSaveError;
@@ -278,8 +386,82 @@ async function loadSettingsPage(t, settings, inputValues) {
       nextUpdateError = new Error(message);
     },
     multimodalApplyButton,
+    multimodalRowsHTML: () => renderedMultimodalHTML,
     multimodalError,
     multimodalModal,
+    customPricingRowsHTML: () => renderedCustomPricingHTML,
+    setCustomPricingRows(entries) {
+      customPricingRows = entries.map((entry, index) => {
+        const pricing = entry.pricing || {};
+        const status = { textContent: '', hidden: true, dataset: {} };
+        const priceInputs = new Map([...customPricingFieldsForTest].map((field) => [field, {
+          value: Object.prototype.hasOwnProperty.call(pricing, field) ? String(pricing[field]) : ''
+        }]));
+        let modelRow;
+        const modelInput = {
+          value: entry.model,
+          closest(selector) {
+            return selector === '.custom-pricing-model-row' ? modelRow : null;
+          },
+          matches(selector) {
+            return selector === '[data-cp-field="model_id"]';
+          },
+          focus() {
+            global.document.activeElement = this;
+          }
+        };
+        const highRow = {
+          dataset: { modelIndex: String(index) },
+          classList: { contains: (name) => name === 'custom-pricing-high-row' },
+          nextElementSibling: null,
+          querySelector(selector) {
+            const match = selector.match(/^\[data-cp-field="(.+)"\]$/);
+            return match ? priceInputs.get(match[1]) || null : null;
+          }
+        };
+        modelRow = {
+          dataset: { modelIndex: String(index) },
+          isConnected: true,
+          classList: { contains: (name) => name === 'custom-pricing-model-row' },
+          nextElementSibling: highRow,
+          querySelector(selector) {
+            if (selector === '[data-cp-field="model_id"]') return modelInput;
+            if (selector === '[data-cp-status]') return status;
+            const match = selector.match(/^\[data-cp-field="(.+)"\]$/);
+            return match ? priceInputs.get(match[1]) || null : null;
+          }
+        };
+        return modelRow;
+      });
+    },
+    editCustomPricingField(index, field, value) {
+      const selector = `[data-cp-field="${field}"]`;
+      const row = customPricingRows[index];
+      const target = row?.querySelector(selector) || row?.nextElementSibling?.querySelector(selector);
+      if (target) target.value = String(value);
+    },
+    requestCustomPricingDefaults(index) {
+      const input = customPricingRows[index]?.querySelector('[data-cp-field="model_id"]');
+      customPricingModalListeners.get('focusout')?.({ target: input });
+    },
+    resolveCustomPricingDefaults(result) {
+      resolveModelPricingRequest?.(result);
+      resolveModelPricingRequest = null;
+    },
+    async openCustomPricing() {
+      customPricingButton.click();
+      await flushAsyncWork();
+    },
+    async openMultimodal() {
+      multimodalFallbackButton.click();
+      await flushAsyncWork();
+    },
+    clickAddMultimodal() {
+      multimodalModalListeners.get('click')?.({ target: multimodalAddButton });
+    },
+    setMultimodalRows(rows) {
+      multimodalRows = rows;
+    },
     applyMultimodal(rows) {
       multimodalRows = rows;
       multimodalModal.classList.add('show');
@@ -304,6 +486,11 @@ async function loadSettingsPage(t, settings, inputValues) {
     }
   };
 }
+
+const customPricingFieldsForTest = [
+  'input_price', 'output_price', 'cache_read_price', 'cache_write_price',
+  'input_price_high', 'output_price_high', 'cache_read_price_high', 'cache_write_price_high'
+];
 
 function saveRequests(page) {
   return page.requests.filter(({ options }) => options?.method === 'POST');
@@ -531,6 +718,64 @@ test('全局冷却规则通过设置批量保存接口持久化', async (t) => {
   assert.deepEqual(JSON.parse(requests[0].options.body), { [key]: rules });
 });
 
+test('自定义模型价格重新打开时保留显式零值', async (t) => {
+  const value = JSON.stringify({
+    'free-cache-model': {
+      cache_read_price: 0,
+      cache_read_price_high: 0,
+      cache_write_price_high: 0
+    }
+  });
+  const page = await loadSettingsPage(t, [{
+    key: 'model_custom_pricing',
+    value,
+    value_type: 'json',
+    description: ''
+  }], {
+    model_custom_pricing: value
+  });
+
+  await page.openCustomPricing();
+
+  const html = page.customPricingRowsHTML();
+  for (const field of ['cache_read_price', 'cache_read_price_high', 'cache_write_price_high']) {
+    assert.match(html, new RegExp(`data-cp-field="${field}"[^>]*value="0"`));
+  }
+});
+
+test('加载系统默认价格时保留其他行的并发编辑', async (t) => {
+  const value = JSON.stringify({
+    'target-model': {},
+    'other-model': { input_price: 1 }
+  });
+  const page = await loadSettingsPage(t, [{
+    key: 'model_custom_pricing',
+    value,
+    value_type: 'json',
+    description: ''
+  }], {
+    model_custom_pricing: value
+  });
+
+  await page.openCustomPricing();
+  page.setCustomPricingRows([
+    { model: 'target-model', pricing: {} },
+    { model: 'other-model', pricing: { input_price: 1 } }
+  ]);
+  page.requestCustomPricingDefaults(0);
+  page.editCustomPricingField(1, 'input_price', 9);
+  page.resolveCustomPricingDefaults({
+    found: true,
+    pricing: { input_price: 2, output_price: 3 }
+  });
+  await flushAsyncWork();
+
+  assert.match(
+    page.customPricingRowsHTML(),
+    /value="other-model"[\s\S]*?data-cp-field="input_price"[^>]*value="9"/
+  );
+});
+
 test('多模态回退映射在对话框内直接保存，无需再点保存所有更改', async (t) => {
   const key = 'model_multimodal_fallback';
   const mappings = '{"gpt-5.6-luna":"gemini-3-pro"}';
@@ -558,6 +803,31 @@ test('多模态回退映射在对话框内直接保存，无需再点保存所�
   page.saveButton.click();
   await flushAsyncWork();
   assert.equal(saveRequests(page).length, 1);
+});
+
+test('添加映射时保留当前行尚未保存的下拉选择', async (t) => {
+  const page = await loadSettingsPage(t, [{
+    key: 'model_multimodal_fallback',
+    value: '{}',
+    value_type: 'json',
+    description: ''
+  }], {
+    model_multimodal_fallback: '{}'
+  }, {
+    filterModels: ['MiniMax-M2.1', 'glm-5.2-fast-preview', 'qwen3.8-max-0902']
+  });
+
+  await page.openMultimodal();
+  page.clickAddMultimodal();
+  page.setMultimodalRows([{
+    from: 'glm-5.2-fast-preview',
+    to: 'qwen3.8-max-0902'
+  }]);
+  page.clickAddMultimodal();
+
+  const html = page.multimodalRowsHTML();
+  assert.match(html, /value="glm-5\.2-fast-preview" selected/);
+  assert.match(html, /value="qwen3\.8-max-0902" selected/);
 });
 
 test('多模态回退映射保存失败时保留对话框和原持久化值', async (t) => {

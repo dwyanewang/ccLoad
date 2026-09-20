@@ -55,8 +55,12 @@ var responsesWebsocketUpgrader = websocket.Upgrader{
 
 func isResponsesWebsocketUpgradeRequest(r *http.Request) bool {
 	return r != nil && r.Method == http.MethodGet &&
-		slices.Contains(responsesWebsocketUpgradePaths, r.URL.Path) &&
+		isResponsesWebsocketPath(r.URL.Path) &&
 		websocket.IsWebSocketUpgrade(r)
+}
+
+func isResponsesWebsocketPath(path string) bool {
+	return slices.Contains(responsesWebsocketUpgradePaths, path)
 }
 
 // responsesWebsocketTimeouts resolves the idle read deadline and ping
@@ -223,9 +227,6 @@ func (s *Server) HandleResponsesWebsocket(c *gin.Context) {
 			turnResult, errTurn := s.executeResponsesWebsocketTurn(
 				connectionCtx, c, conn, requestBody, nativeRequestBody, executionSession, allowLocalPrewarm,
 			)
-			if len(turnResult.committedRequest) > 0 {
-				requestBody = turnResult.committedRequest
-			}
 			if errTurn != nil {
 				if turnResult.interrupted {
 					s.responsesExecutionSessions.commit(executionSession, requestBody, turnResult)
@@ -347,7 +348,6 @@ type responsesWebsocketTurnResult struct {
 	completedResponseID string
 	pendingToolCallIDs  []string
 	interrupted         bool
-	committedRequest    []byte
 }
 
 type responsesWebsocketTerminalError struct {
@@ -444,8 +444,12 @@ func (s *Server) executeResponsesWebsocketTurn(
 			return responsesWebsocketTurnResult{}, errors.New("token cost limit exceeded")
 		}
 	}
+	ctx = withChannelRestrictionToken(ctx, tokenHashString)
 
 	candidates, err := s.selectCandidatesByModelAndClientProtocol(ctx, modelName, string(protocol.Codex))
+	if err == nil {
+		candidates = s.appendAntigravityCreditsCandidates(ctx, candidates, modelName, string(protocol.Codex), requestBody)
+	}
 	if err != nil {
 		return responsesWebsocketTurnResult{}, fmt.Errorf("select upstream candidates: %w", err)
 	}
@@ -471,29 +475,27 @@ func (s *Server) executeResponsesWebsocketTurn(
 	header := responsesWebsocketUpstreamHeaders(c.Request.Header)
 	header.Set("Content-Type", "application/json")
 	reqCtx := &proxyRequestContext{
-		clientModel:                clientModel,
-		originalModel:              modelName,
-		requestedModel:             requestedModel,
-		clientProtocol:             protocol.Codex,
-		codexClient:                isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
-		requestMethod:              http.MethodPost,
-		requestPath:                "/v1/responses",
-		rawQuery:                   c.Request.URL.RawQuery,
-		body:                       requestBody,
-		translatedBody:             requestBody,
-		header:                     header,
-		isStreaming:                true,
-		tokenHash:                  tokenHashString,
-		tokenID:                    tokenIDInt64,
-		clientIP:                   c.ClientIP(),
-		startTime:                  startTime,
-		thinkingEffort:             thinkingEffort,
-		routingSession:             executionSession,
-		nativeCodexWS:              nativeCodexWS,
-		nativeCodexBody:            bytes.Clone(nativeRequestBody),
-		codexMultiAgentV2Optimized: executionSession.codexMultiAgentV2StateSnapshot(),
+		clientModel:     clientModel,
+		originalModel:   modelName,
+		requestedModel:  requestedModel,
+		clientProtocol:  protocol.Codex,
+		codexClient:     isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
+		requestMethod:   http.MethodPost,
+		requestPath:     "/v1/responses",
+		rawQuery:        c.Request.URL.RawQuery,
+		body:            requestBody,
+		translatedBody:  requestBody,
+		header:          header,
+		isStreaming:     true,
+		tokenHash:       tokenHashString,
+		tokenID:         tokenIDInt64,
+		clientIP:        c.ClientIP(),
+		startTime:       startTime,
+		thinkingEffort:  thinkingEffort,
+		routingSession:  executionSession,
+		nativeCodexWS:   nativeCodexWS,
+		nativeCodexBody: bytes.Clone(nativeRequestBody),
 	}
-	ctx = withCodexMultiAgentV2RequestContext(ctx, reqCtx)
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
 			s.activeRequests.AddBytes(reqCtx.activeReqID, n)
@@ -517,6 +519,10 @@ func (s *Server) executeResponsesWebsocketTurn(
 	bridgeWriter := newResponsesWebsocketBridgeWriter(conn, s.bodyLimits.maxForPath("/v1/responses"))
 	clientReplay := false
 	stopBeforeNativeWebsocket := func(current, next *model.Config, result *proxyResult) bool {
+		// 管理员中断要继续切渠道，不在此处收口。
+		if result == nil || result.operatorAborted {
+			return false
+		}
 		if isNativeCodexWebsocketCandidate(current) || !isNativeCodexWebsocketCandidate(next) {
 			return false
 		}
@@ -529,8 +535,6 @@ func (s *Server) executeResponsesWebsocketTurn(
 	lastResult, succeeded := s.runProxyAttemptLoopWithFailureBoundary(
 		ctx, candidates, reqCtx, bridgeWriter, stopBeforeNativeWebsocket,
 	)
-	committedRequest := bytes.Clone(reqCtx.quotaOverdraftTranscript)
-	s.updateCodexMultiAgentV2SessionState(executionSession, reqCtx)
 	if bridgeWriter.closedForMessageTooBig {
 		return responsesWebsocketTurnResult{}, &responsesWebsocketTerminalError{forwarded: true}
 	}
@@ -560,7 +564,6 @@ func (s *Server) executeResponsesWebsocketTurn(
 					completedOutput:    interruptedOutput,
 					pendingToolCallIDs: pendingToolCallIDs,
 					interrupted:        true,
-					committedRequest:   committedRequest,
 				}
 			}
 			return turnResult, &responsesWebsocketClientRetryError{
@@ -572,7 +575,6 @@ func (s *Server) executeResponsesWebsocketTurn(
 			completedOutput:     bytes.Clone(bridgeWriter.completedOutput),
 			completedResponseID: bridgeWriter.completedResponseID,
 			pendingToolCallIDs:  responsesWebsocketPendingToolCallIDs(bridgeWriter.completedOutput),
-			committedRequest:    committedRequest,
 		}, nil
 	}
 	originalStatus := determineFinalClientStatus(lastResult)
@@ -604,6 +606,19 @@ func (s *Server) executeResponsesWebsocketTurn(
 		return responsesWebsocketTurnResult{}, &responsesWebsocketClientRetryError{
 			code:    responsesWebsocketInterruptedCode,
 			message: responsesWebsocketUpstreamErrorMessage(lastResult.body),
+		}
+	}
+	// A 598/599 result is an internal stream failure, not a client-visible
+	// Responses error payload. When every candidate is exhausted (including an
+	// administrator abort of a heartbeat-only stream), forwarding its diagnostic
+	// text through the generic error path would emit a 400 `upstream_error` and
+	// leave the WebSocket open with no turn terminator. Make it client-retryable,
+	// matching the already-committed interruption path above.
+	if lastResult != nil && (lastResult.operatorAborted || util.IsModelScopedStreamFailure(lastResult.status)) {
+		return responsesWebsocketTurnResult{}, &responsesWebsocketClientRetryError{
+			status:  status,
+			code:    responsesWebsocketInterruptedCode,
+			message: responsesWebsocketInterruptedMessage,
 		}
 	}
 	if lastResult != nil && len(lastResult.body) > 0 {
@@ -669,7 +684,7 @@ func writeResponsesWebsocketSyntheticPrewarm(
 }
 
 func isResponsesWebsocketFailurePayload(payload []byte) bool {
-	if !gjson.ValidBytes(payload) {
+	if !json.Valid(payload) {
 		return false
 	}
 	switch strings.TrimSpace(gjson.GetBytes(payload, "type").String()) {
@@ -792,7 +807,7 @@ func (w *responsesWebsocketBridgeWriter) Write(data []byte) (int, error) {
 		if len(payload) == 0 || bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
 			continue
 		}
-		if !gjson.ValidBytes(payload) {
+		if !json.Valid(payload) {
 			return 0, errors.New("invalid JSON in upstream SSE event")
 		}
 		eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())

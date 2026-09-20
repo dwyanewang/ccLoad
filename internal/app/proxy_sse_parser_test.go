@@ -8,6 +8,118 @@ import (
 	"ccLoad/internal/util"
 )
 
+func TestNativeImagesUsageAndCompletion(t *testing.T) {
+	usage := `{"input_tokens":100,"input_tokens_details":{"text_tokens":40,"image_tokens":60,"cached_tokens":30,"cached_tokens_details":{"text_tokens":10,"image_tokens":20}},"output_tokens":50}`
+	for _, kind := range []string{"json", "image_generation", "image_edit"} {
+		t.Run(kind, func(t *testing.T) {
+			var parser usageParser
+			var body string
+			if kind == "json" {
+				parser = newJSONUsageParser("openai")
+				body = `{"data":[{"b64_json":"aW1hZ2U="}],"usage":` + usage + `}`
+			} else {
+				parser = newSSEUsageParser("openai")
+				body = "event: " + kind + ".completed\ndata: {\"type\":\"" + kind + ".completed\",\"b64_json\":\"aW1hZ2U=\",\"usage\":" + usage + "}\n\n"
+			}
+			if err := parser.Feed([]byte(body)); err != nil {
+				t.Fatal(err)
+			}
+			input, output, cached, _ := parser.GetUsage()
+			if input != 70 || output != 50 || cached != 30 {
+				t.Fatalf("usage=%d/%d/%d", input, output, cached)
+			}
+			if kind != "json" && !parser.IsStreamComplete() {
+				t.Fatal("image completion not recognized")
+			}
+			imageUsage := parser.GetImageUsage()
+			res := &fwResult{InputTokens: input, OutputTokens: output, CacheReadInputTokens: cached, ImageUsage: &imageUsage}
+			// 30 text + 10 cached text + 40 image + 20 cached image + 50 output.
+			if cost := computeRequestCost("gpt-image-2.5-flare", "", res); !floatEquals(cost, 0.0020225) {
+				t.Fatalf("image cost=%g, want 0.0020225", cost)
+			}
+		})
+	}
+}
+
+func TestSSEUsageParserDuplicateKeysFirstWins(t *testing.T) {
+	t.Parallel()
+	parser := &sseUsageParser{upstreamProtocol: "codex"}
+	if err := parser.parseEvent(
+		"response.completed",
+		`{"type":"response.completed","usage":{"input_tokens":3},"usage":{"input_tokens":999}}`,
+	); err != nil {
+		t.Fatalf("parseEvent() error = %v", err)
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("duplicate keys must still mark stream complete")
+	}
+	input, _, _, _ := parser.GetUsage()
+	if input != 3 {
+		t.Fatalf("InputTokens = %d, want first-wins 3", input)
+	}
+}
+
+func TestSSEUsageParserDuplicateResponseKeysFirstWins(t *testing.T) {
+	t.Parallel()
+	parser := &sseUsageParser{upstreamProtocol: "codex"}
+	if err := parser.parseEvent(
+		"response.completed",
+		`{"type":"response.completed","response":{"id":"first","output":[{"type":"function_call","call_id":"call_first","name":"lookup","arguments":"{}"}],"usage":{"input_tokens":3}},"response":{"id":"second","output":[{"type":"function_call","call_id":"call_second","name":"lookup","arguments":"{}"}],"usage":{"input_tokens":999}}}`,
+	); err != nil {
+		t.Fatalf("parseEvent() error = %v", err)
+	}
+	input, _, _, _ := parser.GetUsage()
+	if input != 3 {
+		t.Fatalf("InputTokens = %d, want first-wins 3", input)
+	}
+	result, ok := parser.GetResponsesTurnResult()
+	if !ok {
+		t.Fatal("expected response turn result")
+	}
+	if result.completedResponseID != "first" {
+		t.Fatalf("response ID = %q, want first", result.completedResponseID)
+	}
+	if got := string(result.completedOutput); got != `[{"type":"function_call","call_id":"call_first","name":"lookup","arguments":"{}"}]` {
+		t.Fatalf("completed output = %s, want first response output", got)
+	}
+	if len(result.pendingToolCallIDs) != 1 || result.pendingToolCallIDs[0] != "call_first" {
+		t.Fatalf("pending tool calls = %#v, want [call_first]", result.pendingToolCallIDs)
+	}
+}
+
+func TestSSEUsageParserMarksCompleteOnTrailingJSON(t *testing.T) {
+	t.Parallel()
+	parser := &sseUsageParser{upstreamProtocol: "codex"}
+	err := parser.parseEvent(
+		"response.completed",
+		`{"type":"response.completed","response":{"id":"r","output":[]}} []`,
+	)
+	if err == nil {
+		t.Fatal("trailing JSON must fail usage parse")
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("terminal event must mark stream complete even when JSON unmarshal fails")
+	}
+}
+
+func TestSSEUsageParserMarksCompleteOnFinishReasonWithDuplicateKeys(t *testing.T) {
+	t.Parallel()
+	parser := &sseUsageParser{upstreamProtocol: "openai"}
+	if err := parser.parseEvent(
+		"",
+		`{"choices":[{"finish_reason":"stop"}],"usage":{"input_tokens":1},"usage":{"input_tokens":9}}`,
+	); err != nil {
+		t.Fatalf("parseEvent() error = %v", err)
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("non-empty finish_reason must still mark the stream complete")
+	}
+	input, _, _, _ := parser.GetUsage()
+	if input != 1 {
+		t.Fatalf("InputTokens = %d, want first-wins 1", input)
+	}
+}
+
 func TestMarkSSEErrorForwardResultPreservesWebsocketStatusAndHeaders(t *testing.T) {
 	res := &fwResult{SSEErrorEvent: []byte(`{
 		"type":"error",
@@ -459,6 +571,192 @@ func TestSSEUsageParser_MessageDeltaWithZeroInputTokens(t *testing.T) {
 	}
 	if output != 144 {
 		t.Errorf("OutputTokens = %d, 期望 144", output)
+	}
+}
+
+func TestSSEUsageParser_AnthropicPlaceholderZerosPreserveProductionUsage(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":169296,"cache_creation_input_tokens":2613,"cache_creation":{"ephemeral_5m_input_tokens":2613,"ephemeral_1h_input_tokens":0}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":1378,"cache_read_input_tokens":169296,"cache_creation_input_tokens":2613,"cache_creation":{"ephemeral_5m_input_tokens":2613,"ephemeral_1h_input_tokens":0}}}
+
+event: message_stop
+data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}
+
+`
+
+	parser := newSSEUsageParser("anthropic")
+	feedAndAssertUsage(t, parser, sseData, 2, 1378, 169296, 2613)
+	if parser.Cache5mInputTokens != 2613 || parser.Cache1hInputTokens != 0 {
+		t.Fatalf("cache breakdown = %d/%d, want 2613/0", parser.Cache5mInputTokens, parser.Cache1hInputTokens)
+	}
+	if parser.CacheCreationInputTokens != parser.Cache5mInputTokens+parser.Cache1hInputTokens {
+		t.Fatalf("cache aggregate=%d, breakdown sum=%d", parser.CacheCreationInputTokens, parser.Cache5mInputTokens+parser.Cache1hInputTokens)
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("message_stop 仍应标记流完成")
+	}
+}
+
+func TestSSEUsageParser_AnthropicOutputZeroThenPositive(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":73}}
+
+`
+
+	feedAndAssertUsage(t, newSSEUsageParser("anthropic"), sseData, 10, 73, 0, 0)
+}
+
+func TestSSEUsageParser_AnthropicLaterPositiveSnapshotCanDecrease(t *testing.T) {
+	sseData := `event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":100,"cache_read_input_tokens":900}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":80,"cache_read_input_tokens":700}}
+
+`
+
+	feedAndAssertUsage(t, newSSEUsageParser("anthropic"), sseData, 0, 80, 700, 0)
+}
+
+func TestSSEUsageParser_AnthropicUsageOnlyInMessageStop(t *testing.T) {
+	sseData := `event: message_stop
+data: {"type":"message_stop","usage":{"input_tokens":12,"output_tokens":73,"cache_read_input_tokens":17558,"cache_creation_input_tokens":278}}
+
+`
+
+	parser := newSSEUsageParser("anthropic")
+	feedAndAssertUsage(t, parser, sseData, 12, 73, 17558, 278)
+	if parser.Cache5mInputTokens != 278 || parser.Cache1hInputTokens != 0 {
+		t.Fatalf("aggregate-only cache breakdown = %d/%d, want 278/0", parser.Cache5mInputTokens, parser.Cache1hInputTokens)
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("message_stop-only usage 应保留终止语义")
+	}
+}
+
+func TestSSEUsageParser_AnthropicCacheCreationSnapshots(t *testing.T) {
+	tests := []struct {
+		name          string
+		sseData       string
+		wantAggregate int
+		want5m        int
+		want1h        int
+	}{
+		{
+			name: "1h-only snapshot clears previous 5m",
+			sseData: `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":500,"cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":200}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"cache_creation_input_tokens":500,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500}}}
+
+`,
+			wantAggregate: 500,
+			want5m:        0,
+			want1h:        500,
+		},
+		{
+			name: "mixed 5m and 1h snapshot",
+			sseData: `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1,"cache_creation_input_tokens":999,"cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":200}}}}
+
+`,
+			wantAggregate: 500,
+			want5m:        300,
+			want1h:        200,
+		},
+		{
+			name: "all zero usage remains zero",
+			sseData: `event: message_stop
+data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}
+
+`,
+			wantAggregate: 0,
+			want5m:        0,
+			want1h:        0,
+		},
+		{
+			name: "aggregate-only falls back to 5m and clears 1h",
+			sseData: `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"cache_creation_input_tokens":80}}
+
+`,
+			wantAggregate: 80,
+			want5m:        80,
+			want1h:        0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := newSSEUsageParser("anthropic")
+			if err := parser.Feed([]byte(tt.sseData)); err != nil {
+				t.Fatalf("Feed失败: %v", err)
+			}
+			if parser.CacheCreationInputTokens != tt.wantAggregate || parser.Cache5mInputTokens != tt.want5m || parser.Cache1hInputTokens != tt.want1h {
+				t.Fatalf("cache aggregate/5m/1h = %d/%d/%d, want %d/%d/%d",
+					parser.CacheCreationInputTokens, parser.Cache5mInputTokens, parser.Cache1hInputTokens,
+					tt.wantAggregate, tt.want5m, tt.want1h)
+			}
+			if parser.CacheCreationInputTokens != parser.Cache5mInputTokens+parser.Cache1hInputTokens {
+				t.Fatalf("cache aggregate=%d, breakdown sum=%d", parser.CacheCreationInputTokens, parser.Cache5mInputTokens+parser.Cache1hInputTokens)
+			}
+		})
+	}
+}
+
+func TestSSEUsageParser_AnthropicPlaceholderZerosInOversizedEvent(t *testing.T) {
+	parser := newSSEUsageParser("anthropic")
+	start := `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":1378,"cache_read_input_tokens":169296,"cache_creation_input_tokens":2613,"cache_creation":{"ephemeral_5m_input_tokens":2613,"ephemeral_1h_input_tokens":0}}}}
+
+`
+	if err := parser.Feed([]byte(start)); err != nil {
+		t.Fatalf("Feed start 失败: %v", err)
+	}
+
+	chunks := []string{
+		"event: .\n",
+		`data: {"type":".","padding":"`,
+		strings.Repeat("a", maxSSEEventSize+1),
+		`","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}` + "\n\n",
+	}
+	for i, chunk := range chunks {
+		if err := parser.Feed([]byte(chunk)); err != nil {
+			t.Fatalf("Feed第%d块失败: %v", i+1, err)
+		}
+	}
+
+	feedAndAssertUsage(t, parser, "", 2, 1378, 169296, 2613)
+	if parser.CacheCreationInputTokens != parser.Cache5mInputTokens+parser.Cache1hInputTokens {
+		t.Fatalf("cache aggregate=%d, breakdown sum=%d", parser.CacheCreationInputTokens, parser.Cache5mInputTokens+parser.Cache1hInputTokens)
+	}
+}
+
+func TestSSEUsageParser_OpenAIResponsesPlaceholderZerosPreserveUsage(t *testing.T) {
+	sseData := `event: response.in_progress
+data: {"type":"response.in_progress","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":10},"output_tokens":70}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0}}}
+
+`
+
+	parser := newSSEUsageParser("openai")
+	feedAndAssertUsage(t, parser, sseData, 90, 70, 20, 10)
+	if parser.Cache5mInputTokens != 10 || parser.Cache1hInputTokens != 0 {
+		t.Fatalf("Responses cache breakdown = %d/%d, want 10/0", parser.Cache5mInputTokens, parser.Cache1hInputTokens)
+	}
+	if !parser.IsStreamComplete() {
+		t.Fatal("response.completed 应保留终止语义")
 	}
 }
 
@@ -1628,5 +1926,112 @@ func TestSSEUsageParser_ResponsesMetadataEventLineWithoutPayloadType(t *testing.
 	}
 	if !parser.HasStreamOutput() {
 		t.Fatal("HasStreamOutput() should be true after a semantic event following metadata")
+	}
+}
+
+func TestSSEUsageParserPreservesCompletedOutputObjectOrder(t *testing.T) {
+	t.Parallel()
+
+	parser := newSSEUsageParser("codex")
+	frame := `data: {"type":"response.completed","response":{"id":"resp-1","output":[{"z":1,"type":"message","a":2}],"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
+	if err := parser.Feed([]byte(frame)); err != nil {
+		t.Fatalf("Feed failed: %v", err)
+	}
+	result, ok := parser.GetResponsesTurnResult()
+	if !ok {
+		t.Fatal("GetResponsesTurnResult() should return completed response metadata")
+	}
+	want := `[{"z":1,"type":"message","a":2}]`
+	if string(result.completedOutput) != want {
+		t.Fatalf("completed output was re-encoded: got %s, want %s", result.completedOutput, want)
+	}
+}
+
+// SSE 帧的语法守卫必须自带嵌套深度上限。gjson.ValidBytes 没有上限，放行后
+// root.Value() 的物化按 O(n²) 展开——maxSSEEventSize 以内的深嵌套帧足以烧掉
+// 数十秒 CPU。这里钉的是「有上限」这个契约，不是某个具体层数。
+func TestSSEJSONObjectMapDepthGuard(t *testing.T) {
+	t.Parallel()
+
+	nest := func(depth int) []byte {
+		return []byte(`{"type":"response.completed","deep":` + strings.Repeat("[", depth) + "1" + strings.Repeat("]", depth) + `}`)
+	}
+
+	event, err := sseJSONObjectMap(nest(100))
+	if err != nil {
+		t.Fatalf("ordinary nesting rejected: %v", err)
+	}
+	if event["type"] != "response.completed" {
+		t.Fatalf("type = %v, want response.completed", event["type"])
+	}
+
+	deep := nest(50000)
+	if len(deep) > maxSSEEventSize {
+		t.Fatalf("fixture is %d bytes, exceeds maxSSEEventSize %d", len(deep), maxSSEEventSize)
+	}
+	if _, err := sseJSONObjectMap(deep); err == nil {
+		t.Fatal("deeply nested frame must be rejected by the syntax guard")
+	}
+}
+
+// usage 计数最终要乘单价写进计费。上游给出无法用 int 表示的数值时，int(v) 会产出
+// MaxInt——一次坏帧就能把成本、日志和限额判定一起污染。契约是把这类值当作「没给
+// 这个计数」，而不是天文数字。
+func TestSSEUsageParserRejectsUnrepresentableTokenCounts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"positive infinity", "1e999"},
+		{"negative infinity", "-1e999"},
+		{"beyond int range", "1e300"},
+		{"negative count", "-5"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parser := &sseUsageParser{upstreamProtocol: "codex"}
+			frame := `{"type":"response.completed","usage":{"input_tokens":` + tc.value +
+				`,"output_tokens":` + tc.value + `,"cache_read_input_tokens":` + tc.value + `}}`
+			if err := parser.parseEvent("response.completed", frame); err != nil {
+				t.Fatalf("parseEvent() error = %v", err)
+			}
+			input, output, cacheRead, cacheCreation := parser.GetUsage()
+			if input != 0 || output != 0 || cacheRead != 0 || cacheCreation != 0 {
+				t.Fatalf("usage = (%d, %d, %d, %d), want all zero", input, output, cacheRead, cacheCreation)
+			}
+		})
+	}
+}
+
+// 合法的大计数不受收敛影响——收敛的是无法表示的值，不是「大」。
+func TestSSEUsageParserKeepsLargeRepresentableTokenCounts(t *testing.T) {
+	t.Parallel()
+	parser := &sseUsageParser{upstreamProtocol: "codex"}
+	if err := parser.parseEvent(
+		"response.completed",
+		`{"type":"response.completed","usage":{"input_tokens":12000000,"output_tokens":9000000}}`,
+	); err != nil {
+		t.Fatalf("parseEvent() error = %v", err)
+	}
+	input, output, _, _ := parser.GetUsage()
+	if input != 12000000 || output != 9000000 {
+		t.Fatalf("usage = (%d, %d), want (12000000, 9000000)", input, output)
+	}
+}
+
+// 守卫失败时必须给出坏字节的位置。sonic 的错误原本带 index，换成 json.Valid 后
+// 只剩布尔——排障要知道帧坏在哪里，不是只知道它坏了。
+func TestSSEJSONObjectMapErrorCarriesOffset(t *testing.T) {
+	t.Parallel()
+	_, err := sseJSONObjectMap([]byte(`{"type":"response.completed","usage":}`))
+	if err == nil {
+		t.Fatal("malformed frame must be rejected")
+	}
+	if !strings.Contains(err.Error(), "offset 38") {
+		t.Fatalf("error = %q, want it to locate the offending byte", err)
 	}
 }

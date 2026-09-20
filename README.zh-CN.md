@@ -99,7 +99,7 @@ ccLoad 直接处理这些问题：
 
 ## 🏗️ 架构概览
 
-每个渠道默认接受四种客户端协议。实际上游协议由 `protocol_transform_mode` 和每个结构化 URL 的 `protocols` 声明共同决定：`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 探测并跳过已试协议，仅在响应未提交的能力错误后继续；`local` 优先使用显式声明协议的 URL，并保持每个 URL 的声明顺序。只有全部 URL 都未声明协议时，`local` 才按 Anthropic → Codex → OpenAI → Gemini 尝试。不兼容 URL 不发请求、不冷却。自动探测成功结果按 URL 和请求族缓存到进程重启或渠道配置变更；只有稳定的端点级非模型 404/405 才会缓存该 URL 与请求族的“全部协议不支持”结果，并在 10 分钟后重新探测。请求相关的 400/403/500 和本地转换失败会在下次请求时重新尝试。
+每个渠道默认接受四种客户端协议。实际上游协议由 `protocol_transform_mode` 和每个结构化 URL 的 `protocols` 声明共同决定：`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 探测并跳过已试协议，仅在响应未提交的能力错误后继续；`local` 优先使用显式声明协议的 URL，并保持每个 URL 的声明顺序。来自官方 Codex 客户端的 Responses 请求在 `local` 模式下会在 URL 已声明 Codex 能力时优先选择 Codex 原生路径；未声明 Codex 的 URL 不会因此获得额外能力，其他客户端仍遵循原声明顺序。只有全部 URL 都未声明协议时，`local` 才按 Anthropic → Codex → OpenAI → Gemini 尝试。不兼容 URL 不发请求、不冷却。自动探测成功结果按 URL 和请求族缓存到进程重启或渠道配置变更；只有稳定的端点级非模型 404/405 才会缓存该 URL 与请求族的“全部协议不支持”结果，并在 10 分钟后重新探测。请求相关的 400/403/500 和本地转换失败会在下次请求时重新尝试。
 
 ![ccLoad 程序架构](images/ccload-architecture.jpg)
 
@@ -711,7 +711,7 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > 任何 OpenAI 兼容服务均可使用，只需把 `urls[].url` 改为它的 API 基础地址。不要包含 `/v1` 或具体端点路径，ccLoad 会按所选协议自动追加。`protocols: ["openai"]` 声明将该渠道作为 OpenAI 上游路由。
 
-> **协议行为说明**：每个 `urls` 条目可通过 `protocols` 声明 `anthropic`、`codex`、`openai`、`gemini` 能力，非空列表是权威配置。`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 自动探测并跳过已试协议；`local` 优先显式声明的 URL 和配置顺序。`local` 下仅当全部 URL 都未声明时，才按 Anthropic → Codex → OpenAI → Gemini 尝试。
+> **协议行为说明**：每个 `urls` 条目可通过 `protocols` 声明 `anthropic`、`codex`、`openai`、`gemini` 能力，非空列表是权威配置。`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 自动探测并跳过已试协议；`local` 优先显式声明的 URL 和配置顺序。官方 Codex 客户端发出的 Responses 请求会在 URL 声明 Codex 时将 Codex 原生候选提前，但不会把未声明 Codex 的 URL 当作可用；其他客户端保持配置顺序。`local` 下仅当全部 URL 都未声明时，才按 Anthropic → Codex → OpenAI → Gemini 尝试。
 
 > **多URL说明**：`urls` 是有序的 `{url, exact, protocols}` 对象数组。`exact: true` 表示该地址已经是完整上游请求 URL。系统按延迟加权选择 URL，并对故障 URL 独立冷却；local 模式会先把显式声明协议的 URL 稳定排到自动 URL 前面，各组内部顺序不变。
 
@@ -741,7 +741,7 @@ SDK Agent 只开放 Cursor 的 `mcp` capability group：SDK custom tools 通过 
 
 #### Zed
 
-在渠道管理中选择 **Zed** 并完成原生登录。这不是 OAuth code/PKCE 流程：每次登录在随机 loopback 端口生成临时 RSA-2048 密钥，把 PKCS#1 DER 公钥以 base64url 传给 `zed.dev/native_app_signin`，再用 RSA-OAEP/SHA-256 把回调的 `access_token` 解密成长期 native credential；临时私钥绝不持久化。试用权限绑定真实 Zed 安装的 `system_id`（表单值 → `CCLOAD_ZED_SYSTEM_ID` → 本机 Zed `db/0-global/db.sqlite`）；没有可信来源就拒绝登录，同账号重授权保留已存值。
+在渠道管理中选择 **Zed** 并完成原生登录。这不是 OAuth code/PKCE 流程：每次登录在随机 loopback 端口生成临时 RSA-2048 密钥，把 PKCS#1 DER 公钥以 base64url 传给 `zed.dev/native_app_signin`，再用 RSA-OAEP/SHA-256 把回调的 `access_token` 解密成长期 native credential；临时私钥绝不持久化。`system_id` 是可选的 Zed 安装标识，主要用于试用权限绑定真实安装（表单值 → `CCLOAD_ZED_SYSTEM_ID` → 本机 Zed `db/0-global/db.sqlite`）；没有该值时仍可发起登录并尝试换取令牌，请求会省略 `x-zed-system-id`，由上游决定账号是否具备试用权限；禁止生成随机值或复制其他机器的固定值，同账号重授权保留已存值。
 
 数据请求先用 native credential 经 `/client/llm_tokens` 换短期 JWT（提前 60 秒单飞刷新并 CAS 持久化），再以 `Authorization: Bearer` 调 `/completions`。渠道固定 exact `/completions`、codex 协议 + local 转换、禁用 WebSocket；ccLoad 动态暴露 `/models` 中能跨 OpenAI/Anthropic/Google 提供商完成 wire 转换的模型。请求会包进 Zed `thread_id/prompt_id/intent/provider/model/provider_request` envelope；`plan` 403 只冷却当前模型并切换渠道，其他 401/403 才刷新凭证。
 
@@ -930,7 +930,7 @@ ccLoad 使用的核心技术栈：
   - 上游同步入口：Codex 调 `$sync-cliproxy-core`，Claude Code 调 `/sync-cliproxy-core`；一次原子操作固定一个 commit，同时同步核心和全部已登记 provider adapter
   - 无法表示为目标协议的请求返回 `400 Bad Request`，不会触发渠道故障切换或冷却
   - 每个渠道默认接受 Anthropic、Codex、OpenAI、Gemini 客户端；实际上游协议能力属于结构化 URL
-  - 显式协议声明直接选路，不兼容 URL 不发请求、不冷却地跳过；自动模式先试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 回落并跳过已试协议；local 模式仅在全部 URL 未声明时按 Anthropic → Codex → OpenAI → Gemini 回落
+  - 显式协议声明直接选路，不兼容 URL 不发请求、不冷却地跳过；自动模式先试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 回落并跳过已试协议；local 模式按声明顺序回落，官方 Codex 客户端的 Responses 请求会优先已声明 Codex 的候选，仅在全部 URL 未声明时按 Anthropic → Codex → OpenAI → Gemini 回落
   - 自动检测仅在未提交响应的 HTTP 400、非模型 404/405、结构化 `convert_request_failed` + `not implemented` 500，或请求到达 API 前的 Cloudflare 403 拦截页后本地转换；未声明协议的 Exact URL 跨协议直接转换
 - **冷却管理器**（DRY原则）：
   - `cooldown/manager.go`：统一冷却决策引擎

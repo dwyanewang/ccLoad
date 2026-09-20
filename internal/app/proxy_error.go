@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
@@ -20,10 +19,7 @@ import (
 // 错误处理核心函数
 // ============================================================================
 
-const (
-	cooldownWriteTimeout                 = 3 * time.Second
-	codexQuotaOverdraftStatisticsTimeout = 3 * time.Second
-)
+const cooldownWriteTimeout = 3 * time.Second
 
 var cooldownClearChannelFailCount atomic.Uint64
 var cooldownClearKeyFailCount atomic.Uint64
@@ -231,7 +227,7 @@ func buildProxyLogEntry(
 	if res != nil && statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices && res.ResponseModel != "" {
 		responseModel = res.ResponseModel
 	}
-	return buildLogEntry(logEntryParams{
+	entry := buildLogEntry(logEntryParams{
 		RequestModel:     reqCtx.requestLogModel(),
 		ActualModel:      actualModel,
 		ResponseModel:    responseModel,
@@ -253,11 +249,14 @@ func buildProxyLogEntry(
 		CostMultiplier:   reqCtx.attemptCostMultiplier,
 		ThinkingEffort:   reqCtx.thinkingEffort,
 	})
+	if cfg.UsesAntigravityOAuth() && cfg.AntigravityCredits {
+		entry.Message += " [credits]"
+	}
+	return entry
 }
 
 func (s *Server) updateTokenStatsForProxy(
 	reqCtx *proxyRequestContext,
-	cfg *model.Config,
 	isSuccess bool,
 	duration float64,
 	res *fwResult,
@@ -271,6 +270,49 @@ func (s *Server) updateTokenStatsForProxy(
 	}
 	billingModel := resolveProxyBillingModel(requestPath, actualModel, requestModel)
 	s.updateTokenStatsAsync(reqCtx.tokenHash, reqCtx.attemptCostMultiplier, isSuccess, duration, reqCtx.isStreaming, res, billingModel)
+}
+
+// newOperatorAbortResult 构造"未向下游提交响应"时的中断结果：跳过当前渠道，不施加冷却。
+// 已提交响应的中断走 handleOperatorAbort（记 599 并停止切换）。
+//
+// 中断可能发生在 forwardAttempt 之外（凭证刷新、Key/URL 重试等待），这些路径直接返回本结果，
+// 不经过 handleOperatorAbort，因此必须在此记 502，否则日志只剩"上一次失败 + 换渠道成功"，
+// 无法解释换渠原因。
+func (s *Server) newOperatorAbortResult(cfg *model.Config, actualModel, selectedKey string, reqCtx *proxyRequestContext) *proxyResult {
+	logged := false
+	if reqCtx != nil && !reqCtx.skipProxyLog {
+		duration := 0.0
+		if !reqCtx.channelStartTime.IsZero() {
+			duration = time.Since(reqCtx.channelStartTime).Seconds()
+		}
+		s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, http.StatusBadGateway, duration, nil, errOperatorAbort.Error())
+		logged = true
+	}
+	return &proxyResult{
+		status: http.StatusBadGateway, body: []byte(errOperatorAbort.Error()), channelID: &cfg.ID,
+		operatorAborted: true, nextAction: cooldown.ActionRetryChannel, proxyLogWritten: logged,
+	}
+}
+
+// handleOperatorAbort 只记录本次尝试，不把人工控制转成渠道故障。
+func (s *Server) handleOperatorAbort(cfg *model.Config, actualModel, selectedKey string, res *fwResult, duration float64, reqCtx *proxyRequestContext) *proxyResult {
+	committed := res != nil && res.ResponseCommitted
+	status, action := http.StatusBadGateway, cooldown.ActionRetryChannel
+	if committed {
+		status, action = util.StatusStreamIncomplete, cooldown.ActionReturnClient
+	}
+	if !reqCtx.skipProxyLog {
+		s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, status, duration, res, errOperatorAbort.Error())
+	}
+	if res != nil && hasConsumedTokens(res) {
+		s.updateTokenStatsForProxy(reqCtx, false, duration, res, actualModel)
+	}
+	return &proxyResult{
+		status: status, body: []byte(errOperatorAbort.Error()), channelID: &cfg.ID,
+		// succeeded 表示"响应已提交给下游，不要再写第二份"，而非请求成功。
+		duration: duration, succeeded: committed, nextAction: action,
+		operatorAborted: true, proxyLogWritten: !reqCtx.skipProxyLog,
+	}
 }
 
 // handleNetworkError 处理网络错误
@@ -314,7 +356,7 @@ func (s *Server) handleNetworkError(
 	// [FIX] 2026-01: 499（客户端取消）不计入 failure_count，与 logs 表聚合逻辑保持一致
 	if statusCode != 499 && res != nil && hasConsumedTokens(res) {
 		// isSuccess=false 表示请求失败，但仍记录已消耗的 token
-		s.updateTokenStatsForProxy(reqCtx, cfg, false, duration, res, actualModel)
+		s.updateTokenStatsForProxy(reqCtx, false, duration, res, actualModel)
 	}
 
 	if !shouldRetry {
@@ -530,72 +572,47 @@ func (s *Server) handleProxySuccess(
 
 	// 使用 cooldownManager 清除冷却状态
 	// 设计原则: 清除失败不应影响用户请求成功
-	if err := s.cooldownManager.ClearChannelCooldown(cooldownCtx, cfg.ID); err != nil {
-		count := cooldownClearChannelFailCount.Add(1)
-		if count%100 == 1 {
-			log.Printf("[WARN] ClearChannelCooldown 失败 (累计: %d): channel_id=%d err=%v", count, cfg.ID, err)
-		}
-	}
-	if keyIndex != cooldown.NoKeyIndex {
-		if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
-			count := cooldownClearKeyFailCount.Add(1)
+	if !cfg.AntigravityCredits {
+		if err := s.cooldownManager.ClearChannelCooldown(cooldownCtx, cfg.ID); err != nil {
+			count := cooldownClearChannelFailCount.Add(1)
 			if count%100 == 1 {
-				log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+				log.Printf("[WARN] ClearChannelCooldown 失败 (累计: %d): channel_id=%d err=%v", count, cfg.ID, err)
 			}
 		}
-	}
-	if actualModel != "" && s.hasActiveModelCooldown(ctx, cfg.ID, actualModel) {
-		if err := s.cooldownManager.ClearModelCooldown(cooldownCtx, cfg.ID, actualModel); err != nil {
-			count := cooldownClearModelFailCount.Add(1)
-			if count%100 == 1 {
-				log.Printf("[WARN] ClearModelCooldown 失败 (累计: %d): channel_id=%d model=%s err=%v",
-					count, cfg.ID, actualModel, err)
+		if keyIndex != cooldown.NoKeyIndex {
+			if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
+				count := cooldownClearKeyFailCount.Add(1)
+				if count%100 == 1 {
+					log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+				}
 			}
 		}
-	}
+		if actualModel != "" {
+			if err := s.cooldownManager.ClearModelCooldown(cooldownCtx, cfg.ID, actualModel); err != nil {
+				count := cooldownClearModelFailCount.Add(1)
+				if count%100 == 1 {
+					log.Printf("[WARN] ClearModelCooldown 失败 (累计: %d): channel_id=%d model=%s err=%v",
+						count, cfg.ID, actualModel, err)
+				}
+			}
+		}
 
-	// 冷却状态已恢复，刷新相关缓存避免下次命中过期数据
-	s.invalidateChannelRelatedCache(cfg.ID)
+		// 冷却状态已恢复，刷新相关缓存避免下次命中过期数据
+		s.invalidateChannelRelatedCache(cfg.ID)
+	}
+	if !cfg.AntigravityCredits && s.antigravityCredentials.standardQuotaUntil(cfg, actualModel).After(time.Now()) {
+		s.antigravityCredentials.updateQuotaState(ctx, cfg, actualModel, time.Time{}, false)
+	}
 
 	if cfg.RetryOtherKeysOnFailure && reqCtx.routingSession != nil {
 		reqCtx.routingSession.rememberPreferredChannel(cfg.ID)
 	}
 
-	// 日志与超额统计必须复用同一次成本计算，避免两个记账口径漂移。
 	entry := buildProxyLogEntry(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res, "")
-	overdraftEnabled, persistedOverdraftActive := codexQuotaOverdraftState(cfg, time.Now().Unix())
-	overdraftUsed := res.QuotaOverdraftReplayed
-	if res.QuotaOverdraftReplayed || overdraftEnabled {
-		if s.codexCredentials == nil {
-			log.Printf("[WARN] Codex 超额使用统计未写入: channel_id=%d credential manager unavailable", cfg.ID)
-			overdraftUsed = overdraftUsed || persistedOverdraftActive
-		} else {
-			statisticsCtx, statisticsCancel := context.WithTimeout(
-				context.WithoutCancel(ctx), codexQuotaOverdraftStatisticsTimeout,
-			)
-			_, recorded, err := s.codexCredentials.recordQuotaOverdraftSuccess(
-				statisticsCtx, cfg.ID, util.USDToMicroUSD(entry.Cost),
-				res.QuotaOverdraftReplayed, res.QuotaOverdraftActiveUntil,
-			)
-			statisticsCancel()
-			if err != nil {
-				// 统计失败不允许把已经成功的上游请求改成客户端失败。
-				log.Printf("[WARN] Codex 超额使用统计写入失败: channel_id=%d err=%v", cfg.ID, err)
-				// active_until 是已持久化的超额周期证据。本次记账失败不应
-				// 把真实超额请求的日志降级成普通 ok。
-				overdraftUsed = overdraftUsed || persistedOverdraftActive
-			} else {
-				overdraftUsed = overdraftUsed || recorded
-			}
-		}
-	}
-	if overdraftUsed && !res.QuotaOverdraftReplayed {
-		entry.Message = appendRetryStrategyToMessage(entry.Message, codexQuotaOverdraftRetryStrategy)
-	}
 	s.AddLogAsync(entry)
 
 	// 异步更新Token统计
-	s.updateTokenStatsForProxy(reqCtx, cfg, true, duration, res, actualModel)
+	s.updateTokenStatsForProxy(reqCtx, true, duration, res, actualModel)
 
 	return &proxyResult{
 		status:           res.Status,
@@ -609,17 +626,6 @@ func (s *Server) handleProxySuccess(
 		responsesTurn:    res.ResponsesTurnResult,
 		hasResponsesTurn: res.HasResponsesTurnResult,
 	}, cooldown.ActionReturnClient
-}
-
-func codexQuotaOverdraftState(cfg *model.Config, now int64) (enabled bool, active bool) {
-	if cfg == nil || !cfg.UsesCodexOAuth() {
-		return false, false
-	}
-	credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
-	if err != nil || credential.QuotaOverdraft == nil || !credential.QuotaOverdraft.Enabled {
-		return false, false
-	}
-	return true, credential.QuotaOverdraft.ActiveUntil > now
 }
 
 // handleStreamingErrorNoRetry 处理流式响应中途检测到的错误（597/599）
@@ -674,7 +680,7 @@ func (s *Server) handleUncommittedWebsocketTransportFailure(
 		res,
 		res.StreamDiagMsg,
 	)
-	s.updateTokenStatsForProxy(reqCtx, cfg, false, duration, res, actualModel)
+	s.updateTokenStatsForProxy(reqCtx, false, duration, res, actualModel)
 
 	return &proxyResult{
 		status:                 res.Status,
@@ -721,7 +727,7 @@ func (s *Server) handleProxyErrorResponse(
 	// [FIX] 2026-01: 499（客户端取消）不计入成功/失败统计，与 logs 表聚合逻辑保持一致
 	if res.Status != 499 {
 		// 异步更新Token统计（失败请求不计费）
-		s.updateTokenStatsForProxy(reqCtx, cfg, false, duration, res, actualModel)
+		s.updateTokenStatsForProxy(reqCtx, false, duration, res, actualModel)
 	}
 
 	failure := &proxyResult{

@@ -18,6 +18,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // HandleChannelChat 对话端点：流式上游实时透传，非流式上游归一化为前端 SSE。
@@ -498,6 +499,8 @@ func (s *Server) streamChatWithURLForProtocol(
 		}
 		return chatURLAttemptResult{result: attachTestDebugData(requestPlan, nil, result)}
 	}
+	s.persistDetectionCodexPassiveUsage(req.Context(), cfg, resp, gjson.GetBytes(requestPlan.requestBody, "model").String())
+	s.persistDetectionAnthropicPassiveUsage(req.Context(), cfg, resp)
 	defer func() { _ = resp.Body.Close() }()
 	if requestPlan.debugCapture != nil {
 		requestPlan.debugCapture.wrapResponseBody(resp)
@@ -505,6 +508,7 @@ func (s *Server) streamChatWithURLForProtocol(
 
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := responseIsSSE(resp, requestPlan.upstreamStreaming)
+	wrapCodexSSEResponseBody(resp, protocol.Protocol(requestPlan.upstreamProtocol), isSSE)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))

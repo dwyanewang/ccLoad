@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -52,6 +54,417 @@ func runHandleSuccessResponse(t *testing.T, body string, headers http.Header, is
 	}
 
 	return res, rec.Body.String()
+}
+
+func TestReadSSEPrefixThroughFirstEventReturnsTailWithoutEOF(t *testing.T) {
+	data := []byte("event: response.created\ndata: {\"type\":\"response.created\"}\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\nTAIL")
+	r := &prefixBurstThenErrorReader{data: data}
+	got, err := readSSEPrefixThroughFirstEvent(wrapCodexSSEBody(io.NopCloser(r)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasSuffix(got, []byte("TAIL")) {
+		t.Fatalf("prefix lost tail: got %q", got)
+	}
+	if !bytes.Contains(got, []byte("}\n\nevent: response.completed")) {
+		t.Fatalf("framing repair missing from prefix: %q", got)
+	}
+}
+
+func TestResponseIsSSEAcceptsHeartbeatAndBOMPrefix(t *testing.T) {
+	input := "\xef\xbb\xbf : ping\nevent: response.created\ndata: {}\n\n"
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body: &chunkedProbeReadCloser{chunks: [][]byte{
+			[]byte("\xef"), []byte("\xbb\xbf : ping"), []byte("\nevent:"), []byte(" response.created\ndata: {}\n\n"),
+		}},
+	}
+	if !responseIsSSE(resp, true) {
+		t.Fatal("responseIsSSE() rejected BOM/heartbeat-prefixed SSE")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if string(got) != input {
+		t.Fatalf("response probe changed body: got %q, want %q", got, input)
+	}
+}
+
+type chunkedProbeReadCloser struct {
+	chunks [][]byte
+}
+
+func (r *chunkedProbeReadCloser) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[0]
+	r.chunks = r.chunks[1:]
+	return copy(p, chunk), nil
+}
+
+func (*chunkedProbeReadCloser) Close() error { return nil }
+
+type probeErrorReadCloser struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *probeErrorReadCloser) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), r.err
+}
+
+func (*probeErrorReadCloser) Close() error { return nil }
+
+func TestResponseIsSSEPreservesProbeReadError(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "data and error", data: "event: response.created\ndata: {}\n"},
+		{name: "error without data"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			readErr := errors.New("upstream probe failed")
+			resp := &http.Response{
+				Header: http.Header{"Content-Type": []string{"text/plain"}},
+				Body:   &probeErrorReadCloser{data: []byte(tc.data), err: readErr},
+			}
+			_ = responseIsSSE(resp, true)
+			got, err := io.ReadAll(resp.Body)
+			if !errors.Is(err, readErr) {
+				t.Fatalf("restored body error=%v, want %v", err, readErr)
+			}
+			if string(got) != tc.data {
+				t.Fatalf("restored body=%q, want %q", got, tc.data)
+			}
+		})
+	}
+}
+
+var errUnexpectedPrefixRead = errors.New("readSSEPrefixThroughFirstEvent read past the first chunk")
+
+type prefixBurstThenErrorReader struct {
+	data []byte
+	sent bool
+}
+
+func (r *prefixBurstThenErrorReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.data), nil
+	}
+	return 0, errUnexpectedPrefixRead
+}
+
+func parseCodexResponseEventTypes(t *testing.T, body string) []string {
+	t.Helper()
+	normalized := strings.ReplaceAll(body, "\r\n", "\n")
+	trimmed := strings.TrimSuffix(normalized, "\n\n")
+	if trimmed == "" {
+		return nil
+	}
+	frames := strings.Split(trimmed, "\n\n")
+	got := make([]string, 0, len(frames))
+	for _, frame := range frames {
+		var eventName, dataLine string
+		for _, line := range strings.Split(frame, "\n") {
+			switch {
+			case strings.HasPrefix(line, ":"):
+				continue
+			case strings.HasPrefix(line, "event: "):
+				eventName = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				dataLine = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if eventName == "" || dataLine == "" {
+			t.Fatalf("incomplete Codex SSE frame %q", frame)
+		}
+		var payload struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(dataLine), &payload); err != nil {
+			t.Fatalf("frame %q has invalid data JSON: %v", frame, err)
+		}
+		if payload.Type != eventName {
+			t.Fatalf("event/type mismatch: event=%q type=%q", eventName, payload.Type)
+		}
+		got = append(got, eventName)
+	}
+	return got
+}
+
+func TestResponseIsSSERejectsCommentOnlyPrefix(t *testing.T) {
+	resp := &http.Response{
+		Header: http.Header{"Content-Type": []string{"text/plain"}},
+		Body:   io.NopCloser(strings.NewReader(": ping\n: still-comment\nnot-sse\n")),
+	}
+	if responseIsSSE(resp, true) {
+		t.Fatal("comment-only prefix must not classify as SSE")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read restored body: %v", err)
+	}
+	if string(got) != ": ping\n: still-comment\nnot-sse\n" {
+		t.Fatalf("probe changed body: got %q", got)
+	}
+}
+
+func TestHandleSuccessResponse_CodexMalformedFixtureEmitsIndependentEvents(t *testing.T) {
+	input := readCodexMalformedSSEFixture(t)
+	reqCtx := &requestContext{
+		ctx:         context.Background(),
+		startTime:   time.Now(),
+		isStreaming: true,
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(input)),
+	}
+	recorder := newRecorder()
+	result, _, err := (&Server{}).handleSuccessResponse(
+		reqCtx, resp, resp.Header.Clone(), recorder, string(protocol.Codex),
+		&streamReadStats{}, nil,
+	)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if result == nil || !result.ResponseCommitted {
+		t.Fatalf("response not committed: %#v", result)
+	}
+	wantTypes := []string{
+		"response.created",
+		"response.in_progress",
+		"response.output_item.added",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done",
+	}
+	gotTypes := parseCodexResponseEventTypes(t, recorder.Body.String())
+	if !slices.Equal(gotTypes, wantTypes) {
+		t.Fatalf("emitted event sequence=%v, want %v; body=%q", gotTypes, wantTypes, recorder.Body.String())
+	}
+}
+
+func TestHandleSuccessResponse_DynamicCodexMalformedSSEUsesFraming(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+	s := &Server{protocolRegistry: reg}
+	reqCtx := &requestContext{
+		ctx:         context.Background(),
+		startTime:   time.Now(),
+		isStreaming: true,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol: protocol.Codex,
+			OriginalModel:  "gpt-5-codex",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(bytes.NewReader(readCodexMalformedSSEFixture(t))),
+	}
+	rec := newRecorder()
+	res, _, err := s.handleSuccessResponse(reqCtx, resp, resp.Header.Clone(), rec, "", &streamReadStats{}, nil)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if res == nil || !res.ResponseCommitted {
+		t.Fatalf("response not committed: %#v", res)
+	}
+	wantTypes := []string{
+		"response.created",
+		"response.in_progress",
+		"response.output_item.added",
+		"response.reasoning_summary_part.added",
+		"response.reasoning_summary_text.delta",
+		"response.reasoning_summary_text.done",
+	}
+	if got := parseCodexResponseEventTypes(t, rec.Body.String()); !slices.Equal(got, wantTypes) {
+		t.Fatalf("dynamic response event sequence=%v, want %v; body=%q", got, wantTypes, rec.Body.String())
+	}
+}
+
+func TestHandleSuccessResponse_DynamicCodexGluedSSEWithoutBlankLines(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+	s := &Server{protocolRegistry: reg}
+	input := "event: response.created\ndata: {\"type\":\"response.created\"}\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	reqCtx := &requestContext{
+		ctx:         context.Background(),
+		startTime:   time.Now(),
+		isStreaming: true,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol: protocol.Codex,
+			OriginalModel:  "gpt-5-codex",
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(input)),
+	}
+	rec := newRecorder()
+	res, _, err := s.handleSuccessResponse(reqCtx, resp, resp.Header.Clone(), rec, "", &streamReadStats{}, nil)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if res == nil || !res.ResponseCommitted {
+		t.Fatalf("response not committed: %#v", res)
+	}
+	got := parseCodexResponseEventTypes(t, rec.Body.String())
+	want := []string{"response.created", "response.completed"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("glued dynamic events=%v, want %v; body=%q", got, want, rec.Body.String())
+	}
+}
+
+func TestHandleSuccessResponse_NonCodexSSEPassesThroughUnchanged(t *testing.T) {
+	input := "event: response.created\ndata: {}\nevent: response.completed\ndata: {}\n\n"
+	reqCtx := &requestContext{
+		ctx: context.Background(), startTime: time.Now(), isStreaming: false,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol: protocol.Anthropic, UpstreamProtocol: protocol.Anthropic,
+			RequestFamily: protocol.RequestFamilyMessages, Streaming: false,
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(input)),
+	}
+	recorder := newRecorder()
+	result, _, err := (&Server{}).handleSuccessResponse(
+		reqCtx, resp, resp.Header.Clone(), recorder, string(protocol.Anthropic),
+		&streamReadStats{}, nil,
+	)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if result == nil || !result.ResponseCommitted {
+		t.Fatalf("response not committed: %#v", result)
+	}
+	if got := recorder.Body.String(); got != input {
+		t.Fatalf("non-Codex SSE changed: got %q, want %q", got, input)
+	}
+}
+
+func TestHandleSuccessResponse_AnthropicStreamingSSEPassesThroughUnchanged(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+	s := &Server{protocolRegistry: reg}
+	input := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	reqCtx := &requestContext{
+		ctx:         context.Background(),
+		startTime:   time.Now(),
+		isStreaming: true,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol:   protocol.Anthropic,
+			UpstreamProtocol: protocol.Anthropic,
+			RequestFamily:    protocol.RequestFamilyMessages,
+			Streaming:        true,
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(input)),
+	}
+	rec := newRecorder()
+	res, _, err := s.handleSuccessResponse(reqCtx, resp, resp.Header.Clone(), rec, string(protocol.Anthropic), &streamReadStats{}, nil)
+	if err != nil {
+		t.Fatalf("handleSuccessResponse() error = %v", err)
+	}
+	if res == nil || !res.ResponseCommitted {
+		t.Fatalf("response not committed: %#v", res)
+	}
+	if got := rec.Body.String(); got != input {
+		t.Fatalf("Anthropic streaming SSE changed: got %q, want %q", got, input)
+	}
+}
+
+func TestHandleTranslatedStreamSuccessResponse_CodexMalformedSSEFramesEachEvent(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+	s := &Server{protocolRegistry: reg}
+	reqCtx := &requestContext{
+		ctx:         context.Background(),
+		startTime:   time.Now(),
+		isStreaming: true,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol:   protocol.OpenAI,
+			UpstreamProtocol: protocol.Codex,
+			OriginalModel:    "gpt-4o",
+			ActualModel:      "gpt-5-codex",
+			NeedsTransform:   true,
+		},
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5-codex\"}}\n\n")),
+	}
+	rec := newRecorder()
+	res, _, err := s.handleSuccessResponse(reqCtx, resp, resp.Header.Clone(), rec, string(protocol.Codex), &streamReadStats{}, nil)
+	if err != nil {
+		t.Fatalf("translated malformed SSE error = %v", err)
+	}
+	if res == nil || !res.ResponseCommitted {
+		t.Fatalf("translated response not committed: %#v", res)
+	}
+	body := strings.ReplaceAll(rec.Body.String(), "\r\n", "\n")
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Fatalf("translated response missing terminal [DONE]: %q", body)
+	}
+	dataFrames := 0
+	for _, frame := range strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n") {
+		if !strings.HasPrefix(frame, "data: ") {
+			t.Fatalf("translated output contains unframed chunk: %q", frame)
+		}
+		data := strings.TrimPrefix(frame, "data: ")
+		if data == "[DONE]" {
+			continue
+		}
+		if !json.Valid([]byte(data)) {
+			t.Fatalf("translated data frame is not JSON: %q", frame)
+		}
+		dataFrames++
+	}
+	if dataFrames == 0 || strings.Count(body, "hello") != 1 {
+		t.Fatalf("translated data frames=%d, hello count=%d; body=%q", dataFrames, strings.Count(body, "hello"), body)
+	}
+}
+
+func TestLooksLikeSSERequiresBothEventAndData(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{"both fields", "event: response.created\ndata: {}\n\n", true},
+		{"data only", "data: {\"key\":\"value\"}\n\n", false},
+		{"event only", "event: response.created\n\n", false},
+		{"neither", "{\"hello\": \"world\"}\n", false},
+		{"data in JSON value", "{\"data: event:\": true}\n", false},
+		{"both with leading whitespace", "  event: x\n  data: y\n", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeSSE([]byte(tc.data)); got != tc.want {
+				t.Fatalf("looksLikeSSE(%q) = %v, want %v", tc.data, got, tc.want)
+			}
+		})
+	}
 }
 
 func headerValueFold(headers http.Header, name string) string {
@@ -115,8 +528,11 @@ func TestCodexOAuthRequestUsesRuntimeCredentialAndCodexWireContract(t *testing.T
 		req.Header.Get("Version") != codexVersion {
 		t.Fatalf("Codex identity headers = %v", req.Header)
 	}
-	if req.Header.Get("Session_id") == "" {
-		t.Fatalf("Codex Session_id header is missing: %v", req.Header)
+	if req.Header.Get("Session-Id") == "" {
+		t.Fatalf("Codex Session-Id header is missing: %v", req.Header)
+	}
+	if req.Header.Get("Session_id") != "" || req.Header.Get("Conversation_id") != "" {
+		t.Fatalf("legacy session headers were generated: %v", req.Header)
 	}
 	if got := req.Header.Get("Accept"); got != "text/event-stream" {
 		t.Fatalf("Accept = %q, want text/event-stream", got)
@@ -239,9 +655,30 @@ func TestCodexOAuthRequestInjectsModelInstructionsAndPreservesExplicitValue(t *t
 	}
 }
 
-func TestCodexOAuthNonStreamReassemblesTerminalResponse(t *testing.T) {
-	body := "event: response.output_item.done\n" +
-		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg-1","content":[{"type":"output_text","text":"ok"}]}}` + "\n\n" +
+func TestCodexOAuthWebsocketInstructionsDropOnlySynthesizedDefault(t *testing.T) {
+	cfg := &model.Config{AuthType: model.AuthTypeCodexOAuth}
+	withoutInstructions := []byte(`{"model":"gpt-5.6-sol","input":[]}`)
+	prepared := prepareCodexOAuthResponsesBody(
+		cfg, protocol.Codex, "/v1/responses", withoutInstructions, make(http.Header),
+	)
+	stripped := stripInjectedCodexOAuthInstructionsForWebsocket(cfg, withoutInstructions, prepared)
+	if gjson.GetBytes(stripped, "instructions").Exists() {
+		t.Fatalf("synthesized websocket instructions were not removed: %s", stripped)
+	}
+
+	explicit := []byte(`{"model":"gpt-5.6-sol","instructions":"client instructions","input":[]}`)
+	explicitPrepared := prepareCodexOAuthResponsesBody(
+		cfg, protocol.Codex, "/v1/responses", explicit, make(http.Header),
+	)
+	explicitStripped := stripInjectedCodexOAuthInstructionsForWebsocket(cfg, explicit, explicitPrepared)
+	if got := gjson.GetBytes(explicitStripped, "instructions").String(); got != "client instructions" {
+		t.Fatalf("explicit websocket instructions = %q, want %q", got, "client instructions")
+	}
+}
+
+func TestCodexOAuthNonStreamReassemblesMalformedSSETerminalResponse(t *testing.T) {
+	body := ": ping\nevent: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg-1","content":[{"type":"output_text","text":"ok"}]}}` + "\n" +
 		"event: response.completed\n" +
 		`data: {"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}` + "\n\n"
 	reqCtx := &requestContext{
@@ -249,7 +686,7 @@ func TestCodexOAuthNonStreamReassemblesTerminalResponse(t *testing.T) {
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 	recorder := newRecorder()
@@ -653,6 +1090,168 @@ func TestCodexBodyWithoutThinking_RemovesReasoningControls(t *testing.T) {
 		!strings.Contains(text, `"type":"message"`) {
 		t.Fatalf("retry body should preserve unrelated include and message input, got %s", text)
 	}
+	assertFieldOrder(t, text, `"model"`, `"include"`, `"input"`)
+}
+
+func TestIsInvalidEncryptedContentErrorRecognizesPackyMessage(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "Packy invalid argument",
+			body: `{"error":{"message":"Could not decrypt the provided encrypted_content. Ensure the value is the unmodified encrypted_content from a previous response.","type":"packy_invalid-argument","code":"invalid-argument"}}`,
+			want: true,
+		},
+		{
+			name: "legacy Codex response",
+			body: `{"error":{"message":"The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.","type":"invalid_request_error","param":"","code":"invalid_encrypted_content"}}`,
+			want: true,
+		},
+		{
+			name: "generic decryption failure",
+			body: `{"error":{"message":"Could not decrypt the provided request token."}}`,
+			want: false,
+		},
+		{
+			name: "encrypted content without replay provenance",
+			body: `{"error":{"message":"Could not decrypt encrypted_content."}}`,
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isInvalidEncryptedContentError([]byte(tc.body)); got != tc.want {
+				t.Fatalf("isInvalidEncryptedContentError()=%v, want %v for %s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
+func TestCodexBodyWithoutEncryptedInputItemsPreservesCompactionAndToolHistory(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"gpt-5.5","input":[
+		{"type":"compaction","encrypted_content":"opaque-summary"},
+		{"type":"reasoning","summary":[],"encrypted_content":"opaque-reasoning"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]},
+		{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call-1","output":"ok"}
+	]}`)
+
+	got, ok := codexBodyWithoutEncryptedInputItems(body)
+	if !ok {
+		t.Fatal("codexBodyWithoutEncryptedInputItems returned ok=false")
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("retry input items=%d, want 4: %s", len(items), got)
+	}
+	if compaction := gjson.GetBytes(got, "input.0"); compaction.Get("type").String() != "compaction" ||
+		compaction.Get("encrypted_content").String() != "opaque-summary" {
+		t.Fatalf("encrypted compaction was changed or removed: %s", got)
+	}
+	if gjson.GetBytes(got, "input.#(type==reasoning)").Exists() {
+		t.Fatalf("encrypted reasoning should be removed: %s", got)
+	}
+	for index, wantType := range []string{"message", "function_call", "function_call_output"} {
+		if gotType := gjson.GetBytes(got, fmt.Sprintf("input.%d.type", index+1)).String(); gotType != wantType {
+			t.Fatalf("input.%d.type=%q, want %q: %s", index+1, gotType, wantType, got)
+		}
+	}
+	if gotCallID := gjson.GetBytes(got, "input.3.call_id").String(); gotCallID != "call-1" {
+		t.Fatalf("tool output call_id=%q, want call-1: %s", gotCallID, got)
+	}
+}
+
+func TestCodexBodyWithoutEncryptedInputItemsOnlyRemovesEncryptedReasoning(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"gpt-5.5","input":[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"clear reasoning"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+	]}`)
+
+	if got, ok := codexBodyWithoutEncryptedInputItems(body); ok || got != nil {
+		t.Fatalf("plain reasoning must not be stripped by encrypted-content retry: ok=%v body=%s", ok, got)
+	}
+}
+
+func TestCodexBodyWithoutEncryptedContentPreservesCompaction(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"gpt-5.5","input":[
+		{"type":"compaction","encrypted_content":"opaque-summary"},
+		{"type":"compaction_summary","encrypted_content":"opaque-summary-2"},
+		{"type":"reasoning","encrypted_content":"opaque-reasoning"},
+		{"type":"message","role":"user","content":"continue"}
+	]}`)
+
+	got, ok := codexBodyWithoutEncryptedContent(body)
+	if !ok {
+		t.Fatal("codexBodyWithoutEncryptedContent returned ok=false")
+	}
+	if gjson.GetBytes(got, "input.0.type").String() != "compaction" ||
+		gjson.GetBytes(got, "input.0.encrypted_content").String() != "opaque-summary" {
+		t.Fatalf("encrypted compaction was changed or removed: %s", got)
+	}
+	if gjson.GetBytes(got, "input.1.type").String() != "compaction_summary" ||
+		gjson.GetBytes(got, "input.1.encrypted_content").String() != "opaque-summary-2" {
+		t.Fatalf("encrypted compaction summary was changed or removed: %s", got)
+	}
+	if gjson.GetBytes(got, "input.2.encrypted_content").Exists() {
+		t.Fatalf("reasoning encrypted_content should be removed: %s", got)
+	}
+}
+
+func TestCodexBodyWithoutEncryptedContentPreservesLargeValuesAndDottedKeys(t *testing.T) {
+	body := []byte(`{"input":[{"type":"compaction","encrypted_content":"keep","metadata":{"turn.id":9007199254740993123456789}},{"type":"tool_result","payload":{"encrypted_content":"drop","turn.id":9007199254740993123456789}}]}`)
+
+	got, ok := codexBodyWithoutEncryptedContent(body)
+	if !ok {
+		t.Fatal("codexBodyWithoutEncryptedContent returned ok=false")
+	}
+	if !bytes.Contains(got, []byte(`"turn.id":9007199254740993123456789`)) {
+		t.Fatalf("large dotted-key value was changed: %s", got)
+	}
+	if !bytes.Contains(got, []byte(`"type":"compaction","encrypted_content":"keep"`)) {
+		t.Fatalf("compaction payload was changed: %s", got)
+	}
+	if bytes.Contains(got, []byte(`"encrypted_content":"drop"`)) {
+		t.Fatalf("non-compaction encrypted content was retained: %s", got)
+	}
+}
+
+func TestCodexRetryBodyFor400_RecognizesPackyEncryptedContentError(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"gpt-5.5","input":[
+		{"type":"reasoning","summary":[],"encrypted_content":"opaque-reasoning"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+	]}`)
+	res := &fwResult{
+		Status: http.StatusBadRequest,
+		Body:   []byte(`{"error":{"message":"Could not decrypt the provided encrypted_content. Ensure the value is the unmodified encrypted_content from a previous response.","type":"packy_invalid-argument","code":"invalid-argument"}}`),
+	}
+	plan := protocol.TransformPlan{TranslatedBody: body}
+
+	got, strategy, ok := codexRetryBodyFor400(protocol.Codex, nil, plan, res)
+	if !ok {
+		t.Fatal("codexRetryBodyFor400 returned ok=false for Packy error")
+	}
+	if strategy != "strip_codex_encrypted_input" {
+		t.Fatalf("strategy=%q, want strip_codex_encrypted_input", strategy)
+	}
+	if gjson.GetBytes(got, "input.#").Int() != 1 ||
+		gjson.GetBytes(got, "input.0.type").String() != "message" ||
+		gjson.GetBytes(got, "input.0.content.0.text").String() != "continue" {
+		t.Fatalf("retry body did not retain usable message history: %s", got)
+	}
 }
 
 func TestResponsesRetryBodyForMissingRequiredParameter_DropsInputItem(t *testing.T) {
@@ -688,6 +1287,7 @@ func TestResponsesRetryBodyForMissingRequiredParameter_DropsInputItem(t *testing
 	if items[1].Get("type").String() != "agent_message" || items[1].Get("content.0.text").String() != "follow-up" {
 		t.Fatalf("follow-up item lost: %s", got)
 	}
+	assertFieldOrder(t, string(got), `"model"`, `"input"`)
 }
 
 func TestResponsesRetryBodyForMissingRequiredParameter_IgnoresNonMatchingErrors(t *testing.T) {
@@ -754,6 +1354,106 @@ func TestRetryBodyForRejectedRequest_StripsMissingRequiredInput(t *testing.T) {
 	}
 }
 
+func TestAnthropicRetryBodyFor400PreservesOrderWhileDowngradingThinking(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"claude-opus-4-6","thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"keep this","cache_control":{"type":"ephemeral"}}]}],"output_config":{"effort":"high","format":{"type":"json"}},"metadata":{"keep":true}}`)
+	res := &fwResult{
+		Status: http.StatusBadRequest,
+		Body:   []byte(`{"error":{"type":"invalid_request_error","message":"thinking blocks are not supported"}}`),
+	}
+
+	got, strategy, ok := anthropicRetryBodyFor400(protocol.Anthropic, protocol.TransformPlan{TranslatedBody: body}, res)
+	if !ok || strategy != "downgrade_anthropic_thinking" {
+		t.Fatalf("retry = (%q, %v), body=%s", strategy, ok, got)
+	}
+	if gjson.GetBytes(got, "thinking").Exists() || gjson.GetBytes(got, "output_config.effort").Exists() {
+		t.Fatalf("thinking controls survived downgrade: %s", got)
+	}
+	if gotFormat := gjson.GetBytes(got, "output_config.format.type").String(); gotFormat != "json" {
+		t.Fatalf("output_config.format.type = %q, body=%s", gotFormat, got)
+	}
+	if blockType := gjson.GetBytes(got, "messages.0.content.0.type").String(); blockType != "text" {
+		t.Fatalf("thinking block type = %q, body=%s", blockType, got)
+	}
+	assertFieldOrder(t, string(got), `"model"`, `"messages"`, `"output_config"`, `"metadata"`)
+}
+
+func TestNormalizeAnthropicMessagesBodyPatchesOnlyChangedMembers(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],"thinking":{"type":"adaptive","budget_tokens":4096},"metadata":{"z":1,"a":2}}`)
+
+	got, err := normalizeAnthropicMessagesBody(body)
+	if err != nil {
+		t.Fatalf("normalizeAnthropicMessagesBody() error = %v", err)
+	}
+	if effort := gjson.GetBytes(got, "output_config.effort").String(); effort != "medium" {
+		t.Fatalf("output_config.effort = %q, body=%s", effort, got)
+	}
+	if gjson.GetBytes(got, "thinking.budget_tokens").Exists() {
+		t.Fatalf("budget_tokens survived normalization: %s", got)
+	}
+	assertFieldOrder(t, string(got), `"model"`, `"messages"`, `"thinking"`, `"metadata"`, `"output_config"`)
+	assertFieldOrder(t, gjson.GetBytes(got, "metadata").Raw, `"z"`, `"a"`)
+}
+func TestNormalizeAnthropicMessagesBodySanitizesOpaqueThinkingSignatureOnCanonicalBody(t *testing.T) {
+	t.Parallel()
+	// body 已满足 normalizeAnthropicMessagesRequest 的全部字段条件：
+	// adaptive thinking 无 budget_tokens、cache_control 已存在、无采样字段，
+	// normalize 不会改写任何成员。但 assistant 的 thinking block 携带 Claude-compatible
+	// 上游不接受的外来 signature（opaque-deepseek-id）——canonical body 也必须被清洗。
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":4096,"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"thinking","thinking":"foreign reasoning","signature":"opaque-deepseek-id"},{"type":"text","text":"answer"}]}]}`)
+
+	got, err := normalizeAnthropicMessagesBody(body)
+	if err != nil {
+		t.Fatalf("normalizeAnthropicMessagesBody() error = %v", err)
+	}
+	// 外来 signature 不兼容 Claude 上游，thinking block 必须整体删除，
+	// 相邻的普通 text block 保持不变。
+	if strings.Contains(string(got), "opaque-deepseek-id") {
+		t.Fatalf("opaque-signature thinking block survived sanitization: %s", got)
+	}
+	blocks := gjson.GetBytes(got, "messages.1.content")
+	if len(blocks.Array()) != 1 || blocks.Get("0.type").String() != "text" || blocks.Get("0.text").String() != "answer" {
+		t.Fatalf("assistant content = %s, want single text block after sanitization", blocks.Raw)
+	}
+}
+
+// Anthropic 改写全程用 sjson 就地写字节，而 sjson 对截断/带尾随数据的输入会静默
+// 返回损坏结果且 err == nil。入口这一次语法校验是唯一防线，必须拒绝非法 body。
+func TestNormalizeAnthropicMessagesBodyRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{
+		`{"model":"claude-opus-4-6"} {"unexpected":true}`,
+		`{"model":"claude-opus-4-6"`,
+		`[{"model":"claude-opus-4-6"}]`,
+		``,
+	} {
+		if _, err := normalizeAnthropicMessagesBody([]byte(body)); err == nil {
+			t.Fatalf("normalizeAnthropicMessagesBody accepted malformed body %q", body)
+		}
+	}
+}
+
+func TestRectifyAnthropicThinkingBudgetRejectsFractionalTokenCounts(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"thinking":{"type":"enabled","budget_tokens":32000.5},"max_tokens":64000.5}`)
+	if got, ok := rectifyAnthropicThinkingBudget(body); !ok || gjson.GetBytes(got, "thinking.budget_tokens").Int() != 32000 || gjson.GetBytes(got, "max_tokens").Int() != 64000 {
+		t.Fatalf("fractional token counts were not repaired exactly: ok=%v body=%s", ok, got)
+	}
+}
+
+func TestDowngradeAnthropicThinkingBlocksRemovesEmptyOutputConfig(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"claude-opus-4-6","output_config":{"effort":"high"},"messages":[]}`)
+	got, ok := downgradeAnthropicThinkingBlocks(body)
+	if !ok {
+		t.Fatal("expected thinking downgrade to apply")
+	}
+	if gjson.GetBytes(got, "output_config").Exists() {
+		t.Fatalf("empty output_config survived: %s", got)
+	}
+}
+
 func TestRetryBodyForRejectedRequest_StripsUnknownInputStatus(t *testing.T) {
 	t.Parallel()
 	// 两个 item 都带 status：一次性剥离全部，而不是只删上游点名的单个路径。
@@ -766,7 +1466,6 @@ func TestRetryBodyForRejectedRequest_StripsUnknownInputStatus(t *testing.T) {
 		ClientProtocol: protocol.Codex, UpstreamProtocol: protocol.Codex,
 		RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: body,
 	}
-
 	got, strategy, ok := retryBodyForRejectedRequest(protocol.Codex, nil, plan, res)
 	if !ok {
 		t.Fatal("retryBodyForRejectedRequest returned ok=false")
@@ -938,6 +1637,7 @@ func TestResponsesRetryBodyForUnknownParameter_RequiresCodexResponsesScope(t *te
 func TestResponsesBodyForHTTPTransport_StripsInputItemStatus(t *testing.T) {
 	t.Parallel()
 	body := []byte(`{"model":"gpt-5.6-sol","seed":9007199254740993,"input":[{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}","status":"completed"},{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}]}`)
+	want := []byte(`{"model":"gpt-5.6-sol","seed":9007199254740993,"input":[{"type":"function_call","call_id":"call_1","name":"exec","arguments":"{}"},{"type":"message","role":"user","content":[{"type":"input_text","text":"ok"}]}]}`)
 	plan := protocol.TransformPlan{
 		ClientProtocol:   protocol.Codex,
 		UpstreamProtocol: protocol.Codex,
@@ -953,11 +1653,69 @@ func TestResponsesBodyForHTTPTransport_StripsInputItemStatus(t *testing.T) {
 	if gjson.GetBytes(got, "seed").Raw != "9007199254740993" {
 		t.Fatalf("HTTP Codex body changed large integer: %s", got)
 	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("HTTP Codex body changed unrelated serialized bytes:\n got: %s\nwant: %s", got, want)
+	}
 
 	plan.UpstreamProtocol = protocol.OpenAI
 	got = responsesBodyForHTTPTransport(&model.Config{}, plan, body)
 	if !gjson.GetBytes(got, "input.0.status").Exists() {
 		t.Fatalf("non-Codex upstream body lost input status: %s", got)
+	}
+}
+
+func TestStripResponsesInputItemStatusPreservesTranscriptSerialization(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"function_call","id":"fc_0","call_id":"call_0","name":"exec","arguments":"{\"large\":9007199254740993}","status":"completed"},{"status":"completed","type":"function_call","id":"fc_1","call_id":"call_1","name":"exec","arguments":"{}"},{"type":"function_call","status":"in_progress","id":"fc_2","call_id":"call_2","name":"exec","arguments":"{}"},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"},{"type":"metadata","status":"nested-keep"}]}],"metadata":{"status":"top-level-keep"},"seed":9007199254740993}`)
+	want := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"function_call","id":"fc_0","call_id":"call_0","name":"exec","arguments":"{\"large\":9007199254740993}"},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec","arguments":"{}"},{"type":"function_call","id":"fc_2","call_id":"call_2","name":"exec","arguments":"{}"},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"},{"type":"metadata","status":"nested-keep"}]}],"metadata":{"status":"top-level-keep"},"seed":9007199254740993}`)
+
+	for range 100 {
+		got := stripResponsesInputItemStatus(body)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("status stripping changed the serialized transcript prefix:\n got: %s\nwant: %s", got, want)
+		}
+	}
+}
+
+func TestStripResponsesInputItemStatusLeavesInvalidJSONUntouched(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"input":[{"type":"function_call","status":"completed"}`)
+	if got := stripResponsesInputItemStatus(body); !bytes.Equal(got, body) {
+		t.Fatalf("invalid JSON changed: got %s", got)
+	}
+}
+
+func TestStripResponsesInputItemStatusPreservesUnrelatedWhitespace(t *testing.T) {
+	t.Parallel()
+	body := []byte(`{"input":[{ "status" : "completed" , "type" : "function_call" },{"type":"function_call" , "status" : "completed" },{"status":null}]}`)
+	want := []byte(`{"input":[{  "type" : "function_call" },{"type":"function_call"  },{}]}`)
+	if got := stripResponsesInputItemStatus(body); !bytes.Equal(got, want) {
+		t.Fatalf("status stripping changed unrelated whitespace:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func BenchmarkStripResponsesInputItemStatus(b *testing.B) {
+	for _, itemCount := range []int{1, 100, 1000} {
+		var body strings.Builder
+		body.WriteString(`{"input":[`)
+		for i := range itemCount {
+			if i > 0 {
+				body.WriteByte(',')
+			}
+			fmt.Fprintf(&body, `{"type":"function_call","id":"fc_%d","call_id":"call_%d","name":"exec","arguments":"{}","status":"completed"}`, i, i)
+		}
+		body.WriteString(`]}`)
+		payload := []byte(body.String())
+
+		b.Run(fmt.Sprintf("items_%d", itemCount), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				if got := stripResponsesInputItemStatus(payload); len(got) >= len(payload) {
+					b.Fatal("status fields were not removed")
+				}
+			}
+		})
 	}
 }
 
@@ -1136,7 +1894,7 @@ func TestCodexRetryBodyFor400_UsesSSEErrorStatusForEncryptedContent(t *testing.T
 	body := []byte(`{
 		"model":"gpt-5.5",
 		"input":[
-			{"type":"compaction","encrypted_content":"drop-compaction"},
+			{"type":"compaction","encrypted_content":"keep-compaction"},
 			{"type":"reasoning","summary":[],"encrypted_content":"drop-reasoning"},
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"}]}
 		]
@@ -1154,8 +1912,11 @@ func TestCodexRetryBodyFor400_UsesSSEErrorStatusForEncryptedContent(t *testing.T
 	if strategy != "strip_codex_encrypted_input" {
 		t.Fatalf("strategy=%q, want strip_codex_encrypted_input", strategy)
 	}
-	if items := gjson.GetBytes(got, "input").Array(); len(items) != 1 || items[0].Get("type").String() != "message" {
-		t.Fatalf("retry body should keep only the non-encrypted message, got %s", got)
+	if items := gjson.GetBytes(got, "input").Array(); len(items) != 2 ||
+		items[0].Get("type").String() != "compaction" ||
+		items[0].Get("encrypted_content").String() != "keep-compaction" ||
+		items[1].Get("type").String() != "message" {
+		t.Fatalf("retry body should preserve compaction and keep the message, got %s", got)
 	}
 }
 
@@ -1170,92 +1931,6 @@ func TestCodexRetryBodyFor400_DoesNotRetryCommittedSSEError(t *testing.T) {
 	plan := protocol.TransformPlan{TranslatedBody: []byte(`{"input":[{"type":"reasoning","encrypted_content":"drop"}]}`)}
 	if _, _, ok := codexRetryBodyFor400(protocol.Codex, nil, plan, res); ok {
 		t.Fatal("committed SSE error must not be retried")
-	}
-}
-
-func TestCodexQuotaOverdraftRetryBody_AppendsCompletedToolPair(t *testing.T) {
-	original := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
-	before := bytes.Clone(original)
-	cfg := &model.Config{
-		AuthType: model.AuthTypeCodexOAuth,
-		OAuthCredential: `{"type":"codex","access_token":"at","refresh_token":"rt",` +
-			`"expired":"2030-01-01T00:00:00Z","quota_overdraft":{"enabled":true}}`,
-	}
-	plan := protocol.TransformPlan{
-		ClientProtocol: protocol.Codex, UpstreamProtocol: protocol.Codex,
-		RequestFamily: protocol.RequestFamilyResponses, TranslatedBody: original,
-	}
-	res := &fwResult{
-		Status: http.StatusTooManyRequests,
-		Body:   []byte(`{"error":{"type":"usage_limit_reached","resets_at":4102444800}}`),
-	}
-
-	retryBody, retryTranscript, activeUntil, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPost, plan, res, original)
-	if !ok {
-		t.Fatal("codexQuotaOverdraftRetryBodies returned ok=false")
-	}
-	if activeUntil != 4102444800 {
-		t.Fatalf("activeUntil=%d, want upstream reset", activeUntil)
-	}
-	if !bytes.Equal(retryBody, retryTranscript) {
-		t.Fatalf("wire body and transcript must contain the same tool pair:\nwire=%s\ntranscript=%s", retryBody, retryTranscript)
-	}
-	if !bytes.Equal(original, before) {
-		t.Fatalf("original request body was mutated: %s", original)
-	}
-	items := gjson.GetBytes(retryBody, "input").Array()
-	if len(items) != 3 {
-		t.Fatalf("input items=%d body=%s, want 3", len(items), retryBody)
-	}
-	callID := items[1].Get("call_id").String()
-	if items[1].Get("type").String() != "custom_tool_call" || items[1].Get("name").String() != "exec" ||
-		!strings.HasPrefix(callID, "call_ccload_overdraft_") ||
-		items[2].Get("type").String() != "custom_tool_call_output" || items[2].Get("call_id").String() != callID ||
-		items[2].Get("output.0.text").String() != codexQuotaOverdraftExecOutput {
-		t.Fatalf("invalid overdraft tool pair: %s", retryBody)
-	}
-
-	if _, _, _, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPut, plan, res, original); ok {
-		t.Fatal("non-POST Responses request must not be replayed internally")
-	}
-
-	sseResult := &fwResult{
-		Status: http.StatusOK,
-		SSEErrorEvent: []byte(`{"type":"error","error":{"type":"usage_limit_reached"},` +
-			`"status_code":429}`),
-	}
-	if _, _, _, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPost, plan, sseResult, original); !ok {
-		t.Fatal("uncommitted SSE usage_limit_reached must be replayed")
-	}
-	for name, event := range map[string][]byte{
-		"missing embedded status": []byte(`{"type":"error","error":{"type":"usage_limit_reached"}}`),
-		"wrong embedded status":   []byte(`{"type":"error","error":{"type":"usage_limit_reached"},"status_code":401}`),
-	} {
-		t.Run(name, func(t *testing.T) {
-			result := &fwResult{Status: http.StatusOK, SSEErrorEvent: event}
-			if _, _, _, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPost, plan, result, original); ok {
-				t.Fatal("SSE usage limit without embedded 429 must not be replayed")
-			}
-		})
-	}
-	sseResult.ResponseCommitted = true
-	if _, _, _, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPost, plan, sseResult, original); ok {
-		t.Fatal("committed SSE error must not be replayed")
-	}
-
-	for name, body := range map[string][]byte{
-		"implicit message type": []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`),
-		"trailing Responses Lite tools": []byte(`{"model":"gpt-5.4","input":[` +
-			`{"role":"user","content":"hello"},{"type":"additional_tools","tools":[]}]}`),
-	} {
-		t.Run(name, func(t *testing.T) {
-			variantPlan := plan
-			variantPlan.TranslatedBody = body
-			retryBody, _, _, ok := codexQuotaOverdraftRetryBodies(cfg, http.MethodPost, variantPlan, res, body)
-			if !ok || len(gjson.GetBytes(retryBody, "input").Array()) != len(gjson.GetBytes(body, "input").Array())+2 {
-				t.Fatalf("valid Responses user turn was not replayed: ok=%v body=%s", ok, retryBody)
-			}
-		})
 	}
 }
 
@@ -1627,9 +2302,9 @@ func TestAnthropicOAuthFinalizerBuildsClaudeCodeWireContract(t *testing.T) {
 	body, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(`{
 		"model":"claude-sonnet-4-5","system":"answer tersely","messages":[{"role":"user","content":"hello world"}],
 		"thinking":{"type":"enabled"},"tool_choice":{"type":"auto"}
-	}`), cfg, "", http.Header{"User-Agent": []string{"third-party-client"}})
+	}`), cfg, "", http.Header{"User-Agent": []string{"third-party-client"}}, anthropicOfficialTestURL)
 	if err != nil {
-		t.Fatalf("finalizeAnthropicClaudeCodeMessagesBody() error = %v", err)
+		t.Fatalf("finalizeAnthropicClaudeCodeMessagesBody(, anthropicOfficialTestURL) error = %v", err)
 	}
 	if got := gjson.GetBytes(body, "model").String(); got != "claude-sonnet-4-5-20250929" {
 		t.Fatalf("model = %q", got)
@@ -1681,12 +2356,12 @@ func TestAnthropicOAuthFinalizerReplacesForgedBillingPrefix(t *testing.T) {
 		"model":"claude-sonnet-4-6",
 		"system":[{"type":"text","text":"x-anthropic-billing-header: attacker-controlled"}],
 		"messages":[{"role":"user","content":"hello"}]
-	}`), &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", nil)
+	}`), &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", nil, anthropicOfficialTestURL)
 	if err != nil {
-		t.Fatalf("finalizeAnthropicClaudeCodeMessagesBody() error = %v", err)
+		t.Fatalf("finalizeAnthropicClaudeCodeMessagesBody(, anthropicOfficialTestURL) error = %v", err)
 	}
 	if got := gjson.GetBytes(body, "system.0.text").String(); got == "x-anthropic-billing-header: attacker-controlled" ||
-		!strings.Contains(got, "cc_version=2.1.220.") {
+		!strings.Contains(got, "cc_version=2.1.258.") {
 		t.Fatalf("forged billing block survived: %q", got)
 	}
 	if got := gjson.GetBytes(body, "messages.0.content").String(); got != "[System Instructions]\nx-anthropic-billing-header: attacker-controlled" {
@@ -1694,10 +2369,39 @@ func TestAnthropicOAuthFinalizerReplacesForgedBillingPrefix(t *testing.T) {
 	}
 }
 
+func TestAnthropicClaudeCodeWireUsesIncomingClientVersion(t *testing.T) {
+	t.Parallel()
+	const clientVersion = "9.9.9"
+	headers := http.Header{
+		"User-Agent": {"claude-cli/" + clientVersion + " (external, cli)"},
+	}
+	cfg := &model.Config{Name: "anthropic-api-key"}
+	body, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(`{
+		"model":"claude-sonnet-4-6",
+		"messages":[{"role":"user","content":"hello"}]
+	}`), cfg, "sk-ant-key", headers, anthropicOfficialTestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(body, "system.0.text").String(); !strings.Contains(got, "cc_version="+clientVersion+".") {
+		t.Fatalf("billing version = %q", got)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, anthropicOfficialTestURL.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectAnthropicAPIKeyHeaders(req, cfg, "sk-ant-key", body, headers)
+	if got, want := headerValueFold(req.Header, "User-Agent"),
+		"claude-cli/"+clientVersion+" (external, cli)"; got != want {
+		t.Fatalf("User-Agent = %q, want %q", got, want)
+	}
+}
+
 func TestAnthropicOAuthPreservesNativeClaudeCodeBody(t *testing.T) {
 	credential := &anthropicauth.Credential{
 		Type: anthropicauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
-		Expired: "2030-01-01T00:00:00Z", AccountUUID: "account",
+		Expired: "2030-01-01T00:00:00Z", AccountUUID: "3f2b7c18-9d4e-4a6b-8c51-7e0a2d9b4f36",
 	}
 	credentialJSON, err := credential.JSON()
 	if err != nil {
@@ -1708,19 +2412,19 @@ func TestAnthropicOAuthPreservesNativeClaudeCodeBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}
-	nativeBody := []byte(fmt.Sprintf(`{
+	nativeBody := fmt.Appendf(nil, `{
 		"model":"claude-sonnet-4-6",
 		"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"}],
-		"metadata":{"user_id":"{\"device_id\":\"%s\",\"account_uuid\":\"account\",\"session_id\":\"e03895ad-8b34-4a84-bbf6-002e8909b17b\"}"},
+		"metadata":{"user_id":"{\"device_id\":\"%s\",\"account_uuid\":\"3f2b7c18-9d4e-4a6b-8c51-7e0a2d9b4f36\",\"session_id\":\"e03895ad-8b34-4a84-bbf6-002e8909b17b\"}"},
 		"messages":[{"role":"user","content":"hello"}],"max_tokens":1024
-	}`, parsedCredential.DeviceID))
+	}`, parsedCredential.DeviceID)
 	nativeHeaders := http.Header{
 		"User-Agent": {"claude-cli/2.1.220 (external, cli)"},
 		"X-App":      {"cli"}, "Anthropic-Beta": {"claude-code-20250219"},
 		"X-Claude-Code-Session-Id": {"e03895ad-8b34-4a84-bbf6-002e8909b17b"},
 	}
 	finalized, err := finalizeAnthropicClaudeCodeMessagesBody(
-		nativeBody, cfg, "", nativeHeaders,
+		nativeBody, cfg, "", nativeHeaders, anthropicOfficialTestURL,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1748,7 +2452,7 @@ func TestAnthropicOAuthPreservesMarkerlessHaikuHelper(t *testing.T) {
 	const sessionID = "11111111-2222-4333-8444-555555555555"
 	userID := fmt.Sprintf(`{"device_id":%q,"account_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","session_id":%q}`,
 		credential.DeviceID, sessionID)
-	body := []byte(fmt.Sprintf(`{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`, userID))
+	body := fmt.Appendf(nil, `{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`, userID)
 	betas := "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 	headers := http.Header{
 		"Accept": {"application/json"}, "Accept-Encoding": {"gzip"}, "Content-Type": {"application/json"},
@@ -1761,7 +2465,7 @@ func TestAnthropicOAuthPreservesMarkerlessHaikuHelper(t *testing.T) {
 	}
 	cfg := &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}
 
-	finalized, err := finalizeAnthropicClaudeCodeMessagesBody(body, cfg, "", headers)
+	finalized, err := finalizeAnthropicClaudeCodeMessagesBody(body, cfg, "", headers, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1791,12 +2495,12 @@ func TestAnthropicOAuthPreservesMarkerlessHaikuHelper(t *testing.T) {
 	}
 	pooled, err := finalizeAnthropicClaudeCodeMessagesBody(body, &model.Config{
 		AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: otherCredentialJSON,
-	}, "", headers)
+	}, "", headers, anthropicOfficialTestURL)
 	if err != nil || !bytes.Equal(pooled, body) {
 		t.Fatalf("native helper was tied to the selected pool credential: err=%v body=%s", err, pooled)
 	}
-	reordered := []byte(fmt.Sprintf(`{"max_tokens":1,"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`, userID))
-	cloaked, err := finalizeAnthropicClaudeCodeMessagesBody(reordered, cfg, "", headers)
+	reordered := fmt.Appendf(nil, `{"max_tokens":1,"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"helper probe"}],"metadata":{"user_id":%q}}`, userID)
+	cloaked, err := finalizeAnthropicClaudeCodeMessagesBody(reordered, cfg, "", headers, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1820,7 +2524,7 @@ func TestAnthropicOAuthPreservesStructuredHaikuHelper(t *testing.T) {
 	const sessionID = "11111111-2222-4333-8444-555555555555"
 	userID := fmt.Sprintf(`{"device_id":%q,"account_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","session_id":%q}`,
 		credential.DeviceID, sessionID)
-	body := []byte(fmt.Sprintf(`{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":%q},"max_tokens":32000,"thinking":{"type":"disabled"},"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`, userID))
+	body := fmt.Appendf(nil, `{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":[{"type":"text","text":"helper probe"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Return a short title."}],"tools":[],"metadata":{"user_id":%q},"max_tokens":32000,"thinking":{"type":"disabled"},"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"stream":true}`, userID)
 	betas := "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15"
 	headers := http.Header{
 		"Accept": {"application/json"}, "Accept-Encoding": {"gzip, deflate, br, zstd"}, "Content-Type": {"application/json"},
@@ -1832,7 +2536,7 @@ func TestAnthropicOAuthPreservesStructuredHaikuHelper(t *testing.T) {
 		"X-Stainless-OS": {"MacOS"}, "X-Stainless-Arch": {"arm64"}, "X-Stainless-Retry-Count": {"0"}, "X-Stainless-Timeout": {"600"},
 	}
 	finalized, err := finalizeAnthropicClaudeCodeMessagesBody(
-		body, &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", headers,
+		body, &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", headers, anthropicOfficialTestURL,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1859,7 +2563,7 @@ func TestAnthropicOAuthDropsOnlyAutoContextManagementWithoutThinking(t *testing.
 		"model":"claude-opus-4-6","messages":[{"role":"user","content":"run"}],
 		"tools":[{"name":"run","description":"run","input_schema":{"type":"object"}}],
 		"thinking":{"type":"enabled","budget_tokens":1024},"tool_choice":{"type":"any"}
-	}`), cfg, "", nil)
+	}`), cfg, "", nil, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1870,7 +2574,7 @@ func TestAnthropicOAuthDropsOnlyAutoContextManagementWithoutThinking(t *testing.
 	callerBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(`{
 		"model":"claude-opus-4-6","messages":[{"role":"user","content":"run"}],
 		"context_management":{"edits":[{"type":"caller-owned"}]}
-	}`), cfg, "", nil)
+	}`), cfg, "", nil, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1891,7 +2595,7 @@ func TestAnthropicOAuthCloakOwnsSystemAndRollingMessageCache(t *testing.T) {
 		"model":"claude-opus-4-6",
 		"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"user","content":"second"}],
 		"tools":[{"name":"search","description":"search","input_schema":{"type":"object"}}]
-	}`), &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", nil)
+	}`), &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON}, "", nil, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1932,11 +2636,11 @@ func TestAnthropicOAuthRejectsForgedNativeFingerprint(t *testing.T) {
 		"metadata":{"user_id":"x"},
 		"messages":[{"role":"user","content":"hello"}]
 	}`), &model.Config{AuthType: model.AuthTypeAnthropicOAuth, OAuthCredential: credentialJSON},
-		"", http.Header{"User-Agent": []string{"claude-cli/fake"}})
+		"", http.Header{"User-Agent": []string{"claude-cli/fake"}}, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := gjson.GetBytes(body, "system.0.text").String(); strings.Contains(got, "forged") || !strings.Contains(got, "cc_version=2.1.220.") {
+	if got := gjson.GetBytes(body, "system.0.text").String(); strings.Contains(got, "forged") || !strings.Contains(got, "cc_version=2.1.258.") {
 		t.Fatalf("forged native fingerprint bypassed cloaking: %q", got)
 	}
 	identity := gjson.GetBytes(body, "metadata.user_id").String()
@@ -2095,11 +2799,11 @@ func TestAnthropicAPIKeyAuthenticationUsesOfficialOriginBoundary(t *testing.T) {
 	}
 }
 
-// TestAnthropicAPIKeyFingerprintMatchesOAuthWire 是本次移植的核心契约：Claude Code
-// CLI 指纹只由「是不是 Anthropic Messages 上游」决定，与凭证形态无关。同一份请求
-// 经 OAuth 渠道和 API Key 渠道转发，body 与 header（除认证头与随请求变化的身份值）
-// 必须一字不差——一旦分叉，body 用的能力和 header 声明的 beta 迟早对不上。
-func TestAnthropicAPIKeyFingerprintMatchesOAuthWire(t *testing.T) {
+// TestAnthropicAPIKeyFingerprintMatchesOAuthWireExceptCCH 守住凭证边界：OAuth 与
+// API Key 共用 CLI wire/beta 形状，差异只落在 CCH 上——OAuth 无条件签，API Key 只在
+// 第一方 origin 签（第三方网关把 billing 块当 prompt 文本，每请求变化会打散 prompt
+// cache）。判据见 anthropicCCHSigningEnabled。
+func TestAnthropicAPIKeyFingerprintMatchesOAuthWireExceptCCH(t *testing.T) {
 	const requestBody = `{
 		"model":"claude-sonnet-4-5","system":"answer tersely",
 		"messages":[{"role":"user","content":"hello world"}],
@@ -2117,11 +2821,11 @@ func TestAnthropicAPIKeyFingerprintMatchesOAuthWire(t *testing.T) {
 	apiKeyCfg := &model.Config{Name: "anthropic-api-key"}
 	callerHeaders := http.Header{"User-Agent": []string{"third-party-client"}}
 
-	oauthBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(requestBody), oauthCfg, "", callerHeaders)
+	oauthBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(requestBody), oauthCfg, "", callerHeaders, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatalf("OAuth finalize: %v", err)
 	}
-	apiKeyBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(requestBody), apiKeyCfg, "sk-ant-key", callerHeaders)
+	apiKeyBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(requestBody), apiKeyCfg, "sk-ant-key", callerHeaders, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatalf("API key finalize: %v", err)
 	}
@@ -2137,6 +2841,23 @@ func TestAnthropicAPIKeyFingerprintMatchesOAuthWire(t *testing.T) {
 	if gjson.GetBytes(apiKeyBody, "temperature").Exists() ||
 		!strings.HasPrefix(gjson.GetBytes(apiKeyBody, "system.0.text").String(), "x-anthropic-billing-header:") {
 		t.Fatalf("API key body did not adopt the CLI wire shape: %s", apiKeyBody)
+	}
+	oauthBilling := gjson.GetBytes(oauthBody, "system.0.text").String()
+	apiKeyBilling := gjson.GetBytes(apiKeyBody, "system.0.text").String()
+	if !strings.Contains(oauthBilling, " cch=") || strings.Contains(oauthBilling, "cch=00000;") {
+		t.Fatalf("OAuth billing is not signed: %q", oauthBilling)
+	}
+	if !strings.Contains(apiKeyBilling, " cch=") || strings.Contains(apiKeyBilling, "cch=00000;") {
+		t.Fatalf("API-key billing on first-party origin must be signed: %q", apiKeyBilling)
+	}
+	// 同一份请求发往第三方网关时，billing 必须保持无 cch 的稳定形态。
+	thirdPartyBody, err := finalizeAnthropicClaudeCodeMessagesBody(
+		[]byte(requestBody), apiKeyCfg, "sk-ant-key", callerHeaders, anthropicThirdPartyTestURL)
+	if err != nil {
+		t.Fatalf("third-party finalize: %v", err)
+	}
+	if got := gjson.GetBytes(thirdPartyBody, "system.0.text").String(); strings.Contains(got, "cch=") {
+		t.Fatalf("API-key billing on a third-party gateway must stay unsigned: %q", got)
 	}
 	if anthropicClaudeCodeBetas(oauthBody) != anthropicClaudeCodeBetas(apiKeyBody) {
 		t.Fatalf("beta sets diverged: OAuth=%q API key=%q",
@@ -2187,7 +2908,7 @@ func TestAnthropicClaudeCodeCacheTTLFollowsCaller(t *testing.T) {
 
 	defaultBody, err := finalizeAnthropicClaudeCodeMessagesBody([]byte(`{
 		"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}]
-	}`), cfg, "sk-ant-key", headers)
+	}`), cfg, "sk-ant-key", headers, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2202,7 +2923,7 @@ func TestAnthropicClaudeCodeCacheTTLFollowsCaller(t *testing.T) {
 		"model":"claude-sonnet-4-5","messages":[{"role":"user","content":[
 			{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}
 		]}]
-	}`), cfg, "sk-ant-key", headers)
+	}`), cfg, "sk-ant-key", headers, anthropicOfficialTestURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2267,6 +2988,228 @@ func TestZAICodingPlanSkipsClaudeCodeFingerprint(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := isAnthropicClaudeCodeMessagesRequest(test.cfg, protocol.Anthropic, "/v1/messages"); got != test.want {
 				t.Fatalf("isAnthropicClaudeCodeMessagesRequest = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+// TestAnthropicClaudeCodeRetryReplaysWirePerSigningPolicy 守住重试重放路径：body 已在
+// 首次尝试时最终化，重放只允许按凭证/origin 决定要不要重签 CCH，不允许再跑一轮归一。
+//
+// 这一支是 CCH 条件化之后最容易回归的地方：判据一旦写成 isNativeAnthropicClaudeCodeRequest，
+// 「本渠道不签名」产出的无 cch body 就会被网关判成非原生，自己不认自己。
+func TestAnthropicClaudeCodeRetryReplaysWirePerSigningPolicy(t *testing.T) {
+	headers := http.Header{"User-Agent": []string{"third-party-client"}}
+	cfg := &model.Config{Name: "anthropic-api-key"}
+	const requestBody = `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}]}`
+
+	server := &Server{}
+	for _, testCase := range []struct {
+		name     string
+		target   *url.URL
+		wantSign bool
+	}{
+		{name: "third_party_stays_unsigned", target: anthropicThirdPartyTestURL},
+		{name: "first_party_signs", target: anthropicOfficialTestURL, wantSign: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			finalized, err := finalizeAnthropicClaudeCodeMessagesBody(
+				[]byte(requestBody), cfg, "sk-ant-key", headers, testCase.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 网关自己的产物必须通过出站身份判据，否则重放会被误判成第三方 body。
+			outboundHeaders := http.Header{
+				"User-Agent":               {"claude-cli/" + anthropicCLIVersion + " (external, cli)"},
+				"X-App":                    {"cli"},
+				"Anthropic-Beta":           {"claude-code-20250219"},
+				"X-Claude-Code-Session-Id": {anthropicSessionIDFromRequest(finalized)},
+			}
+			if !isNativeAnthropicClaudeCodeRequest(outboundHeaders) {
+				t.Fatalf("gateway-owned wire failed its own outbound identity check: %s", finalized)
+			}
+			replayed, err := server.prepareTranslatedUpstreamBody(
+				cfg, protocol.Anthropic, "/v1/messages", finalized, finalized,
+				"sk-ant-key", headers, true, testCase.target, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(replayed, finalized) {
+				t.Fatalf("retry replay rewrote an already finalized body:\n got %s\nwant %s", replayed, finalized)
+			}
+			billing := gjson.GetBytes(replayed, "system.0.text").String()
+			if signed := strings.Contains(billing, " cch="); signed != testCase.wantSign {
+				t.Fatalf("signed=%v want %v: %q", signed, testCase.wantSign, billing)
+			}
+		})
+	}
+}
+
+func TestPrepareTranslatedUpstreamBodyInjectsAnyrouterFallbackTools(t *testing.T) {
+	t.Parallel()
+
+	const body = `{"model":"claude-fable-5-1","messages":[{"role":"user","content":"title"}],"tools":[]}`
+	headers := http.Header{
+		"User-Agent":     {"claude-cli/2.1.236 (external, cli)"},
+		"X-App":          {"cli"},
+		"Anthropic-Beta": {"claude-code-20250219"},
+	}
+
+	got, err := (&Server{}).prepareTranslatedUpstreamBody(
+		anyrouterAnthropicCfg(), protocol.Anthropic, "/v1/messages",
+		[]byte(body), []byte(body), "sk-ant-key", headers, false, anthropicThirdPartyTestURL,
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := gjson.GetBytes(got, "tools")
+	if !tools.IsArray() || jsonMemberCount(tools) != 3 {
+		t.Fatalf("tools = %s, want three fallback tools", tools.Raw)
+	}
+	for index, want := range []string{"Edit", "Read", "Write"} {
+		if name := gjson.GetBytes(got, fmt.Sprintf("tools.%d.name", index)).String(); name != want {
+			t.Fatalf("tools.%d.name = %q, want %q; body = %s", index, name, want, got)
+		}
+	}
+}
+
+// TestAnthropicNativeClaudeCodeWithoutCCHPassesThrough 守住入站判据不看 CCH。
+//
+// 下游 Claude Code 指向 ccLoad 时看到的是非第一方 base URL，native gate
+// (`s = firstParty || vertex ? " cch=00000;" : ""`) 直接省略 cch，但 X-App/UA/beta/
+// metadata.user_id 四个身份信号一个不少。把 ` cch=` 当必要条件会让**所有**真实
+// Claude Code 请求落进重写路径：system 被重建成 CLI 三段式、客户端 system block 上
+// 的 cache_control 随 anthropicSystemText 降级整段丢弃、剩余断点再被
+// enforceAnthropicCacheControlLimit 裁剪——客户端自管的 prompt cache 就此失效。
+func TestAnthropicNativeClaudeCodeWithoutCCHPassesThrough(t *testing.T) {
+	const sessionID = "f2e293f7-b6ee-48f7-9258-95be092aae58"
+	identity := fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`,
+		"94a1bc03ba56d8895e3f6f33010c88d32fc9b3165576727d163261ada4af99d1",
+		"00d2be77-53ea-52f8-8a66-bfc5c4b195e9", sessionID)
+	body := fmt.Appendf(nil, `{"model":"claude-opus-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.746; cc_entrypoint=cli;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"metadata":{"user_id":%q},"messages":[{"role":"user","content":[{"type":"text","text":"first","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":"ok"},{"role":"user","content":"second"}],"tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"max_tokens":1024,"temperature":0.4}`, identity)
+	headers := http.Header{
+		"User-Agent":               {"claude-cli/" + anthropicCLIVersion + " (external, cli)"},
+		"X-App":                    {"cli"},
+		"Anthropic-Beta":           {"claude-code-20250219,oauth-2025-04-20"},
+		"X-Claude-Code-Session-Id": {sessionID},
+	}
+	cfg := &model.Config{Name: "anthropic-third-party"}
+
+	if !isNativeAnthropicClaudeCodeRequest(headers) {
+		t.Fatal("a real Claude Code request without cch was rejected by the native detector")
+	}
+	finalized, err := finalizeAnthropicClaudeCodeMessagesBody(body, cfg, "sk-ant-key", headers, anthropicThirdPartyTestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(finalized, body) {
+		t.Fatalf("native body was rewritten:\n got %s\nwant %s", finalized, body)
+	}
+	// 逐项钉死重写路径最先破坏的那几处。
+	if strings.Contains(string(finalized), "[System Instructions]") {
+		t.Fatalf("caller system was demoted into messages: %s", finalized)
+	}
+	for _, path := range []string{
+		"system.1.cache_control", "messages.0.content.0.cache_control", "tools.0.cache_control",
+	} {
+		if !gjson.GetBytes(finalized, path).Exists() {
+			t.Fatalf("caller-owned %s was stripped: %s", path, finalized)
+		}
+	}
+	if gjson.GetBytes(finalized, "metadata.user_id").String() != identity {
+		t.Fatalf("caller identity was replaced with a synthesized one: %s", finalized)
+	}
+}
+
+// TestAnthropicNativeClaudeCodeBodyShapeIsIrrelevant 守住判定只看请求头。
+//
+// body 侧曾经有过三道检查（metadata.user_id 存在性与形态、system[0] 的 billing 前缀、
+// header 与 body 的 session id 等式），每一道都是静默假阴性通道：不匹配不会报错，只会
+// 把真实 Claude Code 请求降级进重写路径、打散客户端自管的 cache_control 断点。这里逐个
+// 钉死它们不再参与判定，并且直通是字节级的。
+func TestAnthropicNativeClaudeCodeBodyShapeIsIrrelevant(t *testing.T) {
+	t.Parallel()
+	headers := http.Header{
+		"User-Agent":     {"claude-cli/" + anthropicCLIVersion + " (external, cli)"},
+		"X-App":          {"cli"},
+		"Anthropic-Beta": {"claude-code-20250219"},
+	}
+	cfg := &model.Config{Name: "anthropic-third-party"}
+
+	const cacheControlBody = `{"model":"claude-opus-5","system":[{"type":"text","text":"custom system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"max_tokens":1024,"temperature":0.4}`
+
+	for _, testCase := range []struct{ name, body string }{
+		{"no metadata at all", cacheControlBody},
+		{"empty account_uuid", `{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"94a1bc03ba56d8895e3f6f33010c88d32fc9b3165576727d163261ada4af99d1\",\"account_uuid\":\"\",\"session_id\":\"f2e293f7-b6ee-48f7-9258-95be092aae58\"}"},"messages":[{"role":"user","content":"hi"}],"max_tokens":1024}`},
+		{"non-uuid account_uuid", `{"model":"claude-opus-5","metadata":{"user_id":"{\"device_id\":\"short\",\"account_uuid\":\"not-a-uuid\",\"session_id\":\"nope\"}"},"messages":[{"role":"user","content":"hi"}],"max_tokens":1024}`},
+		{"no billing prefix in system", cacheControlBody},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if !isNativeAnthropicClaudeCodeRequest(headers) {
+				t.Fatal("native detection must not depend on the body")
+			}
+			body := []byte(testCase.body)
+			finalized, err := finalizeAnthropicClaudeCodeMessagesBody(
+				body, cfg, "sk-ant-key", headers, anthropicThirdPartyTestURL,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(finalized, body) {
+				t.Fatalf("native body was rewritten:\n got %s\nwant %s", finalized, body)
+			}
+		})
+	}
+
+	// 三个头缺任意一个就不是原生请求。
+	for _, missing := range []string{"User-Agent", "X-App", "Anthropic-Beta"} {
+		t.Run("missing "+missing, func(t *testing.T) {
+			t.Parallel()
+			partial := headers.Clone()
+			partial.Del(missing)
+			if isNativeAnthropicClaudeCodeRequest(partial) {
+				t.Fatalf("a request without %s was accepted as native", missing)
+			}
+		})
+	}
+}
+
+// TestValidAnthropicClaudeCLIUserAgent 钉死 UA 判据对齐上游
+// claudeCodeNativeUserAgentPattern + nativeClaudeEntrypoints。
+//
+// 写死 " (external, cli)" 后缀会把带 Agent SDK 的 CLI 和 VSCode 扩展整条拒掉，
+// 后果不是报错而是静默降级到重写路径——客户端的 prompt cache 断点被打散。
+func TestValidAnthropicClaudeCLIUserAgent(t *testing.T) {
+	t.Parallel()
+	version := anthropicCLIVersion
+	for _, testCase := range []struct {
+		name      string
+		userAgent string
+		want      bool
+	}{
+		{"cli", "claude-cli/" + version + " (external, cli)", true},
+		{"cli with agent sdk", "claude-cli/" + version + " (external, cli, agent-sdk/0.1.5)", true},
+		{"sdk-cli", "claude-cli/" + version + " (external, sdk-cli)", true},
+		{"claude-vscode", "claude-cli/" + version + " (external, claude-vscode)", true},
+		{"surrounding whitespace", "  claude-cli/" + version + " (external, cli)  ", true},
+		// 版本号刻意不参与判定：锁死它等于给客户端每次升级埋一颗静默降级地雷。
+		{"newer version", "claude-cli/9.9.9 (external, cli)", true},
+		{"older version", "claude-cli/1.0.0 (external, cli)", true},
+		{"unknown entrypoint", "claude-cli/" + version + " (external, sdk-ts)", false},
+		{"non-numeric version", "claude-cli/latest (external, cli)", false},
+		{"missing external marker", "claude-cli/" + version + " (cli)", false},
+		{"trailing junk", "claude-cli/" + version + " (external, cli) extra", false},
+		{"malformed agent sdk", "claude-cli/" + version + " (external, cli, agent-sdk/x)", false},
+		{"empty", "", false},
+		{"unrelated client", "python-httpx/0.27.0", false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			if got := validAnthropicClaudeCLIUserAgent(testCase.userAgent); got != testCase.want {
+				t.Fatalf("validAnthropicClaudeCLIUserAgent(%q) = %v, want %v",
+					testCase.userAgent, got, testCase.want)
 			}
 		})
 	}

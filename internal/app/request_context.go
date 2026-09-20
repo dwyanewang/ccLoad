@@ -26,17 +26,17 @@ type requestContext struct {
 	streamTimeout                 time.Duration
 	nonStreamTimeout              time.Duration
 	responsesSSEUpstreamNonStream bool
+	codeBuddyOAuth                bool
 	antigravityOAuth              bool
+	antigravityReplay             *antigravityReplay
 	anthropicClaudeCodeWire       bool
+	replayBodyRulesApplied        bool // 完整回放体已经过 applyBodyRules；增量体单独判定
 	zedWire                       *zedWirePlan
-	// codexMultiAgentV2Optimized records that this attempt renamed the
-	// collaboration namespace and therefore needs response restoration.
-	codexMultiAgentV2Optimized bool
-	executionIdentity          string
-	firstByteTimer             *time.Timer
-	streamTimer                *time.Timer
-	firstByteTimedOut          atomic.Bool
-	streamTimedOut             atomic.Bool
+	executionIdentity             string
+	firstByteTimer                *time.Timer
+	streamTimer                   *time.Timer
+	firstByteTimedOut             atomic.Bool
+	streamTimedOut                atomic.Bool
 }
 
 // newRequestContext 创建请求上下文（处理超时控制）

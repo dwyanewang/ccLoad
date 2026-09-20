@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/model"
@@ -120,6 +121,46 @@ func readWebsocketUntilType(t testing.TB, conn *websocket.Conn, wanted string) m
 		if eventType == wanted {
 			return event
 		}
+	}
+}
+
+func readResponsesWebsocketRetryAndClose(t testing.TB, conn *websocket.Conn) {
+	t.Helper()
+	seenRetry := false
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			var closeErr *websocket.CloseError
+			if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseInternalServerErr {
+				t.Fatalf("operator-abort close=%v, want websocket 1011", err)
+			}
+			if !seenRetry {
+				t.Fatal("operator abort closed websocket without retry error")
+			}
+			return
+		}
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		var event struct {
+			Type   string `json:"type"`
+			Status int    `json:"status"`
+			Error  struct {
+				Type string `json:"type"`
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(payload, &event); err != nil {
+			t.Fatalf("operator-abort websocket payload is not JSON: %v", err)
+		}
+		if event.Type != "error" {
+			continue
+		}
+		if event.Status != http.StatusBadGateway || event.Error.Type != "server_error" ||
+			event.Error.Code != responsesWebsocketInterruptedCode {
+			t.Fatalf("operator-abort retry event=%s", payload)
+		}
+		seenRetry = true
 	}
 }
 
@@ -396,6 +437,65 @@ func newBridgeWriterTestConn(t *testing.T) *websocket.Conn {
 	return conn
 }
 
+// TestResponsesWebsocketBridgeWriterRejectsInvalidJSON ensures truncated or
+// otherwise invalid upstream SSE payloads are not forwarded as websocket
+// TextMessage frames and do not mark the bridge as successfully completed.
+func TestResponsesWebsocketBridgeWriterRejectsInvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	truncated := []byte(`{"type":"response.completed"`)
+	if json.Valid(truncated) {
+		t.Fatal("test fixture must be invalid JSON for encoding/json")
+	}
+	if gjson.ValidBytes(truncated) {
+		t.Fatal("test fixture must be invalid JSON for gjson.ValidBytes")
+	}
+	if got := strings.TrimSpace(gjson.GetBytes(truncated, "type").String()); got != "response.completed" {
+		t.Fatalf("gjson still reads type from truncated payload: %q", got)
+	}
+
+	var received [][]byte
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		for {
+			_, message, errRead := conn.ReadMessage()
+			if errRead != nil {
+				return
+			}
+			received = append(received, bytes.Clone(message))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial bridge writer test websocket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	writer := newResponsesWebsocketBridgeWriter(conn, 0)
+	_, writeErr := writer.Write([]byte("data: " + string(truncated) + "\n\n"))
+	if writeErr == nil {
+		t.Fatal("truncated response.completed SSE must fail Write")
+	}
+	if !strings.Contains(writeErr.Error(), "invalid JSON in upstream SSE event") {
+		t.Fatalf("unexpected Write error: %v", writeErr)
+	}
+	if writer.completed {
+		t.Fatal("invalid upstream SSE must not mark bridge as completed")
+	}
+	if len(received) != 0 {
+		t.Fatalf("invalid upstream SSE must not send TextMessage, got %d frame(s)", len(received))
+	}
+}
+
 // TestResponsesWebsocketBridgeWriterCapsCollectedOutputBytes locks down the
 // cumulative output item ceiling: the per-event pending limit clears after
 // every parsed event, so a stream of many small response.output_item.done
@@ -585,6 +685,9 @@ func TestResponsesWebsocketAcceptsV1CodexPath(t *testing.T) {
 // /v1/responses path, not the alias.
 func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("upstream method = %q, want POST", r.Method)
+		}
 		if r.URL.Path != "/v1/responses" {
 			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
 		}
@@ -608,6 +711,33 @@ func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
 			if !strings.Contains(body, `"type":"response.completed"`) ||
 				!strings.Contains(body, `"id":"resp-sse-codex"`) {
 				t.Fatalf("SSE fallback body=%s", body)
+			}
+		})
+	}
+}
+
+func TestResponsesGetWithoutWebsocketUpgradeDoesNotReachUpstream(t *testing.T) {
+	for _, path := range responsesWebsocketUpgradePaths {
+		t.Run(path, func(t *testing.T) {
+			var upstreamCalls atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamCalls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "codex-plain-get", upstreamProtocol: "codex", models: "*", priority: 100,
+			}}, map[int]string{0: upstream.URL})
+
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer test-api-key")
+			response := httptest.NewRecorder()
+			env.engine.ServeHTTP(response, req)
+
+			if response.Code != http.StatusUpgradeRequired {
+				t.Fatalf("plain GET status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusUpgradeRequired)
+			}
+			if upstreamCalls.Load() != 0 {
+				t.Fatalf("plain GET reached upstream %d time(s)", upstreamCalls.Load())
 			}
 		})
 	}
@@ -2060,7 +2190,7 @@ func TestResponsesWebsocketClientRetryAfterInterruptedTextStream(t *testing.T) {
 // an interrupted stream — 502 upstream_stream_interrupted plus close 1011 — so
 // the client reconnects and replays the full turn. An error event that DOES
 // carry a status (usage_limit_reached + 429) stays a verbatim terminal answer;
-// TestNativeCodexWebsocketQuotaOverdraftReplayFailureCoolsOnce guards that side.
+// TestNativeCodexWebsocketUsageLimitCoolsWithoutReplay guards that side.
 func TestResponsesWebsocketClientRetryAfterUpstreamErrorEvent(t *testing.T) {
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2424,9 +2554,9 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 			t.Errorf("native upstream identity headers=%v", r.Header)
 		}
 		for name, want := range map[string]string{
-			"Conversation_id":                       "ws-session",
+			"Conversation_id":                       "",
 			"Session-Id":                            "ws-session",
-			"Session_id":                            "ws-session",
+			"Session_id":                            "",
 			"Thread-Id":                             "worker-thread",
 			"Version":                               codexVersion,
 			"X-Client-Request-Id":                   "request-1",
@@ -2552,6 +2682,7 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T) {
+	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	requestBody := make(chan map[string]any, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2564,11 +2695,20 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		if got := r.Header.Get("X-OpenAI-FedRAMP"); got != "true" {
 			t.Errorf("X-OpenAI-FedRAMP = %q", got)
 		}
-		if r.Header.Get("User-Agent") != codexUserAgent || r.Header.Get("Originator") != "codex-tui" {
+		if r.Header.Get("User-Agent") != clientUserAgent || r.Header.Get("Originator") != "codex-tui" {
 			t.Errorf("Codex identity headers = %v", r.Header)
 		}
-		if r.Header.Get("Session_id") == "" {
-			t.Errorf("Codex Session_id header is missing: %v", r.Header)
+		if got := r.Header.Get("Version"); got != "" {
+			t.Errorf("Version = %q, want absent for official client without Version", got)
+		}
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+			t.Errorf("X-Codex-Window-Id = %q, want omitted from native WebSocket", got)
+		}
+		if r.Header.Get("Session-Id") == "" {
+			t.Errorf("Codex Session-Id header is missing: %v", r.Header)
+		}
+		if r.Header.Get("Session_id") != "" || r.Header.Get("Conversation_id") != "" {
+			t.Errorf("legacy session headers were generated: %v", r.Header)
 		}
 		if !strings.Contains(r.Header.Get("OpenAI-Beta"), "responses_websockets=") {
 			t.Errorf("OpenAI-Beta = %q", r.Header.Get("OpenAI-Beta"))
@@ -2605,7 +2745,11 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		models: "gpt-test", authType: model.AuthTypeCodexOAuth,
 		oauthCredential: codexProxyTestCredential(t, "at-ws", "rt-ws", "account-ws", true), priority: 100,
 	}}, map[int]string{0: upstream.URL})
-	downstream := dialResponsesWebsocket(t, env.engine)
+	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+		"User-Agent":        {clientUserAgent},
+		"Originator":        {"codex-tui"},
+		"X-Codex-Window-Id": {"client-thread:0"},
+	})
 	if err := downstream.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test",
 		"input": []any{map[string]any{"role": "user", "content": "hello"}},
@@ -2618,9 +2762,8 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 		t.Fatalf("completed response = %#v", completed)
 	}
 	request := <-requestBody
-	instructions, _ := request["instructions"].(string)
-	if request["stream"] != true || request["store"] != false ||
-		!strings.HasPrefix(instructions, "You are Codex, an agent based on GPT-5.") {
+	_, hasInstructions := request["instructions"]
+	if request["stream"] != true || request["store"] != false || hasInstructions {
 		t.Fatalf("upstream Codex request = %#v", request)
 	}
 	if _, exists := request["include"]; exists {
@@ -2637,398 +2780,86 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 	}
 }
 
-func TestNativeCodexWebsocketQuotaOverdraftReplaysAndPersistsTranscript(t *testing.T) {
-	var handshakes atomic.Int32
-	requestBodies := make(chan []byte, 3)
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade overdraft websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		attempt := handshakes.Add(1)
-		_, body, err := conn.ReadMessage()
-		if err != nil {
-			t.Errorf("read overdraft websocket attempt %d: %v", attempt, err)
-			return
-		}
-		requestBodies <- bytes.Clone(body)
-
-		if attempt == 1 {
-			_ = conn.WriteJSON(map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"type": "usage_limit_reached", "message": "The usage limit has been reached",
-					"plan_type": "team", "resets_in_seconds": 7260,
-				},
-				"status_code": http.StatusTooManyRequests,
-			})
-			return
-		}
-
-		responseID := fmt.Sprintf("resp-overdraft-ws-%d", attempt-1)
-		if err := conn.WriteJSON(map[string]any{
-			"type": "response.completed",
-			"response": map[string]any{
-				"id": responseID, "status": "completed", "model": "gpt-5.4-mini", "output": []any{},
-				"usage": map[string]any{"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
-			},
-		}); err != nil {
-			t.Errorf("write overdraft websocket completion %d: %v", attempt, err)
-			return
-		}
-		// Force the next turn onto a new physical socket. It must receive the
-		// durable full transcript, including the accepted synthetic tool pair.
-		if attempt == 2 {
-			_ = conn.WriteControl(
-				websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "reconnect"),
-				time.Now().Add(time.Second),
-			)
-		}
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "native-codex-overdraft", upstreamProtocol: "codex", websockets: true,
-		models: "gpt-5.4-mini", authType: model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-ws", "rt-overdraft-ws", "account-overdraft-ws"),
-		codexQuotaOverdraft: true, priority: 100,
-	}}, map[int]string{0: upstream.URL})
-	appServer := httptest.NewServer(env.engine)
-	defer appServer.Close()
-
-	first := dialResponsesWebsocketAtURL(
-		t, appServer.URL, "test-api-key", "/backend-api/codex/responses",
-		http.Header{"Session-Id": []string{"overdraft-ws-session"}},
-	)
-	if err := first.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set first overdraft websocket deadline: %v", err)
-	}
-	if err := first.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-5.4-mini", "stream": true,
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "first"}},
-		}},
-	}); err != nil {
-		t.Fatalf("write first overdraft websocket turn: %v", err)
-	}
-	completed := readWebsocketUntilType(t, first, "response.completed")
-	response, _ := completed["response"].(map[string]any)
-	if response["id"] != "resp-overdraft-ws-1" {
-		t.Fatalf("first overdraft completion=%#v", completed)
-	}
-	if handshakes.Load() != 2 {
-		t.Fatalf("overdraft websocket handshakes=%d, want initial plus one replay", handshakes.Load())
-	}
-	initialBody := <-requestBodies
-	replayBody := <-requestBodies
-	if len(gjson.GetBytes(initialBody, "input").Array()) != 1 {
-		t.Fatalf("initial websocket request was modified: %s", initialBody)
-	}
-	replayItems := gjson.GetBytes(replayBody, "input").Array()
-	if len(replayItems) != 3 {
-		t.Fatalf("replayed websocket input items=%d body=%s, want original plus tool pair", len(replayItems), replayBody)
-	}
-	callID := replayItems[1].Get("call_id").String()
-	if replayItems[1].Get("type").String() != "custom_tool_call" || replayItems[1].Get("name").String() != "exec" ||
-		!strings.HasPrefix(callID, "call_ccload_overdraft_") ||
-		replayItems[2].Get("type").String() != "custom_tool_call_output" || replayItems[2].Get("call_id").String() != callID {
-		t.Fatalf("invalid websocket overdraft tool pair: %s", replayBody)
-	}
-
-	overdraftLog := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if overdraftLog.StatusCode != http.StatusOK || overdraftLog.Message != "ok [quota_overdraft]" ||
-		!overdraftLog.UpstreamWebsocket || overdraftLog.Cost <= 0 {
-		t.Fatalf("overdraft websocket log=%#v", overdraftLog)
-	}
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("list overdraft websocket config: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("get overdraft websocket cooldowns: %v", err)
-	}
-	if len(cooldowns[configs[0].ID]) != 0 {
-		t.Fatalf("successful websocket replay left model cooldowns: %+v", cooldowns[configs[0].ID])
-	}
-
-	_ = first.Close()
-	waitForResponsesWebsocketAttachments(t, env.server.responsesExecutionSessions, 0)
-	second := dialResponsesWebsocketAtURL(
-		t, appServer.URL, "test-api-key", "/backend-api/codex/responses",
-		http.Header{"Session-Id": []string{"overdraft-ws-session"}},
-	)
-	if err := second.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set resumed overdraft websocket deadline: %v", err)
-	}
-	if err := second.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-5.4-mini",
-		"previous_response_id": "resp-overdraft-ws-1",
-		"input": []any{map[string]any{
-			"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": "second"}},
-		}},
-	}); err != nil {
-		t.Fatalf("write resumed overdraft websocket turn: %v", err)
-	}
-	readWebsocketUntilType(t, second, "response.completed")
-	if handshakes.Load() != 3 {
-		t.Fatalf("resumed overdraft websocket handshakes=%d, want fresh physical connection", handshakes.Load())
-	}
-	resumedBody := <-requestBodies
-	resumedItems := gjson.GetBytes(resumedBody, "input").Array()
-	if len(resumedItems) != 4 || resumedItems[1].Get("call_id").String() != callID ||
-		resumedItems[2].Get("call_id").String() != callID ||
-		resumedItems[3].Get("content.0.text").String() != "second" {
-		t.Fatalf("resumed full transcript lost overdraft tool pair: %s", resumedBody)
-	}
-	var overdraftLogs []*model.LogEntry
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		overdraftLogs, err = env.store.ListLogs(
-			context.Background(), time.Now().Add(-time.Minute), 20, 0,
-			&model.LogFilter{LogSource: model.LogSourceProxy},
-		)
-		if err == nil && len(overdraftLogs) == 2 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err != nil || len(overdraftLogs) != 2 ||
-		overdraftLogs[0].Message != "ok [quota_overdraft]" || overdraftLogs[1].Message != "ok [quota_overdraft]" {
-		t.Fatalf("websocket active-cycle logs=%#v err=%v, want both successes marked overdraft", overdraftLogs, err)
-	}
-
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("get persisted overdraft websocket config: %v", err)
-	}
-	credential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	wantCost := util.USDToMicroUSD(overdraftLogs[0].Cost) + util.USDToMicroUSD(overdraftLogs[1].Cost)
-	if err != nil || credential.QuotaOverdraft == nil || !credential.QuotaOverdraft.Enabled ||
-		credential.QuotaOverdraft.ActiveUntil <= time.Now().Unix() ||
-		credential.QuotaOverdraft.SuccessfulRequests != 2 || credential.QuotaOverdraft.CostMicroUSD != wantCost {
-		t.Fatalf("persisted websocket overdraft stats=%#v err=%v, want requests=2 cost=%d",
-			credential, err, wantCost)
-	}
-}
-
-func TestResponsesWebsocketFailedOverdraftDoesNotPolluteFallbackTranscript(t *testing.T) {
-	var overdraftHandshakes atomic.Int32
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	overdraft := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade failed-overdraft fallback websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		overdraftHandshakes.Add(1)
-		if _, _, err := conn.ReadMessage(); err != nil {
-			t.Errorf("read failed-overdraft fallback websocket: %v", err)
-			return
-		}
-		_ = conn.WriteJSON(map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type": "usage_limit_reached", "message": "The usage limit has been reached",
-				"resets_in_seconds": 7260,
-			},
-			"status_code": http.StatusTooManyRequests,
-		})
-	}))
-	defer overdraft.Close()
-
-	var fallbackCalls atomic.Int32
-	fallbackBodies := make(chan []byte, 2)
-	fallback := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read fallback body after failed overdraft: %v", err)
-			return
-		}
-		fallbackBodies <- body
-		call := fallbackCalls.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w,
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-clean-fallback-%d\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
-			call,
-		)
-	}))
-	defer fallback.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{
-		{
-			name: "failed-native-overdraft", upstreamProtocol: "codex", websockets: true,
-			models: "gpt-test", authType: model.AuthTypeCodexOAuth,
-			oauthCredential:     codexProxyTestCredential(t, "at-overdraft-pollution", "rt-overdraft-pollution", "account-overdraft-pollution"),
-			codexQuotaOverdraft: true, priority: 100,
-		},
-		{name: "clean-http-fallback", upstreamProtocol: "codex", models: "gpt-test", priority: 90},
-	}, map[int]string{0: overdraft.URL, 1: fallback.URL})
-	downstream := dialResponsesWebsocketWithSessionID(t, env.engine, "overdraft-fallback-transcript")
-	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set failed-overdraft fallback deadline: %v", err)
-	}
-	if err := downstream.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-test",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "first"}},
-	}); err != nil {
-		t.Fatalf("write failed-overdraft fallback turn: %v", err)
-	}
-	readWebsocketUntilType(t, downstream, "response.completed")
-	if overdraftHandshakes.Load() != 2 || fallbackCalls.Load() != 1 {
-		t.Fatalf("failed overdraft/fallback attempts=%d/%d, want 2/1", overdraftHandshakes.Load(), fallbackCalls.Load())
-	}
-	firstFallbackBody := <-fallbackBodies
-	if len(gjson.GetBytes(firstFallbackBody, "input").Array()) != 1 {
-		t.Fatalf("first fallback received polluted request: %s", firstFallbackBody)
-	}
-
-	if err := downstream.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-test", "previous_response_id": "resp-clean-fallback-1",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "second"}},
-	}); err != nil {
-		t.Fatalf("write resumed fallback turn: %v", err)
-	}
-	readWebsocketUntilType(t, downstream, "response.completed")
-	secondFallbackBody := <-fallbackBodies
-	items := gjson.GetBytes(secondFallbackBody, "input").Array()
-	if len(items) != 2 {
-		t.Fatalf("failed overdraft polluted durable fallback transcript: %s", secondFallbackBody)
-	}
-	for _, item := range items {
-		if strings.HasPrefix(item.Get("call_id").String(), "call_ccload_overdraft_") {
-			t.Fatalf("failed overdraft tool pair leaked into fallback transcript: %s", secondFallbackBody)
-		}
-	}
-}
-
-func TestResponsesWebsocketOverdraftPairSurvivesInterruptedReplacementReplay(t *testing.T) {
-	var attempts atomic.Int32
-	requestBodies := make(chan []byte, 3)
-	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempt := attempts.Add(1)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Errorf("read interrupted-overdraft attempt %d: %v", attempt, err)
-			return
-		}
-		requestBodies <- bytes.Clone(body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		switch attempt {
-		case 1:
-			_, _ = io.WriteString(w, `data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7260},"status_code":429}`+"\n\n")
-		case 2:
-			partial := `data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc-overdraft-interrupted","call_id":"call-overdraft-interrupted","name":"lookup","arguments":"{}"}}` + "\n\n"
-			w.Header().Set("Content-Length", fmt.Sprint(len(partial)+64))
-			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, partial)
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
+func TestNativeCodexWebsocketWindowHeaderRules(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+		want   []string
+	}{
+		{name: "default"},
+		{name: "override", action: model.RuleActionOverride, want: []string{"configured-window:0"}},
+		{name: "append", action: model.RuleActionAppend, want: []string{"configured-window:0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := make(chan http.Header, 1)
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				captured <- r.Header.Clone()
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				var request map[string]any
+				if err := conn.ReadJSON(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := conn.WriteJSON(map[string]any{
+					"type":     "response.completed",
+					"response": map[string]any{"id": "resp-window", "output": []any{}},
+				}); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer upstream.Close()
+			rules := []model.CustomHeaderRule{{Action: model.RuleActionAppend, Name: "X-Configured", Value: "once"}}
+			if tc.action != "" {
+				rules = append(rules, model.CustomHeaderRule{
+					Action: tc.action, Name: "x-codex-window-id", Value: "configured-window:0",
+				})
 			}
-			// Closing without response.completed forces the downstream client to
-			// reconnect and send a full replacement transcript.
-		case 3:
-			_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp-overdraft-recovered","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\n")
-		}
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "overdraft-interrupted", upstreamProtocol: "codex",
-		models: "gpt-test", authType: model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-interrupted", "rt-overdraft-interrupted", "account-overdraft-interrupted"),
-		codexQuotaOverdraft: true, priority: 100,
-	}}, map[int]string{0: upstream.URL})
-	first := dialResponsesWebsocketWithSessionID(t, env.engine, "overdraft-interrupted-replay")
-	if err := first.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatalf("set interrupted-overdraft deadline: %v", err)
-	}
-	if err := first.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-test",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "lookup"}},
-	}); err != nil {
-		t.Fatalf("write interrupted-overdraft turn: %v", err)
-	}
-	readWebsocketUntilType(t, first, "response.output_item.done")
-	var retryEvent map[string]any
-	if err := first.ReadJSON(&retryEvent); err != nil {
-		t.Fatalf("read interrupted-overdraft retry event: %v", err)
-	}
-	retryError, _ := retryEvent["error"].(map[string]any)
-	if retryEvent["type"] != "error" || retryError["code"] != responsesWebsocketInterruptedCode {
-		t.Fatalf("interrupted-overdraft retry event=%#v", retryEvent)
-	}
-	_, _, closeErr := first.ReadMessage()
-	var websocketClose *websocket.CloseError
-	if !errors.As(closeErr, &websocketClose) || websocketClose.Code != websocket.CloseInternalServerErr {
-		t.Fatalf("interrupted-overdraft close=%v, want 1011", closeErr)
-	}
-
-	second := dialResponsesWebsocketWithSessionID(t, env.engine, "overdraft-interrupted-replay")
-	if err := second.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatalf("set replacement-overdraft deadline: %v", err)
-	}
-	if err := second.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-test",
-		"input": []any{
-			map[string]any{"type": "message", "role": "user", "content": "lookup"},
-			map[string]any{
-				"type": "function_call", "id": "fc-overdraft-interrupted",
-				"call_id": "call-overdraft-interrupted", "name": "lookup", "arguments": "{}",
-			},
-			map[string]any{"type": "function_call_output", "call_id": "call-overdraft-interrupted", "output": "42"},
-		},
-	}); err != nil {
-		t.Fatalf("write replacement-overdraft transcript: %v", err)
-	}
-	recovered := readWebsocketUntilType(t, second, "response.completed")
-	response, _ := recovered["response"].(map[string]any)
-	if response["id"] != "resp-overdraft-recovered" || attempts.Load() != 3 {
-		t.Fatalf("replacement-overdraft response=%#v attempts=%d", recovered, attempts.Load())
-	}
-
-	<-requestBodies
-	overdraftReplay := <-requestBodies
-	replacementReplay := <-requestBodies
-	overdraftItems := gjson.GetBytes(overdraftReplay, "input").Array()
-	if len(overdraftItems) != 3 {
-		t.Fatalf("interrupted overdraft request omitted gateway pair: %s", overdraftReplay)
-	}
-	gatewayCallID := overdraftItems[1].Get("call_id").String()
-	replacementItems := gjson.GetBytes(replacementReplay, "input").Array()
-	if len(replacementItems) != 5 || replacementItems[1].Get("call_id").String() != gatewayCallID ||
-		replacementItems[2].Get("call_id").String() != gatewayCallID ||
-		replacementItems[3].Get("call_id").String() != "call-overdraft-interrupted" ||
-		replacementItems[4].Get("call_id").String() != "call-overdraft-interrupted" {
-		t.Fatalf("replacement replay lost or misplaced gateway-owned pair: %s", replacementReplay)
+			env := setupProxyTestEnv(t, []testChannel{{
+				name: "window-headers", upstreamProtocol: "codex", websockets: true, models: "gpt-test",
+				customRequestRules: &model.CustomRequestRules{Headers: rules},
+			}}, map[int]string{0: upstream.URL})
+			downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+				"X-Codex-Window-Id": {"client-thread:0"},
+			})
+			if err := downstream.WriteJSON(map[string]any{
+				"type": "response.create", "model": "gpt-test", "input": []any{},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			readWebsocketUntilType(t, downstream, "response.completed")
+			got := <-captured
+			if !slices.Equal(got.Values("X-Codex-Window-Id"), tc.want) {
+				t.Errorf("X-Codex-Window-Id = %v, want %v", got.Values("X-Codex-Window-Id"), tc.want)
+			}
+			if !slices.Equal(got.Values("X-Configured"), []string{"once"}) {
+				t.Errorf("unrelated header rules applied more than once: %v", got.Values("X-Configured"))
+			}
+		})
 	}
 }
 
-func TestNativeCodexWebsocketQuotaOverdraftReplayFailureCoolsOnce(t *testing.T) {
+func TestNativeCodexWebsocketUsageLimitCoolsWithoutReplay(t *testing.T) {
 	var handshakes atomic.Int32
-	requestBodies := make(chan []byte, 2)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			t.Errorf("upgrade failed-overdraft websocket: %v", err)
+			t.Errorf("upgrade usage-limit websocket: %v", err)
 			return
 		}
 		defer func() { _ = conn.Close() }()
 		handshakes.Add(1)
-		_, body, err := conn.ReadMessage()
+		_, _, err = conn.ReadMessage()
 		if err != nil {
-			t.Errorf("read failed-overdraft websocket: %v", err)
+			t.Errorf("read usage-limit websocket: %v", err)
 			return
 		}
-		requestBodies <- bytes.Clone(body)
 		_ = conn.WriteJSON(map[string]any{
 			"type": "error",
 			"error": map[string]any{
@@ -3040,209 +2871,52 @@ func TestNativeCodexWebsocketQuotaOverdraftReplayFailureCoolsOnce(t *testing.T) 
 	}))
 	defer upstream.Close()
 
+	credential := strings.TrimSuffix(codexProxyTestCredential(t, "at-usage-limit-ws", "rt-usage-limit-ws", "account-usage-limit-ws"), "}") +
+		`,"quota_overdraft":{"enabled":true}}`
 	env := setupProxyTestEnv(t, []testChannel{{
-		name: "native-codex-overdraft-failure", upstreamProtocol: "codex", websockets: true,
+		name: "native-codex-usage-limit", upstreamProtocol: "codex", websockets: true,
 		models: "gpt-5.4-mini", authType: model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-ws-fail", "rt-overdraft-ws-fail", "account-overdraft-ws-fail"),
-		codexQuotaOverdraft: true, priority: 100,
+		oauthCredential: credential, priority: 100,
 	}}, map[int]string{0: upstream.URL})
 	downstream := dialResponsesWebsocketAtPath(t, env.engine, "test-api-key", "/backend-api/codex/responses")
 	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set failed-overdraft websocket deadline: %v", err)
+		t.Fatalf("set usage-limit websocket deadline: %v", err)
 	}
 	before := time.Now()
 	if err := downstream.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-5.4-mini",
 		"input": []any{map[string]any{"type": "message", "role": "user", "content": "fail"}},
 	}); err != nil {
-		t.Fatalf("write failed-overdraft websocket turn: %v", err)
+		t.Fatalf("write usage-limit websocket turn: %v", err)
 	}
 	var terminal map[string]any
 	if err := downstream.ReadJSON(&terminal); err != nil {
-		t.Fatalf("read failed-overdraft terminal event: %v", err)
+		t.Fatalf("read usage-limit terminal event: %v", err)
 	}
 	errorObject, _ := terminal["error"].(map[string]any)
 	if terminal["type"] != "error" || terminal["status_code"] != float64(http.StatusTooManyRequests) ||
 		errorObject["type"] != "usage_limit_reached" {
-		t.Fatalf("failed-overdraft terminal event=%#v", terminal)
+		t.Fatalf("usage-limit terminal event=%#v", terminal)
 	}
-	if handshakes.Load() != 2 {
-		t.Fatalf("failed-overdraft websocket handshakes=%d, want exactly 2", handshakes.Load())
+	if handshakes.Load() != 1 {
+		t.Fatalf("usage-limit websocket handshakes=%d, want exactly 1", handshakes.Load())
 	}
-	<-requestBodies
-	replayBody := <-requestBodies
-	if len(gjson.GetBytes(replayBody, "input").Array()) != 3 {
-		t.Fatalf("failed-overdraft retry omitted tool pair: %s", replayBody)
-	}
-
 	configs, err := env.store.ListConfigs(context.Background())
 	if err != nil || len(configs) != 1 {
-		t.Fatalf("list failed-overdraft websocket config: configs=%d err=%v", len(configs), err)
+		t.Fatalf("list usage-limit websocket config: configs=%d err=%v", len(configs), err)
 	}
 	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
 	if err != nil {
-		t.Fatalf("get failed-overdraft websocket cooldowns: %v", err)
+		t.Fatalf("get usage-limit websocket cooldowns: %v", err)
 	}
 	duration := cooldowns[configs[0].ID]["gpt-5.4-mini"].Sub(before)
 	if duration < 7250*time.Second || duration > 7270*time.Second {
-		t.Fatalf("failed-overdraft websocket cooldown=%v, want about 7260s", duration)
+		t.Fatalf("usage-limit websocket cooldown=%v, want about 7260s", duration)
 	}
 	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.StatusCode != http.StatusTooManyRequests || !strings.HasSuffix(entry.Message, "[quota_overdraft]") ||
+	if entry.StatusCode != http.StatusTooManyRequests ||
 		!entry.UpstreamWebsocket {
-		t.Fatalf("failed-overdraft websocket log=%#v", entry)
-	}
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("get failed-overdraft websocket config: %v", err)
-	}
-	credential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	if err != nil || credential.QuotaOverdraft == nil || credential.QuotaOverdraft.SuccessfulRequests != 0 ||
-		credential.QuotaOverdraft.CostMicroUSD != 0 {
-		t.Fatalf("failed websocket replay changed overdraft stats: credential=%#v err=%v", credential, err)
-	}
-}
-
-func TestNativeCodexWebsocketQuotaOverdraftDoesNotReplayCommittedEvents(t *testing.T) {
-	prefix := map[string]any{"type": "response.output_text.delta", "delta": "partial"}
-	var handshakes atomic.Int32
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade committed-overdraft websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		handshakes.Add(1)
-		if _, _, err := conn.ReadMessage(); err != nil {
-			t.Errorf("read committed-overdraft websocket: %v", err)
-			return
-		}
-		_ = conn.WriteJSON(prefix)
-		_ = conn.WriteJSON(map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type": "usage_limit_reached", "message": "The usage limit has been reached",
-				"resets_in_seconds": 7260,
-			},
-			"status_code": http.StatusTooManyRequests,
-		})
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "native-codex-overdraft-committed", upstreamProtocol: "codex", websockets: true,
-		models: "gpt-5.4-mini", authType: model.AuthTypeCodexOAuth,
-		oauthCredential: codexProxyTestCredential(
-			t, "at-overdraft-ws-committed", "rt-overdraft-ws-committed", "account-overdraft-ws-committed",
-		),
-		codexQuotaOverdraft: true, priority: 100,
-	}}, map[int]string{0: upstream.URL})
-	downstream := dialResponsesWebsocket(t, env.engine)
-	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set committed-overdraft websocket deadline: %v", err)
-	}
-	if err := downstream.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-5.4-mini",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "commit"}},
-	}); err != nil {
-		t.Fatalf("write committed-overdraft websocket turn: %v", err)
-	}
-	var firstEvent map[string]any
-	if err := downstream.ReadJSON(&firstEvent); err != nil {
-		t.Fatalf("read committed-overdraft prefix: %v", err)
-	}
-	if firstEvent["type"] != prefix["type"] {
-		t.Fatalf("committed-overdraft prefix=%#v", firstEvent)
-	}
-	var terminal map[string]any
-	if err := downstream.ReadJSON(&terminal); err != nil {
-		t.Fatalf("read committed-overdraft terminal event: %v", err)
-	}
-	if terminal["type"] != "error" || handshakes.Load() != 1 {
-		t.Fatalf("committed-overdraft terminal=%#v handshakes=%d, want no replay", terminal, handshakes.Load())
-	}
-
-	configs, err := env.store.ListConfigs(context.Background())
-	if err != nil || len(configs) != 1 {
-		t.Fatalf("list committed-overdraft websocket config: configs=%d err=%v", len(configs), err)
-	}
-	cooldowns, err := env.store.GetAllModelCooldowns(context.Background())
-	if err != nil {
-		t.Fatalf("get committed-overdraft websocket cooldowns: %v", err)
-	}
-	if _, ok := cooldowns[configs[0].ID]["gpt-5.4-mini"]; !ok {
-		t.Fatal("committed websocket usage limit did not cool the model")
-	}
-	entry := waitForProxyLog(t, env, "gpt-5.4-mini")
-	if entry.StatusCode != http.StatusTooManyRequests || strings.Contains(entry.Message, "quota_overdraft") {
-		t.Fatalf("committed-overdraft websocket log=%#v", entry)
-	}
-	persisted, err := env.store.GetConfig(context.Background(), configs[0].ID)
-	if err != nil {
-		t.Fatalf("get committed-overdraft websocket config: %v", err)
-	}
-	credential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
-	if err != nil || credential.QuotaOverdraft == nil || credential.QuotaOverdraft.SuccessfulRequests != 0 ||
-		credential.QuotaOverdraft.CostMicroUSD != 0 {
-		t.Fatalf("committed websocket error changed overdraft stats: credential=%#v err=%v", credential, err)
-	}
-}
-
-func TestNativeCodexWebsocketQuotaOverdraftReplaysAfterMetadataEvents(t *testing.T) {
-	var handshakes atomic.Int32
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade metadata-overdraft websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		handshakes.Add(1)
-		if _, _, err := conn.ReadMessage(); err != nil {
-			t.Errorf("read metadata-overdraft websocket: %v", err)
-			return
-		}
-		_ = conn.WriteJSON(map[string]any{
-			"type": "response.created", "response": map[string]any{"id": "resp-created", "status": "in_progress"},
-		})
-		_ = conn.WriteJSON(map[string]any{
-			"type": "error",
-			"error": map[string]any{
-				"type": "usage_limit_reached", "message": "The usage limit has been reached",
-				"resets_in_seconds": 7260,
-			},
-			"status_code": http.StatusTooManyRequests,
-		})
-	}))
-	defer upstream.Close()
-
-	env := setupProxyTestEnv(t, []testChannel{{
-		name: "native-codex-overdraft-metadata", upstreamProtocol: "codex", websockets: true,
-		models: "gpt-5.4-mini", authType: model.AuthTypeCodexOAuth,
-		oauthCredential:     codexProxyTestCredential(t, "at-overdraft-ws-metadata", "rt-overdraft-ws-metadata", "account-overdraft-ws-metadata"),
-		codexQuotaOverdraft: true, priority: 100,
-	}}, map[int]string{0: upstream.URL})
-	downstream := dialResponsesWebsocket(t, env.engine)
-	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set metadata-overdraft websocket deadline: %v", err)
-	}
-	if err := downstream.WriteJSON(map[string]any{
-		"type": "response.create", "model": "gpt-5.4-mini",
-		"input": []any{map[string]any{"type": "message", "role": "user", "content": "metadata"}},
-	}); err != nil {
-		t.Fatalf("write metadata-overdraft websocket turn: %v", err)
-	}
-	var terminal map[string]any
-	if err := downstream.ReadJSON(&terminal); err != nil {
-		t.Fatalf("read metadata-overdraft terminal event: %v", err)
-	}
-	errorObject, _ := terminal["error"].(map[string]any)
-	if terminal["type"] != "error" || errorObject["type"] != "usage_limit_reached" || handshakes.Load() != 2 {
-		t.Fatalf("metadata-overdraft terminal=%#v handshakes=%d, want replay after metadata-only prefix",
-			terminal, handshakes.Load())
+		t.Fatalf("usage-limit websocket log=%#v", entry)
 	}
 }
 
@@ -3329,6 +3003,9 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	var responses atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+			t.Errorf("unapproved window header reached upstream: %q", got)
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			t.Errorf("upgrade header-fingerprint websocket: %v", err)
@@ -3362,6 +3039,7 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	first := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
 		"Session-Id":          []string{"header-fingerprint"},
 		"OpenAI-Organization": []string{"org-a"},
+		"X-Codex-Window-Id":   []string{"window-a:0"},
 	})
 	if err := first.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test",
@@ -3378,6 +3056,7 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 	second := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
 		"Session-Id":          []string{"header-fingerprint"},
 		"OpenAI-Organization": []string{"org-b"},
+		"X-Codex-Window-Id":   []string{"window-b:0"},
 	})
 	if err := second.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test", "previous_response_id": "resp-header-1",
@@ -4455,6 +4134,12 @@ func TestNativeCodexWebsocketRetainsAffinityAfterPhysicalDisconnect(t *testing.T
 	}
 	readWebsocketUntilType(t, downstream, "response.completed")
 
+	// A higher-priority alternative must not override the established session.
+	if err := env.store.UpdateAPIKeyPriorities(context.Background(), configs[0].ID, map[int]int{0: 100, 1: -100}); err != nil {
+		t.Fatal(err)
+	}
+	env.server.InvalidateAPIKeysCache(configs[0].ID)
+
 	deadline := time.Now().Add(time.Second)
 	for env.server.responsesExecutionSessions.stats().UpstreamConnections != 0 {
 		if time.Now().After(deadline) {
@@ -5115,6 +4800,18 @@ func TestNativeCodexWebsocketInterruptedEventReconnectsWithReplayBeforeSemanticO
 	)
 }
 
+// keepalive 是保活帧而非语义输出：上游发完 keepalive 就断连时，
+// 只要还没出现真实内容就必须允许同目标重连重放。
+func TestNativeCodexWebsocketKeepaliveReconnectsWithReplayBeforeSemanticOutput(t *testing.T) {
+	testNativeCodexWebsocketReadFailureReconnectsWithReplay(
+		t,
+		"keepalive",
+		func(conn *websocket.Conn) error {
+			return conn.WriteJSON(map[string]any{"type": "keepalive", "sequence_number": 2})
+		},
+	)
+}
+
 func testNativeCodexWebsocketReadFailureReconnectsWithReplay(
 	t *testing.T,
 	failureName string,
@@ -5407,7 +5104,7 @@ func TestNativeCodexWebsocketMaxAgeDrainsActiveTurnBeforeClosing(t *testing.T) {
 	}
 }
 
-func TestNativeCodexWebsocketSequentialKeyFailbackReplaysBetweenTurns(t *testing.T) {
+func TestNativeCodexWebsocketPriorityKeyFailbackReplaysBetweenTurns(t *testing.T) {
 	var phase atomic.Int32
 	var keyAHandshakes, keyBHandshakes atomic.Int32
 	keyAReplay := make(chan map[string]any, 1)
@@ -5484,7 +5181,7 @@ func TestNativeCodexWebsocketSequentialKeyFailbackReplaysBetweenTurns(t *testing
 		models: "gpt-test", apiKey: "sk-ws-a", priority: 100, retryOtherKeysOnFailure: true,
 	}}, map[int]string{0: upstream.URL})
 	if err := env.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{{
-		ChannelID: 1, KeyIndex: 1, APIKey: "sk-ws-b", KeyStrategy: model.KeyStrategySequential,
+		ChannelID: 1, KeyIndex: 1, APIKey: "sk-ws-b", Priority: -1, KeyStrategy: model.KeyStrategySequential,
 	}}); err != nil {
 		t.Fatalf("create websocket fallback key: %v", err)
 	}
@@ -5753,6 +5450,110 @@ func TestNativeCodexWebsocketMissingStoredInputItemReconnectsWithStrippedReplay(
 	}
 	if gjson.GetBytes(replay, "input.1.id").String() != "msg_item_keep" {
 		t.Fatalf("unrelated input item lost on replay: %s", replay)
+	}
+}
+
+func TestNativeCodexWebsocketInvalidEncryptedContentReconnectsWithStrippedReplay(t *testing.T) {
+	requests := make(chan []byte, 2)
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection := handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade invalid-encrypted-content websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read invalid-encrypted-content request: %v", err)
+			return
+		}
+		requests <- bytes.Clone(payload)
+		if connection == 1 {
+			_ = conn.WriteJSON(map[string]any{"type": "codex.rate_limits", "plan_type": "team"})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "codex.response.metadata",
+				"headers": map[string]any{
+					"x-models-etag": `W/"invalid-encrypted-content"`,
+				},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "error", "status": http.StatusBadRequest,
+				"error": map[string]any{
+					"type": "invalid_request_error", "code": "invalid_encrypted_content",
+					"message": "The encrypted content could not be verified.",
+				},
+			})
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": "resp-encrypted-content-stripped", "output": []any{},
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "invalid-encrypted-content-replay", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", priority: 100, authType: model.AuthTypeCodexOAuth,
+		oauthCredential: codexProxyTestCredential(t, "at-invalid-encrypted", "rt-invalid-encrypted", "account-invalid-encrypted"),
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
+		"Session-Id": {"invalid-encrypted-content"},
+		"User-Agent": {"codex-tui/0.148.0"},
+	})
+	if err := downstream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set invalid-encrypted-content deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test", "store": false,
+		"input": []any{
+			map[string]any{
+				"type": "reasoning", "id": "rs_rejected",
+				"encrypted_content": "opaque", "summary": []any{},
+			},
+			map[string]any{"type": "compaction", "encrypted_content": "opaque-compaction"},
+			map[string]any{"type": "message", "role": "user", "content": "keep going"},
+		},
+		"tools": []any{map[string]any{
+			"type": "namespace", "name": "collaboration",
+			"tools": []any{map[string]any{
+				"type": "function", "name": "spawn_agent", "description": "Spawns an agent.",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+			}},
+		}},
+	}); err != nil {
+		t.Fatalf("write invalid-encrypted-content request: %v", err)
+	}
+	completed := readWebsocketUntilType(t, downstream, "response.completed")
+	completedJSON, _ := json.Marshal(completed)
+	if gjson.GetBytes(completedJSON, "response.id").String() != "resp-encrypted-content-stripped" {
+		t.Fatalf("unexpected stripped replay completion: %#v", completed)
+	}
+
+	first := <-requests
+	replay := <-requests
+	if gjson.GetBytes(first, "tools.0.name").String() != "collaboration" {
+		t.Fatalf("native Codex request changed the collaboration namespace: %s", first)
+	}
+	if !bytes.Contains(first, []byte(`"encrypted_content"`)) {
+		t.Fatalf("first upstream request dropped encrypted content too early: %s", first)
+	}
+	items := gjson.GetBytes(replay, "input").Array()
+	if len(items) != 2 || items[0].Get("type").String() != "compaction" ||
+		items[1].Get("type").String() != "message" || handshakes.Load() != 2 {
+		t.Fatalf("replay input=%s handshakes=%d, want compaction, message and two handshakes", gjson.GetBytes(replay, "input").Raw, handshakes.Load())
+	}
+	if items[0].Raw != gjson.GetBytes(first, "input.1").Raw {
+		t.Fatalf("replay changed the compaction history: %s", items[0].Raw)
+	}
+	if items[1].Get("content").String() != "keep going" {
+		t.Fatalf("replay changed the retained message: %s", items[1].Raw)
 	}
 }
 
@@ -6031,6 +5832,9 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
 			websocketCalls.Add(1)
+			if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
+				t.Errorf("HTTP-only window header reached WebSocket: %q", got)
+			}
 			if r.Header.Get("X-Codex-Turn-State") != "turn-state" || r.Header.Get("X-ResponsesAPI-Include-Timing-Metrics") != "true" {
 				t.Errorf("websocket-only headers missing from handshake: %v", r.Header)
 			}
@@ -6050,6 +5854,9 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		}
 		if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state" {
 			t.Errorf("HTTP fallback X-Codex-Turn-State=%q, want %q; headers=%v", got, "turn-state", r.Header)
+		}
+		if got := r.Header.Get("X-Codex-Window-Id"); got != "client-thread:0" {
+			t.Errorf("HTTP fallback X-Codex-Window-Id=%q, want client-thread:0", got)
 		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil || !json.Valid(body) {
@@ -6120,6 +5927,7 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		http.Header{
 			"OpenAI-Beta":                           []string{"other-feature"},
 			"X-Codex-Turn-State":                    []string{"turn-state"},
+			"X-Codex-Window-Id":                     []string{"client-thread:0"},
 			"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
 		},
 	)
@@ -7070,6 +6878,182 @@ func TestResponsesWebsocketExposesActualUpstreamTransportWhileActive(t *testing.
 	readWebsocketUntilType(t, downstream, "response.completed")
 }
 
+func TestResponsesWebsocketOperatorAbortPingOnlyUpstream(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	requestStarted := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade operator-abort websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("read operator-abort websocket payload: %v", err)
+			return
+		}
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		// Metadata-only frames mirror a heartbeat-only Responses stream: they
+		// must not commit the downstream response and the turn remains pending.
+		for {
+			if err := conn.WriteJSON(map[string]any{"type": "response.created", "response": map[string]any{"id": "resp-ping-only"}}); err != nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "active-abort-native-ws", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	env.server.client = upstream.Client()
+	downstream := dialResponsesWebsocket(t, env.engine)
+	defer func() { _ = downstream.Close() }()
+	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set operator-abort websocket deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "abort ping-only"}},
+	}); err != nil {
+		t.Fatalf("write operator-abort websocket request: %v", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream websocket request did not start")
+	}
+	var aborted bool
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		for _, active := range env.server.activeRequests.List() {
+			if active.Abortable && env.server.activeRequests.Abort(active.ID) {
+				aborted = true
+				break
+			}
+		}
+		if aborted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !aborted {
+		t.Fatal("no abortable native websocket request appeared")
+	}
+	// The operator abort must send a retryable error and close the downstream
+	// turn promptly. A timeout here reproduces the issue's stuck "aborting" request.
+	readResponsesWebsocketRetryAndClose(t, downstream)
+}
+
+func TestResponsesWebsocketOperatorAbortPingOnlyHTTPUpstream(t *testing.T) {
+	for _, withBackup := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nativeBackup=%v", withBackup), func(t *testing.T) {
+			requestStarted := make(chan struct{}, 1)
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				select {
+				case requestStarted <- struct{}{}:
+				default:
+				}
+				flusher := w.(http.Flusher)
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						_, _ = io.WriteString(w, ": PING\n\n")
+						flusher.Flush()
+					}
+				}
+			}))
+			defer upstream.Close()
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			var backupHits atomic.Int64
+			backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamConn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Errorf("backup upgrade: %v", err)
+					return
+				}
+				defer func() { _ = upstreamConn.Close() }()
+				if _, _, err := upstreamConn.ReadMessage(); err != nil {
+					t.Errorf("backup request: %v", err)
+					return
+				}
+				backupHits.Add(1)
+				_ = upstreamConn.WriteJSON(map[string]any{"type": "response.output_text.delta", "response_id": "resp-backup", "item_id": "msg-backup", "output_index": 0, "content_index": 0, "delta": "backup"})
+				_ = upstreamConn.WriteJSON(map[string]any{"type": "response.completed", "response": map[string]any{"id": "resp-backup", "status": "completed", "output": []any{map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "backup"}}}}}})
+			}))
+			defer backup.Close()
+			channels := []testChannel{{name: "active-abort-http-ping", upstreamProtocol: "codex", models: "gpt-test", priority: 100}}
+			if withBackup {
+				channels = append(channels, testChannel{name: "abort-native-backup", upstreamProtocol: "codex", websockets: true, models: "gpt-test", priority: 50})
+			}
+			env := setupProxyTestEnv(t, channels, map[int]string{0: upstream.URL, 1: backup.URL})
+
+			conn := dialResponsesWebsocketWithSessionID(t, env.engine, "http-ping-abort")
+			defer func() { _ = conn.Close() }()
+			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatalf("set http-ping websocket deadline: %v", err)
+			}
+			if err := conn.WriteJSON(map[string]any{
+				"type": "response.create", "model": "gpt-test",
+				"input": []any{map[string]any{"role": "user", "content": "abort http ping-only"}},
+			}); err != nil {
+				t.Fatalf("write http-ping websocket request: %v", err)
+			}
+			select {
+			case <-requestStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("http upstream request did not start")
+			}
+			var aborted bool
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+				for _, active := range env.server.activeRequests.List() {
+					if active.Abortable && env.server.activeRequests.Abort(active.ID) {
+						aborted = true
+						break
+					}
+				}
+				if aborted {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !aborted {
+				t.Fatal("no abortable http ping-only request appeared")
+			}
+			if !withBackup {
+				readResponsesWebsocketRetryAndClose(t, conn)
+				return
+			}
+			for {
+				_, payload, err := conn.ReadMessage()
+				if err != nil {
+					t.Fatalf("abort failed to switch to native backup: %v", err)
+				}
+				event := gjson.ParseBytes(payload)
+				if event.Get("type").String() == "error" {
+					t.Fatalf("unexpected retry error: %s", payload)
+				}
+				if event.Get("type").String() == "response.completed" {
+					if event.Get("response.id").String() != "resp-backup" || backupHits.Load() != 1 {
+						t.Fatalf("unexpected backup response: %s", payload)
+					}
+					break
+				}
+			}
+		})
+	}
+}
+
 func TestNativeCodexWebsocketFailedTerminalPersistsUsageWithoutCost(t *testing.T) {
 	t.Parallel()
 
@@ -7124,6 +7108,64 @@ func TestNativeCodexWebsocketFailedTerminalPersistsUsageWithoutCost(t *testing.T
 	}
 	if entry.Cost != 0 {
 		t.Fatalf("failed-terminal cost=%v, want 0", entry.Cost)
+	}
+}
+
+func TestResponsesWebsocketAntigravityCreditsFallback(t *testing.T) {
+	for _, initialEmpty := range []bool{false, true} {
+		t.Run(strconv.FormatBool(initialEmpty), func(t *testing.T) {
+			var standard, paid atomic.Int32
+			upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request struct {
+					Credits []string `json:"enabledCreditTypes"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				if len(request.Credits) == 0 {
+					standard.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(429)
+					_, _ = io.WriteString(w, `{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED"}]}}`)
+					return
+				}
+				paid.Add(1)
+				if !slices.Equal(request.Credits, []string{"GOOGLE_ONE_AI"}) {
+					t.Errorf("credits=%v", request.Credits)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"paid answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5}}}\n\n")
+			}))
+			credential, err := antigravityauth.ParseCredential([]byte(antigravityProxyTestCredential(t, "ws-credits")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			balance, minimum := 10.0, 1.0
+			credential.Credits = &antigravityauth.Credits{Balance: &balance, Minimum: &minimum, SampledAt: time.Now()}
+			if initialEmpty {
+				credential.StandardQuota = map[string]time.Time{"claude-sonnet-4-6": time.Now().Add(time.Hour)}
+			}
+			raw, err := credential.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := setupProxyTestEnvWithSettings(t, []testChannel{{name: "ws credits", upstreamProtocol: "gemini", models: "claude-sonnet-4-6", authType: model.AuthTypeAntigravityOAuth, oauthCredential: raw}}, map[int]string{0: upstream.URL}, map[string]string{"cooldown_fallback_enabled": "false"})
+			conn := dialResponsesWebsocket(t, env.engine)
+			if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "claude-sonnet-4-6", "input": []any{map[string]any{"role": "user", "content": "hello"}}}); err != nil {
+				t.Fatal(err)
+			}
+			readWebsocketUntilType(t, conn, "response.completed")
+			wantStandard := int32(1)
+			if initialEmpty {
+				wantStandard = 0
+			}
+			if standard.Load() != wantStandard || paid.Load() != 1 {
+				t.Fatalf("standard=%d paid=%d", standard.Load(), paid.Load())
+			}
+		})
 	}
 }
 
@@ -7199,5 +7241,80 @@ func TestResponsesWebsocketBridgesToGeminiHTTPChannel(t *testing.T) {
 	}
 	if !bytes.Contains(attempts[3].body, []byte(`"contents"`)) {
 		t.Fatalf("unexpected Gemini bridge request body=%s", attempts[3].body)
+	}
+}
+
+// HTTP 渠道切换到原生 WS 渠道时重放的完整 transcript 会带 input item status，而官方
+// Codex 后端在 WebSocket 上同样以 unknown_parameter 拒绝它（线上表现为 HTTP 101 之后
+// 的 SSE error `[input[N].status]`）。发送边界必须在首帧就剥离，而不是撞 400 再靠重试
+// 自愈——自愈多一个 RTT，且在响应已提交时根本不可用。
+func TestNativeCodexWebsocketStripsInputItemStatusBeforeFirstSend(t *testing.T) {
+	requests := make(chan []byte, 1)
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade status-strip websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read status-strip request: %v", err)
+			return
+		}
+		requests <- bytes.Clone(payload)
+		_ = conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": "resp-status-stripped", "output": []any{},
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "ws-status-strip", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", priority: 100, authType: model.AuthTypeCodexOAuth,
+		oauthCredential: codexProxyTestCredential(t, "at-status-strip", "rt-status-strip", "account-status-strip"),
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocketWithSessionID(t, env.engine, "ws-status-strip")
+	if err := downstream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set status-strip deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test", "store": false,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "keep going"},
+			map[string]any{
+				"type": "function_call", "id": "fc_item_1", "call_id": "call_status_strip",
+				"name": "shell", "arguments": "{}", "status": "completed",
+			},
+			map[string]any{
+				"type": "function_call_output", "call_id": "call_status_strip",
+				"output": "done", "status": "completed",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("write status-strip request: %v", err)
+	}
+	completed := readWebsocketUntilType(t, downstream, "response.completed")
+	completedJSON, _ := json.Marshal(completed)
+	if gjson.GetBytes(completedJSON, "response.id").String() != "resp-status-stripped" {
+		t.Fatalf("unexpected status-strip completion: %#v", completed)
+	}
+
+	sent := <-requests
+	if statuses := gjson.GetBytes(sent, "input.#.status").Array(); len(statuses) != 0 {
+		t.Fatalf("first websocket send kept %d input item status fields: %s", len(statuses), sent)
+	}
+	if gjson.GetBytes(sent, "input.1.call_id").String() != "call_status_strip" {
+		t.Fatalf("status strip damaged the input transcript: %s", sent)
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("status strip must succeed on the first send, handshakes=%d", got)
 	}
 }
