@@ -24,6 +24,32 @@ func (s tokenLogMetadataErrorStore) GetAllAPIKeys(context.Context) (map[int64][]
 	return nil, s.err
 }
 
+func TestLogModelPricesUsesFuzzyMatchedRow(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.modelFuzzyMatch = true
+	ctx := context.Background()
+	price := channelPrice(1, 2)
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name: "fuzzy-price", URLs: model.ChannelURLs{{URL: "https://example.invalid"}},
+		Enabled: true, ModelEntries: []model.ModelEntry{
+			{Model: "gemini-3-flash-preview", RedirectModel: "middle", Pricing: price},
+			{Model: "middle", RedirectModel: "final"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, ok := server.firstModelRow(cfg, "gemini-3-flash")
+	if !ok || selected.logicalModel != "gemini-3-flash-preview" {
+		t.Fatalf("fuzzy route = %+v, ok=%v", selected, ok)
+	}
+	entry := &model.LogEntry{ChannelID: cfg.ID, Model: "gemini-3-flash", ActualModel: "middle", Cost: 1}
+	if got, ok := server.logModelPrices(ctx, []*model.LogEntry{entry})(entry); !ok || !got.Equal(price) {
+		t.Fatalf("log price = %+v, identifiable=%v, want %+v", got, ok, price)
+	}
+}
+
 func TestDashboardLogsForceTokenScopeAndExposeSafeChannelFields(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -47,6 +73,7 @@ func TestDashboardLogsForceTokenScopeAndExposeSafeChannelFields(t *testing.T) {
 
 	now := model.JSONTime{Time: time.Now()}
 	for _, entry := range []*model.LogEntry{
+		{Time: now, Model: "jev-latest", LogSource: model.LogSourceJev, StatusCode: 200, AuthTokenID: 42, Message: "private audit"},
 		{
 			Time:                     now,
 			Model:                    "gpt-5.6",
@@ -87,7 +114,7 @@ func TestDashboardLogsForceTokenScopeAndExposeSafeChannelFields(t *testing.T) {
 		}
 	}
 
-	c, w := newTestContext(t, newRequest(http.MethodGet, "/dashboard/logs?range=today&auth_token_id=99", nil))
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/dashboard/logs?range=today&auth_token_id=99&log_source=all", nil))
 	c.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
 	server.HandleErrors(c)
 	if w.Code != http.StatusOK {
@@ -338,7 +365,7 @@ func TestDashboardChannelsForceTokenScopeAndHideSensitiveConfig(t *testing.T) {
 	entry := response.Data[0]
 	assertJSONNumber(t, entry, "id", float64(ownerChannel.ID))
 	assertJSONString(t, entry, "name", "owner-channel")
-	for _, key := range []string{"url", "proxy_url", "custom_request_rules", "key_strategy", "key_cooldowns"} {
+	for _, key := range []string{"url", "urls", "models", "priority", "protocol_transform_mode", "proxy_url", "custom_request_rules", "key_strategy", "key_cooldowns"} {
 		if _, ok := entry[key]; ok {
 			t.Fatalf("dashboard channel exposed %q", key)
 		}

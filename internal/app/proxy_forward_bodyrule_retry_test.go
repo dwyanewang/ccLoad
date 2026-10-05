@@ -109,9 +109,9 @@ func TestCodexOAuthRetryPreservesFinalBodyRules(t *testing.T) {
 	headers := http.Header{"Content-Type": []string{"application/json"}}
 	original := []byte(`{"model":"gpt-5.6-sol","input":[]}`)
 
-	wire, err := (&Server{}).prepareTranslatedUpstreamBody(
-		cfg, protocol.Codex, "/v1/responses", original, original,
-		"", headers, false, nil, false,
+	wire, _, err := (&Server{}).prepareTranslatedUpstreamBody(
+		cfg, protocol.Codex, "/v1/responses", "", original, original,
+		"", headers, false, nil, false, false,
 	)
 	if err != nil {
 		t.Fatalf("initial body finalization: %v", err)
@@ -126,9 +126,9 @@ func TestCodexOAuthRetryPreservesFinalBodyRules(t *testing.T) {
 		t.Fatalf("initial parallel_tool_calls was not overridden: %s", wire)
 	}
 
-	replayed, err := (&Server{}).prepareTranslatedUpstreamBody(
-		cfg, protocol.Codex, "/v1/responses", wire, wire,
-		"", headers, false, nil, true,
+	replayed, _, err := (&Server{}).prepareTranslatedUpstreamBody(
+		cfg, protocol.Codex, "/v1/responses", "", wire, wire,
+		"", headers, false, nil, true, false,
 	)
 	if err != nil {
 		t.Fatalf("retry body finalization: %v", err)

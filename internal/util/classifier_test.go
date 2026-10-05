@@ -26,6 +26,38 @@ func assertClassifyError(t *testing.T, err error, wantStatus int, wantLevel Erro
 
 }
 
+func TestClassifyXAIFreeUsageScope(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{429, 403, StatusSSEError} {
+		for _, tc := range []struct {
+			name  string
+			body  string
+			model string
+		}{
+			{"account", `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for now."}`, ""},
+			{"named model", `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.6 for now."}`, "grok-4.6"},
+			{"structured model", `{"error":{"code":"subscription:free-usage-exhausted","message":"Included free usage exhausted","model":"grok-4.7","reset_seconds":3600}}`, "grok-4.7"},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, tc.name), func(t *testing.T) {
+				before := time.Now()
+				got := ClassifyHTTPResponseWithMeta(status, nil, []byte(tc.body))
+				if tc.model == "" {
+					if got.ModelScoped || !got.CredentialScoped || got.Level != ErrorLevelKey || !got.HasKeyCooldownUntil {
+						t.Fatalf("account quota classification=%+v", got)
+					}
+				} else {
+					if !got.ModelScoped || got.CredentialScoped || got.Model != tc.model || !got.HasModelCooldownUntil {
+						t.Fatalf("model quota classification=%+v", got)
+					}
+					if tc.name == "structured model" && (got.ModelCooldownUntil.Before(before.Add(time.Hour-time.Second)) || got.ModelCooldownUntil.After(before.Add(time.Hour+time.Second))) {
+						t.Fatalf("exact reset lost: %v", got.ModelCooldownUntil)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestClassifyHTTPResponse(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -884,6 +916,98 @@ func TestParseRetryAfterSecondsCooldownUntil(t *testing.T) {
 	}
 }
 
+func TestInferenceCapErrorCooldown(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name            string
+		body            string
+		wantLevel       ErrorLevel
+		wantHasCooldown bool
+		wantDurationMin int // 允许 ±1 分钟误差
+		wantReason      string
+	}{
+		{
+			name:            "deepseek_daily_limit_2h18m",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Error 429: Daily free limit reached on model deepseek/deepseek-v4.1-flash. Try again in 2h 18m"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: true,
+			wantDurationMin: 138,
+			wantReason:      "INFERENCE_CAP_ERROR",
+		},
+		{
+			name:            "try_again_hours_only",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Limit reached. Try again in 3h"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: true,
+			wantDurationMin: 180,
+			wantReason:      "INFERENCE_CAP_ERROR",
+		},
+		{
+			name:            "try_again_minutes_only",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Try again in 45m"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: true,
+			wantDurationMin: 45,
+			wantReason:      "INFERENCE_CAP_ERROR",
+		},
+		{
+			name:            "try_again_fractional_hours",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Try again in 1.5h"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: true,
+			wantDurationMin: 90,
+			wantReason:      "INFERENCE_CAP_ERROR",
+		},
+		{
+			name:            "try_again_unit_words",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Try again in 2 hours and 5 minutes."}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: true,
+			wantDurationMin: 125,
+			wantReason:      "INFERENCE_CAP_ERROR",
+		},
+		{
+			name:            "no_parseable_time",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Daily limit reached"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: false,
+		},
+		{
+			name:            "milliseconds_are_not_minutes",
+			body:            `{"error":{"code":"INFERENCE_CAP_ERROR","message":"Try again in 5ms"}}`,
+			wantLevel:       ErrorLevelKey,
+			wantHasCooldown: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := classifyHTTPResponseWithMetaAt(429, nil, []byte(tt.body), now)
+			if result.Level != tt.wantLevel {
+				t.Fatalf("level=%d, want %d", result.Level, tt.wantLevel)
+			}
+			if result.HasKeyCooldownUntil {
+				t.Fatalf("inference cap must not cool the whole key: %+v", result)
+			}
+			if result.HasModelCooldownUntil != tt.wantHasCooldown {
+				t.Fatalf("hasModelCooldown=%v, want %v", result.HasModelCooldownUntil, tt.wantHasCooldown)
+			}
+			if !tt.wantHasCooldown {
+				return
+			}
+			if !result.ModelScoped {
+				t.Fatal("inference cap must be model scoped")
+			}
+			gotMin := int(result.ModelCooldownUntil.Sub(now).Minutes())
+			if gotMin < tt.wantDurationMin-1 || gotMin > tt.wantDurationMin+1 {
+				t.Fatalf("cooldown duration=%dm, want ~%dm", gotMin, tt.wantDurationMin)
+			}
+			if result.ModelCooldownReason != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", result.ModelCooldownReason, tt.wantReason)
+			}
+		})
+	}
+}
+
 func TestClassifyHTTPResponseWithMeta_CodexRollingSpendLimit(t *testing.T) {
 	body := []byte(`{"error":{"message":"Codex rolling spend limit exceeded. Used $20.03 in the last 3 hours, limit is $20.00. Please retry after 2196 seconds.","type":"rate_limit_error","param":null,"code":"rate_limit_exceeded"}}`)
 
@@ -1037,6 +1161,16 @@ func TestClassifySSEError(t *testing.T) {
 				t.Errorf("%s: ModelScoped=%v, want %v", tt.name, classification.ModelScoped, wantModelScoped)
 			}
 		})
+	}
+}
+
+// Codex WS 错误事件经 597 分类时，模型不可用只冷却当前模型；OAuth 渠道无独立 Key，
+// 若按普通 Key 级处理会冷却整个渠道。
+func TestClassifySSEErrorModelUnavailableIsModelScoped(t *testing.T) {
+	body := []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+	classification := ClassifyHTTPResponseWithMeta(StatusSSEError, nil, body)
+	if classification.Level != ErrorLevelKey || !classification.ModelScoped {
+		t.Fatalf("classification=%+v, want Key level and model scoped", classification)
 	}
 }
 
@@ -1262,19 +1396,28 @@ func TestShouldFallbackProtocol(t *testing.T) {
 			name:       "ordinary responses validation error",
 			statusCode: http.StatusBadRequest,
 			body:       `{"error":{"message":"input is required","type":"invalid_request_error","code":"invalid_request_error"}}`,
-			want:       true,
+			want:       false,
 		},
 		{
 			name:       "ordinary anthropic beta validation error",
 			statusCode: http.StatusBadRequest,
 			body:       `{"type":"error","error":{"type":"invalid_request_error","message":"anthropic-beta must be a string"}}`,
-			want:       true,
+			want:       false,
 		},
 		{
 			name:       "malformed bad request",
 			statusCode: http.StatusBadRequest,
 			body:       `{"error":`,
-			want:       true,
+			want:       false,
+		},
+		{
+			name:       "invalid tool arguments are not a protocol capability failure",
+			statusCode: http.StatusBadRequest,
+			body:       "{\"model\":\"muse-spark-1.3-contributor\",\"error\":{\"param\":\"arguments\",\"type\":\"invalid_request_error\",\"message\":\"Upstream request failed: [invalid_request_error] `arguments` must be valid JSON\"}}",
+		},
+		{
+			name:       "empty bad request",
+			statusCode: http.StatusBadRequest,
 		},
 	}
 
@@ -1649,5 +1792,54 @@ func TestIsWebsocketConnectionLimitErrorRejectsUnrelatedBodies(t *testing.T) {
 		if IsWebsocketConnectionLimitError([]byte(body)) {
 			t.Errorf("body %q must not be treated as websocket connection limit", body)
 		}
+	}
+}
+
+func TestClassifyAnthropicUnifiedWindowRejectionIsCredentialScoped(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	reset5h := now.Add(2 * time.Hour)
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`)
+	headers := map[string][]string{
+		"anthropic-ratelimit-unified-status":    {"rejected"},
+		"anthropic-ratelimit-unified-5h-status": {"rejected"},
+		"anthropic-ratelimit-unified-5h-reset":  {strconv.FormatInt(reset5h.Unix(), 10)},
+		"anthropic-ratelimit-unified-7d-status": {"allowed"},
+	}
+
+	got := classifyHTTPResponseWithMetaAt(http.StatusTooManyRequests, headers, body, now)
+
+	if got.ModelScoped || !got.CredentialScoped || got.Level != ErrorLevelKey {
+		t.Fatalf("classification=%+v, want credential-scoped key level", got)
+	}
+	if !got.HasKeyCooldownUntil || !got.KeyCooldownUntil.Equal(reset5h) {
+		t.Fatalf("KeyCooldownUntil=%s, want 5h reset %s", got.KeyCooldownUntil, reset5h)
+	}
+}
+
+func TestClassifyAnthropicOverageOnlyRejectionStaysModelScoped(t *testing.T) {
+	now := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
+	headers := map[string][]string{
+		"anthropic-ratelimit-unified-status":         {"rejected"},
+		"anthropic-ratelimit-unified-5h-status":      {"allowed"},
+		"anthropic-ratelimit-unified-7d-status":      {"allowed"},
+		"anthropic-ratelimit-unified-overage-status": {"rejected"},
+		"anthropic-ratelimit-unified-reset":          {strconv.FormatInt(now.Add(time.Hour).Unix(), 10)},
+	}
+
+	got := classifyHTTPResponseWithMetaAt(http.StatusTooManyRequests, headers, nil, now)
+
+	if got.CredentialScoped || !got.ModelScoped {
+		t.Fatalf("classification=%+v, want model-scoped overage rejection", got)
+	}
+}
+
+func TestClassifyAnthropicFastModeCreditsIsRequestLevel(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode."}}`)
+	headers := map[string][]string{"anthropic-ratelimit-unified-reset": {strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)}}
+
+	got := ClassifyHTTPResponseWithMeta(http.StatusTooManyRequests, headers, body)
+
+	if got.Level != ErrorLevelClient || got.ModelScoped || got.HasModelCooldownUntil {
+		t.Fatalf("classification=%+v, want request-level client error without cooldown", got)
 	}
 }

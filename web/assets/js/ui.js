@@ -8,6 +8,7 @@ window.WebAuth = window.WebAuth || {
   },
   getWebRole() { return 'admin'; },
   isAPITokenRole() { return false; },
+  canShowChannels(role, session) { return role !== 'api_token' || session?.show_channels === true; },
   filterNavigation(keys) { return [...keys]; }
 };
 
@@ -70,6 +71,7 @@ window.WebAuth = window.WebAuth || {
   window.fetchWithAuth = fetchWithAuth;
   window.getWebRole = () => window.WebAuth.getWebRole(localStorage);
   window.isAPITokenRole = () => window.WebAuth.isAPITokenRole(localStorage);
+  window.shouldHideChannels = () => !window.WebAuth.canShowChannels(window.getWebRole(), window.webSession);
 })();
 
 // ============================================================
@@ -121,7 +123,8 @@ window.WebAuth = window.WebAuth || {
 
   async function fetchDataWithAuth(url, options = {}) {
     const resp = await fetchAPIWithAuth(url, options);
-    if (!resp.success) throw new Error(resp.error || t('error.requestFailed'));
+    // response 标记这是服务端明确给出的失败，而非网络或解析错误
+    if (!resp.success) throw Object.assign(new Error(resp.error || t('error.requestFailed')), { response: resp });
     return resp.data;
   }
 
@@ -384,7 +387,7 @@ window.WebAuth = window.WebAuth || {
     return el;
   }
 
-  // ---- 活动请求指示器（脉冲 + 角标 + favicon/标题）----
+  // ---- 活动请求指示器（脉冲 + 角标 + favicon）----
   // 全站唯一轮询源：拉取完整 payload 后自己消费 count，同时推送 data 给订阅者（如 logs.js）
   const ACTIVE_POLL_MS = 2000;
   let _activeTimer = null;
@@ -395,12 +398,9 @@ window.WebAuth = window.WebAuth || {
   let _lastBadgeCount = -1;      // 去重：仅数量变化时重绘 favicon
   const _activeDataListeners = [];  // 订阅者回调列表
   let _lastActiveData = null;       // 最近一次推送的数据（新订阅者立即获得，规避时序竞争）
-  const ACTIVE_TITLE_FLASH_MS = 900;
-  let _activeTitleBase = '';
-  let _activeTitleTimer = null;
-  let _activeTitleVisible = false;
-  let _activeTitleCount = 0;
-  let _activeTitleEnabled = false;
+  const ACTIVE_INDICATOR_PULSE_MS = 900;
+  let _activeCount = 0;
+  let _activePulseTimer = null;
   let _faviconPulseOn = false;
 
   function brandBadgeLabel(count) {
@@ -534,76 +534,29 @@ window.WebAuth = window.WebAuth || {
   }
 
   function redrawActiveFavicon() {
-    if (_activeTitleCount > 0) {
-      ensureFaviconBase(() => drawFaviconBadge(_activeTitleCount, _faviconPulseOn));
+    if (_activeCount > 0) {
+      ensureFaviconBase(() => drawFaviconBadge(_activeCount, _faviconPulseOn));
     }
   }
 
-  function activeTitleLabel(count) {
-    const label = brandBadgeLabel(count);
-    const fallback = `请求中[${label}]-`;
-    if (typeof t === 'function') {
-      const translated = t('nav.activeRequestsTitle', { count: label });
-      return translated && translated !== 'nav.activeRequestsTitle' ? translated : fallback;
-    }
-    return fallback;
-  }
-
-  function activeTitleText() {
-    return `${activeTitleLabel(_activeTitleCount)}${_activeTitleBase}`;
-  }
-
-  function showActiveTitle() {
-    document.title = activeTitleText();
-    _activeTitleVisible = true;
-  }
-
-  function restoreActiveTitle() {
-    if (_activeTitleTimer !== null) {
-      clearInterval(_activeTitleTimer);
-      _activeTitleTimer = null;
-    }
-    _activeTitleVisible = false;
-    if (_activeTitleBase) document.title = _activeTitleBase;
-  }
-
-  function updateActiveTitle(count, enabled) {
-    if (_activeTitleTimer === null) {
-      _activeTitleBase = document.title || _activeTitleBase || '';
-    }
-    _activeTitleCount = count;
-    _activeTitleEnabled = enabled === true;
-
+  function updateActiveFaviconPulse(count) {
     if (count <= 0) {
-      restoreActiveTitle();
+      if (_activePulseTimer !== null) {
+        clearInterval(_activePulseTimer);
+        _activePulseTimer = null;
+      }
       return;
     }
-    if (!_activeTitleEnabled && _activeTitleVisible) {
-      document.title = _activeTitleBase;
-      _activeTitleVisible = false;
-    }
-
-    if (_activeTitleTimer === null) {
-      if (_activeTitleEnabled) showActiveTitle();
-      _activeTitleTimer = setInterval(() => {
+    if (_activePulseTimer === null) {
+      _activePulseTimer = setInterval(() => {
         _faviconPulseOn = !_faviconPulseOn;
         redrawActiveFavicon();
-        if (!_activeTitleEnabled) return;
-        if (_activeTitleVisible) {
-          document.title = _activeTitleBase;
-          _activeTitleVisible = false;
-          return;
-        }
-        showActiveTitle();
-      }, ACTIVE_TITLE_FLASH_MS);
-      return;
+      }, ACTIVE_INDICATOR_PULSE_MS);
     }
-
-    if (_activeTitleEnabled && _activeTitleVisible) showActiveTitle();
   }
 
-  function updateActiveIndicator(count, titleEnabled) {
-    _activeTitleCount = count;
+  function updateActiveIndicator(count) {
+    _activeCount = count;
     // 页面内 logo：脉冲 + 角标
     if (_activeWrap) {
       _activeWrap.classList.toggle('is-active', count > 0);
@@ -620,14 +573,14 @@ window.WebAuth = window.WebAuth || {
         restoreFavicon();
       }
     }
-    updateActiveTitle(count, titleEnabled);
+    updateActiveFaviconPulse(count);
   }
 
   async function pollActiveRequests() {
     try {
       const payload = await fetchAPIWithAuth('/admin/active-requests');
       const count = typeof payload.count === 'number' ? payload.count : 0;
-      updateActiveIndicator(count, payload.active_request_title_enabled === true);
+      updateActiveIndicator(count);
       // 推送完整数据给订阅者
       const data = (payload.success && Array.isArray(payload.data)) ? payload.data : [];
       _lastActiveData = data;
@@ -1128,6 +1081,8 @@ window.WebAuth = window.WebAuth || {
     const execute = async () => {
 	  const session = await window.fetchDataWithAuth('/dashboard/session');
 	  if (session && session.role) localStorage.setItem(window.WebAuth.ROLE_KEY, session.role);
+      window.webSession = session;
+      document.body.classList.toggle('web-hide-channels', window.shouldHideChannels());
 	  const restrictedPages = new Set(['channels', 'tokens', 'settings']);
 	  if (window.isAPITokenRole() && restrictedPages.has(options.topbarKey)) {
 	    window.location.replace('/web/index.html');

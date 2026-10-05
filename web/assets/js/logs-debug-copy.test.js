@@ -165,6 +165,7 @@ async function withLoadedLogsPage(options, assertions) {
   };
   const {
     isTokenRole = false,
+    showChannels = false,
     logSource = 'proxy',
     entries = []
   } = options;
@@ -222,7 +223,8 @@ async function withLoadedLogsPage(options, assertions) {
     },
     readFilterControlValues: () => ({ range: 'today', clientProtocol: '', authToken: '' }),
     getDurationTimingColor: () => '',
-    isAPITokenRole: () => isTokenRole
+    isAPITokenRole: () => isTokenRole,
+    shouldHideChannels: () => isTokenRole && !showChannels
   });
   setGlobal('document', {
     addEventListener() {},
@@ -297,4 +299,49 @@ test('model filter options contain request models but not redirected models', as
   }, () => {
     assert.deepEqual(global.window.availableLogsModels, ['requested-model']);
   });
+});
+
+test('Jev audit messages link to their upstream debug-log entry', async () => {
+  await withLoadedLogsPage({
+    logSource: 'jev',
+    entries: [{
+      id: 42,
+      time: Date.now(),
+      model: 'jev-latest',
+      status_code: 200,
+      duration: 0.2,
+      log_source: 'jev',
+      message: JSON.stringify({
+        call_id: 'audit-42',
+        adopted: { category: 'quota' },
+        fallback: { reset: 'no_valid_reset' }
+      })
+    }]
+  }, ({ tbody }) => {
+    assert.match(tbody.innerHTML, /debug-log-link has-upstream-detail[^>]*data-log-id="42"/);
+  });
+});
+
+test('token channel visibility also controls actual model text and hover', async () => {
+  for (const [isTokenRole, showChannels] of [[true, false], [true, true], [false, false]]) {
+    for (const modelField of ['actual_model', 'response_model']) {
+      await withLoadedLogsPage({
+        isTokenRole,
+        showChannels,
+        entries: [{
+          time: Date.now(), model: 'requested-model', [modelField]: 'private-upstream-model',
+          thinking_effort: 'high', reasoning_tokens: 123,
+          status_code: 200, duration: 0, log_source: 'proxy'
+        }]
+      }, ({ tbody }) => {
+        const html = tbody.innerHTML;
+        assert.match(html, /requested-model/);
+        if (isTokenRole && !showChannels) {
+          assert.doesNotMatch(html, /private-upstream-model|model-actual|实际模型:/);
+        } else {
+          assert.match(html, /实际模型: private-upstream-model/);
+        }
+      });
+    }
+  }
 });

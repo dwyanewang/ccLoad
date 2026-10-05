@@ -42,6 +42,9 @@ type Credential struct {
 	PassiveUsage   *PassiveUsage    `json:"passive_usage,omitempty"`
 	OAuthUsage     json.RawMessage  `json:"oauth_usage,omitempty"`
 	QuotaCostUsage *oauthcost.Usage `json:"quota_cost_usage,omitempty"`
+	ModelManifest  *ModelManifest   `json:"model_manifest,omitempty"`
+	// QuotaIdentityBeforePoll 保留轮询重置前的声明身份，等待 id_token 追上这次变化。
+	QuotaIdentityBeforePoll string `json:"quota_identity_before_poll,omitempty"`
 }
 
 // PassiveUsage is the latest quota snapshot sampled from Codex upstream
@@ -153,6 +156,10 @@ func (c *Credential) Normalize() error {
 		c.RefreshToken = ""
 		c.LastRefresh = ""
 		c.Expired = ""
+		if err := c.normalizeModelManifest(); err != nil {
+			return err
+		}
+		adoptLegacyQuotaIdentity(c.QuotaCostUsage, c.QuotaIdentity(), c.AccountID)
 		return nil
 	}
 	if c.RefreshToken == "" {
@@ -177,7 +184,141 @@ func (c *Credential) Normalize() error {
 			}
 		}
 	}
+	if err := c.normalizeModelManifest(); err != nil {
+		return err
+	}
+	adoptLegacyQuotaIdentity(c.QuotaCostUsage, c.QuotaIdentity(), c.AccountID)
 	return nil
+}
+
+// QuotaIdentity 返回上游额度的计数主体 "account_id|plan_type"。同一账号换套餐、同一渠道换账号，
+// 上游额度都不再是原来那一份。缺任一分量返回空串：本次没有观察到身份。
+func (c *Credential) QuotaIdentity() string {
+	if c == nil {
+		return ""
+	}
+	accountID := strings.TrimSpace(c.AccountID)
+	planType := strings.ToLower(strings.TrimSpace(c.PlanType))
+	if accountID == "" || planType == "" {
+		return ""
+	}
+	return accountID + "|" + planType
+}
+
+// ObserveQuotaIdentity 用一次新的 id_token 身份观察更新额度状态：没有记忆时只记录，
+// 套餐未知时仍独立比较账号；身份变化则开始新的计数纪元。返回是否开始了新纪元。
+func (c *Credential) ObserveQuotaIdentity(accountID, planType string, at time.Time) bool {
+	accountID, planType = strings.TrimSpace(accountID), strings.ToLower(strings.TrimSpace(planType))
+	if c == nil || accountID == "" || at.Before(c.QuotaCostUsage.EpochTime()) {
+		return false
+	}
+	if c.QuotaCostUsage == nil {
+		c.QuotaCostUsage = &oauthcost.Usage{}
+	}
+	observed := ""
+	if planType != "" {
+		observed = accountID + "|" + planType
+	}
+	// 套餐字段缺失不影响确认账号切换；两者不能共用“身份未知”的分支。
+	if c.QuotaCostUsage.AccountID != "" && c.QuotaCostUsage.AccountID != accountID {
+		c.RestartQuotaEpoch(observed, at)
+		c.QuotaCostUsage.AccountID = accountID
+		c.QuotaCostUsage.CreditStandardCostMicroUSD = 0
+		return true
+	}
+	c.QuotaCostUsage.AccountID = accountID
+	if observed == "" {
+		return false
+	}
+	if c.QuotaIdentityBeforePoll != "" {
+		if observed == c.QuotaIdentityBeforePoll {
+			return false
+		}
+		c.QuotaIdentityBeforePoll = ""
+		c.QuotaCostUsage.Identity = observed
+		return false
+	}
+	switch c.QuotaCostUsage.Identity {
+	case "":
+		c.QuotaCostUsage.Identity = observed
+		return false
+	case observed:
+		return false
+	}
+	c.RestartQuotaEpoch(observed, at)
+	return true
+}
+
+// RestartQuotaEpoch 丢弃旧额度运行态，从 at 起为 identity 重新计数。identity 为空表示纪元由
+// 额度端点触发或账号变化时缺套餐字段，待下一次 id_token 观察补记。旧额度快照一并丢弃；
+// 否则另一侧观察者会把同一次变化再重置一遍。
+func (c *Credential) RestartQuotaEpoch(identity string, at time.Time) {
+	if c == nil {
+		return
+	}
+	if at.Before(c.QuotaCostUsage.EpochTime()) {
+		return
+	}
+	accountID := strings.TrimSpace(c.AccountID)
+	if identity != "" {
+		accountID, _, _ = strings.Cut(identity, "|")
+	}
+	// 购买额度不随同账号套餐窗口重置；更换账号时不得继承另一账号的累计。
+	var creditCost int64
+	if c.QuotaCostUsage != nil && c.QuotaCostUsage.AccountID == accountID {
+		creditCost = c.QuotaCostUsage.CreditStandardCostMicroUSD
+	}
+	c.QuotaCostUsage = &oauthcost.Usage{Identity: identity, AccountID: accountID, CreditStandardCostMicroUSD: creditCost,
+		EpochAt: at.UTC().Unix(), EpochAtUnixNano: at.UTC().UnixNano()}
+	c.OAuthUsage = nil
+	c.PassiveUsage = nil
+	c.ModelManifest = nil
+	c.QuotaIdentityBeforePoll = ""
+}
+
+// RestartQuotaEpochFromPoll 重置计数，但保留旧声明身份，避免滞后的声明被补记后再次重置。
+// 这里只比较同来源的身份，不把 usage API 的套餐名称与 id_token 混用。
+func (c *Credential) RestartQuotaEpochFromPoll(at time.Time) {
+	if c == nil || at.Before(c.QuotaCostUsage.EpochTime()) {
+		return
+	}
+	previous := c.QuotaIdentityBeforePoll
+	if previous == "" {
+		previous = c.QuotaIdentity()
+		if c.QuotaCostUsage != nil && c.QuotaCostUsage.Identity != "" {
+			previous = c.QuotaCostUsage.Identity
+		}
+	}
+	c.RestartQuotaEpoch("", at)
+	c.QuotaIdentityBeforePoll = previous
+}
+
+// InheritQuotaState 继承计数状态并为升级前的数据补记原凭证身份。
+func (c *Credential) InheritQuotaState(previous *Credential) {
+	c.QuotaCostUsage = oauthcost.Clone(previous.QuotaCostUsage)
+	if c.QuotaCostUsage == nil {
+		c.QuotaCostUsage = &oauthcost.Usage{}
+	}
+	adoptLegacyQuotaIdentity(c.QuotaCostUsage, previous.QuotaIdentity(), previous.AccountID)
+	c.QuotaIdentityBeforePoll = previous.QuotaIdentityBeforePoll
+	if c.ModelManifest == nil && previous.ModelManifest != nil && previous.ModelManifest.Matches(c, previous.ModelManifest.Endpoint) {
+		c.ModelManifest = previous.ModelManifest.Clone()
+	}
+}
+
+// adoptLegacyQuotaIdentity 给升级前的额度状态补记身份：既没记录身份也没有过纪元，说明它累计的
+// 就是 identity 名下的成本。已有纪元却没有完整身份，套餐要等下一次
+// id_token 观察补记，不能在这里猜。
+func adoptLegacyQuotaIdentity(usage *oauthcost.Usage, identity, accountID string) {
+	if usage == nil {
+		return
+	}
+	if usage.AccountID == "" {
+		usage.AccountID = strings.TrimSpace(accountID)
+	}
+	if usage.Identity == "" && usage.EpochAt == 0 {
+		usage.Identity = identity
+	}
 }
 
 // IsPersonalAccessToken reports whether this credential uses a static Codex
@@ -254,7 +395,7 @@ func (c *Credential) NeedsRefresh(now time.Time, lead time.Duration) (bool, erro
 
 // MergeRefresh preserves identity and a rotated refresh token when OpenAI omits
 // those fields from a refresh response.
-func (c *Credential) MergeRefresh(refreshed *Credential) (*Credential, error) {
+func (c *Credential) MergeRefresh(refreshed *Credential, now time.Time) (*Credential, error) {
 	if c == nil || refreshed == nil {
 		return nil, errors.New("codex refresh credential is nil")
 	}
@@ -287,7 +428,8 @@ func (c *Credential) MergeRefresh(refreshed *Credential) (*Credential, error) {
 		merged.PassiveUsage = ClonePassiveUsage(c.PassiveUsage)
 	}
 	merged.OAuthUsage = append(json.RawMessage(nil), c.OAuthUsage...)
-	merged.QuotaCostUsage = oauthcost.Clone(c.QuotaCostUsage)
+	merged.InheritQuotaState(c)
+	merged.ObserveQuotaIdentity(refreshed.AccountID, refreshed.PlanType, now)
 	if err := merged.Normalize(); err != nil {
 		return nil, err
 	}

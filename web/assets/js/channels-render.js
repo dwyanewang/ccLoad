@@ -18,6 +18,46 @@ const CHANNEL_PRIORITY_MIN = -99999;
 const CHANNEL_PRIORITY_MAX = 9999999;
 let channelPrioritySaveTimers = new Map();
 
+function uniqueChannelModelNames(models) {
+  return channelModelDisplayGroups(models).map((group) => group.model);
+}
+
+function channelModelDisplayGroups(models) {
+  const groups = new Map();
+  (Array.isArray(models) ? models : []).forEach((entry) => {
+    const name = String(entry?.model || entry || '').trim();
+    if (!name) return;
+    let group = groups.get(name);
+    if (!group) {
+      group = { model: name, targets: [] };
+      groups.set(name, group);
+    }
+    const redirect = String(entry?.redirect_model || '').trim();
+    const target = redirect || name;
+    if (!group.targets.includes(target)) group.targets.push(target);
+  });
+  return [...groups.values()];
+}
+
+function formatChannelModelLabel(group) {
+  const targets = group.targets.filter((target) => target !== group.model);
+  if (targets.length === 0) return group.model;
+  const visible = targets.slice(0, 2).join(', ');
+  const suffix = targets.length > 2 ? ', ...' : '';
+  return `${group.model}(${visible}${suffix})`;
+}
+
+function formatChannelModelSummary(models) {
+  return channelModelDisplayGroups(models).map(formatChannelModelLabel).join(', ');
+}
+
+function formatChannelModelTitle(models) {
+  return channelModelDisplayGroups(models).map((group) => {
+    const targets = group.targets.filter((target) => target !== group.model);
+    return targets.length > 0 ? `${group.model}(${targets.join(', ')})` : group.model;
+  }).join(', ');
+}
+
 function escapeChannelRefreshText(value) {
   if (value === null || value === undefined) return '';
   return String(value).replace(/[&<>"']/g, c => ({
@@ -68,12 +108,37 @@ function channelShowsOAuthUsage(channel) {
 
 // Codex plan_type → 用户可读标签；未登记的值原样返回。
 function codexPlanLabel(rawPlanType) {
-  const key = String(rawPlanType || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const key = String(rawPlanType || '').trim().toLowerCase().replace(/[\s_-]+/g, '');
   switch (key) {
-    case 'self_serve_business_prolite': return 'Premium seat';
-    case 'team': return 'Standard seat';
+    case 'free': return 'Free';
+    case 'go': return 'Go';
+    case 'plus': return 'Plus';
+    case 'prolite': return 'Pro 100';
+    case 'chatgptpro':
+    case 'pro': return 'Pro 200';
+    case 'promax': return 'Pro 500';
+    case 'team':
+    case 'selfservebusinessusagebased': return 'Business';
+    case 'selfservebusinessprolite': return 'Business Premium';
+    case 'business':
+    case 'enterprise':
+    case 'ent26':
+    case 'enterprisecbpusagebased': return 'Enterprise';
+    case 'enterprisecbpautomation': return 'Enterprise (Automation)';
+    case 'edu': return 'Edu';
+    case 'eduplus': return 'Edu Plus';
+    case 'edupro': return 'Edu Pro';
+    case 'unknown': return 'Unknown';
     default: return rawPlanType;
   }
+}
+
+// 订阅计划标签配色：渠道列表与编辑框共用，保证同一计划显示同一颜色。
+function oauthPlanBadgeTone(authType, planType) {
+  const plan = String(planType || '').toLowerCase();
+  if (authType === 'codex_oauth' && plan.replace(/[^a-z0-9]+/g, '_') === 'self_serve_business_prolite') return 'pro';
+  const planTokens = plan.split(/[^a-z0-9]+/).filter(Boolean);
+  return ['plus', 'pro', 'team'].find(tier => planTokens.includes(tier)) || '';
 }
 
 function buildOAuthPlanBadge(channel) {
@@ -98,10 +163,7 @@ function buildOAuthPlanBadge(channel) {
   const planTokens = planType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   if (channel?.auth_type !== 'xai_oauth' && planTokens.includes('free')) return '';
 
-  const planTone = channel?.auth_type === 'codex_oauth' &&
-    String(planType).toLowerCase().replace(/[^a-z0-9]+/g, '_') === 'self_serve_business_prolite'
-    ? 'pro'
-    : ['plus', 'pro', 'team'].find(tier => planTokens.includes(tier));
+  const planTone = oauthPlanBadgeTone(channel?.auth_type, planType);
   const toneClass = planTone ? ` ch-oauth-plan-badge--${planTone}` : '';
   const displayLabel = channel?.auth_type === 'codex_oauth' ? codexPlanLabel(planType) : planType;
   return `<span class="ch-oauth-plan-badge${toneClass}">${escapeChannelRefreshText(displayLabel)}</span>`;
@@ -496,6 +558,9 @@ function buildChannelTimingHtml(stats) {
   if (avgDuration > 0) {
     rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('stats.tooltipDuration')}</span><span class="ch-timing-value" style="color: ${durationColor};">${avgDuration.toFixed(2)}${window.t('common.seconds')}</span></div>`);
   }
+  if (Number.isFinite(stats.outputTokensPerSecond) && stats.outputTokensPerSecond > 0) {
+    rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('channels.stats.speed')}</span><span class="ch-timing-value">${stats.outputTokensPerSecond.toFixed(1)} tok/s</span></div>`);
+  }
   rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('channels.stats.calls')}</span><span class="ch-timing-value"><span style="color: var(--success-600);">${successCount}</span>/<span style="color: var(--error-600);">${failureCount}</span>${window.t('stats.unitTimes')}</span></div>`);
 
   return rows.length > 0 ? `<div class="ch-timing">${rows.join('')}</div>` : '';
@@ -812,6 +877,55 @@ function buildOAuthUsageToolbar(channel, state = {}, usageLoading = false) {
   return `<div class="ch-oauth-usage__toolbar">${buttons.join('')}</div>`;
 }
 
+function buildAnthropicResetCreditsHtml(channelID) {
+  const state = typeof getAnthropicResetCreditsState === 'function'
+    ? getAnthropicResetCreditsState(channelID) : null;
+  const loading = state?.status === 'loading';
+  const resetting = state?.reset_status === 'loading';
+  const message = state?.reset_error || state?.reset_feedback;
+  const feedback = message ? `<div class="ch-oauth-usage__credits-summary" role="${state?.reset_status === 'reset' ? 'status' : 'alert'}">${escapeChannelRefreshText(message)}</div>` : '';
+  if (state?.status !== 'ready') {
+    if (state?.status !== 'error' && !feedback) return '';
+    return `<div class="ch-oauth-usage__credits">${state?.status === 'error' ? `<div class="ch-oauth-usage__error" role="alert">${escapeChannelRefreshText(state.error)}</div>` : ''}${feedback}</div>`;
+  }
+  const data = state.data;
+  const credits = data.credits.filter(credit => credit && typeof credit === 'object' &&
+    (!credit.expires_at || Date.parse(credit.expires_at) > Date.now()));
+  const total = credits.reduce((sum, credit) => sum + Math.max(0, Number(credit.resets_left) || 0), 0);
+  if (total <= 0) return feedback ? `<div class="ch-oauth-usage__credits">${feedback}</div>` : '';
+  const resetLabel = resetting ? 'resettingQuota' : 'resetQuota';
+  const resetButton = `<button type="button" class="ch-oauth-usage__reset-action channel-action-btn" data-action="reset-anthropic-quota" data-channel-id="${channelID}"${loading || resetting ? ' disabled' : ''}${resetting ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(window.t(`channels.oauth.${resetLabel}`))}</button>`;
+  const expiry = credit => {
+    const timestamp = Date.parse(String(credit.expires_at || ''));
+    return Number.isFinite(timestamp) ? timestamp : Infinity;
+  };
+  const primary = credits.find(credit => credit.redeemable) ||
+    [...credits].sort((left, right) => expiry(left) - expiry(right))[0];
+  const available = data.eligible && data.available_count > 0;
+  const status = !data.eligible ? 'channels.oauth.anthropicResetIneligible'
+    : available ? ''
+      : 'channels.oauth.anthropicResetUnavailable';
+  const expiryText = primary?.expires_at ? formatXAIUsageReset(primary.expires_at) : '';
+  const details = credits.map(credit => {
+    const time = credit.expires_at ? formatXAIUsageReset(credit.expires_at) : '';
+    return `${String(credit.label || '')}: ${Math.max(0, Number(credit.resets_left) || 0)}${time ? ` · ${window.t('channels.oauth.resetCreditExpires', { time })}` : ''}`;
+  }).join('\n');
+  const cooldown = data.cooldown_until && Date.parse(data.cooldown_until) > Date.now()
+    ? formatXAIUsageReset(data.cooldown_until) : '';
+  return `<div class="ch-oauth-usage__credits" role="status">
+    <div class="ch-oauth-usage__credits-summary" title="${escapeChannelRefreshText(details)}">
+      <span class="ch-oauth-usage__credit-count">${escapeChannelRefreshText(window.t('channels.oauth.anthropicResetRemaining', { count: total }))}</span>
+      ${expiryText ? `<span class="ch-oauth-usage__credit-expiry">${escapeChannelRefreshText(window.t('channels.oauth.resetCreditExpires', { time: expiryText }))}</span>` : ''}
+      ${resetButton}
+    </div>
+    ${status || cooldown ? `<div class="ch-oauth-usage__credits-summary">${[
+      status ? escapeChannelRefreshText(window.t(status)) : '',
+      cooldown ? escapeChannelRefreshText(window.t('channels.oauth.anthropicResetCooldown', { time: cooldown })) : ''
+    ].filter(Boolean).join(' · ')}</div>` : ''}
+    ${feedback}
+  </div>`;
+}
+
 function formatCodexResetCreditExpiry(expiresAt) {
   const date = new Date(String(expiresAt || '').trim());
   if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) return null;
@@ -981,6 +1095,13 @@ function buildXAIUsageRows(data) {
   return rows;
 }
 
+function buildCodexPurchasedCreditsHtml(data) {
+  const cost = formatOAuthAccumulatedCost(data?.quota_cost_usage?.credit_standard_cost_microusd);
+  if (!cost) return '';
+  const text = window.t('channels.oauth.codexPurchasedCreditCost', { cost });
+  return `<div class="ch-oauth-usage__credits"><div class="ch-oauth-usage__credits-summary">${escapeChannelRefreshText(text)}</div></div>`;
+}
+
 function buildAntigravityCreditsHtml(credits) {
   if (!credits || typeof credits.balance !== 'number' || !Number.isFinite(credits.balance)) return '';
   const text = window.t('channels.oauth.antigravityCredits', { balance: credits.balance.toLocaleString() });
@@ -1016,16 +1137,17 @@ function buildOAuthUsageStatusHtml(channel) {
   const liveState = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
   const state = liveState || (channel?.oauth_usage ? { status: 'ready', data: channel.oauth_usage } : null);
   if (!state) {
-    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel)}</div>`;
+    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel)}${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}</div>`;
   }
   if (state.status === 'loading') {
-    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel, state, true)}</div>`;
+    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel, state, true)}${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}</div>`;
   }
   if (state.status === 'error') {
     const fallback = window.t('channels.oauth.usageFailed');
     const message = formatOAuthUsageError(state.error) || fallback;
     return `<div class="ch-oauth-usage">
       ${buildOAuthUsageToolbar(channel, state)}
+      ${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}
       <div class="ch-oauth-usage__error" title="${escapeChannelRefreshText(message)}">${escapeChannelRefreshText(message)}</div>
     </div>`;
   }
@@ -1116,6 +1238,8 @@ function buildOAuthUsageStatusHtml(channel) {
   return `<div class="ch-oauth-usage">
     ${buildOAuthUsageToolbar(channel, state)}
     ${rows.join('')}
+    ${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}
+    ${isCodex ? buildCodexPurchasedCreditsHtml(state.data) : ''}
     ${isCodex ? buildCodexResetCreditsHtml(state.data, state, channel.id) : ''}
     ${channel?.auth_type === 'antigravity_oauth' ? buildAntigravityCreditsHtml(state.data?.credits) : ''}
     ${isCodeBuddy ? buildCodeBuddyCreditsHtml(state.data?.codebuddy_credits) : ''}
@@ -1348,10 +1472,9 @@ function createChannelCard(channel) {
   const stats = channelStatsById[channel.id] || null;
   const batchRefreshResult = getBatchRefreshResult(channel.id);
 
-  // 模型文本
-  const modelsText = Array.isArray(channel.models)
-    ? channel.models.map(m => m.model || m).join(', ')
-    : '';
+  // 一对多模型显示前两个重定向目标，悬停时显示全部目标。
+  const modelsText = formatChannelModelSummary(channel.models);
+  const modelsTitle = formatChannelModelTitle(channel.models);
 
   const durationHtml = buildChannelTimingHtml(stats);
   const runtimeStatusHtml = buildChannelRuntimeStatusHtml(channel);
@@ -1389,6 +1512,7 @@ function createChannelCard(channel) {
     url: configuredURLs.join('\n'),
     batchRefreshStatusHtml: buildBatchRefreshStatusHtml(batchRefreshResult),
     modelsText: modelsText,
+    modelsTitle: modelsTitle,
     priority: channel.priority,
     effectivePriorityHtml: buildEffectivePriorityHtml(channel),
     durationHtml: durationHtml,
@@ -1507,7 +1631,7 @@ function initChannelEventDelegation() {
     if (!btn) return;
 
     const action = btn.dataset.action;
-    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'checkin-codebuddy', 'reset-codex-quota', 'refresh-management-balance', 'run-management-checkin', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
+    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'reset-anthropic-quota', 'checkin-codebuddy', 'reset-codex-quota', 'refresh-management-balance', 'run-management-checkin', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
       return;
     }
     const channelId = parseInt(btn.dataset.channelId);
@@ -1526,6 +1650,11 @@ function initChannelEventDelegation() {
           refreshOAuthUsage(channelId).catch(error => {
             if (window.showError) window.showError(error?.message || window.t('channels.oauth.usageFailed'));
           });
+        }
+        break;
+      case 'reset-anthropic-quota':
+        if (typeof confirmAnthropicQuotaReset === 'function') {
+          confirmAnthropicQuotaReset(channelId).catch(() => {});
         }
         break;
       case 'checkin-codebuddy':
@@ -1652,9 +1781,13 @@ function renderChannels(channelsToRender = channels) {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    uniqueChannelModelNames,
+    formatChannelModelSummary,
+    formatChannelModelTitle,
     buildChannelRuntimeStatusHtml,
     buildChannelUsageHtml,
     buildOAuthPlanBadge,
+    oauthPlanBadgeTone,
     codexPlanLabel,
     buildOAuthUsageStatusHtml,
     buildManagementAccountStatusHtml,

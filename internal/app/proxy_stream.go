@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 // cancelableResponseWriter 把请求取消传递到下游阻塞写入。
@@ -406,6 +408,90 @@ func (w *deferredResponseWriter) Committed() bool {
 	return w.committed
 }
 
+// jsonEventRewriteReader 改写上游 2xx 响应中的 JSON 负载：SSE 逐个完整事件改写 data，
+// 非 SSE 读完整个 body 后改写一次。读取同步发生在转发超时/Close 生命周期内；只有完整
+// 事件会被改写，EOF 处的残片原样透传。
+type jsonEventRewriteReader struct {
+	io.ReadCloser
+	rewrite  func([]byte) []byte
+	scanner  *bufio.Scanner
+	pending  []byte
+	jsonRead bool
+}
+
+// wrapJSONEventRewrite 替换 resp.Body。events 非 nil 时按 SSE 事件读取（调用方可先套
+// 帧修复层），nil 表示整段 JSON。
+func wrapJSONEventRewrite(resp *http.Response, events io.Reader, rewrite func([]byte) []byte) {
+	r := &jsonEventRewriteReader{ReadCloser: resp.Body, rewrite: rewrite}
+	if events != nil {
+		r.scanner = bufio.NewScanner(events)
+		r.scanner.Buffer(make([]byte, SSEBufferSize), maxSSEEventSize)
+		r.scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+			if end := firstSSEEventEnd(data); end >= 0 {
+				return end, data[:end], nil
+			}
+			if atEOF && len(data) > 0 {
+				return len(data), data, nil
+			}
+			return 0, nil, nil
+		})
+	}
+	resp.Body = r
+	resp.ContentLength = -1
+	resp.Header.Del("Content-Length")
+}
+
+func (r *jsonEventRewriteReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	for len(r.pending) == 0 {
+		if r.scanner == nil {
+			if r.jsonRead {
+				return 0, io.EOF
+			}
+			r.jsonRead = true
+			body, err := io.ReadAll(r.ReadCloser)
+			if err != nil {
+				return 0, err
+			}
+			r.pending = r.rewrite(body)
+			continue
+		}
+		if !r.scanner.Scan() {
+			if err := r.scanner.Err(); err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
+		}
+		frame := bytes.Clone(r.scanner.Bytes())
+		_, data := parseSSEEventChunk(frame)
+		if firstSSEEventEnd(frame) < 0 || !gjson.ValidBytes(data) {
+			r.pending = frame
+			continue
+		}
+		updated := r.rewrite(data)
+		if bytes.Equal(updated, data) {
+			r.pending = frame
+			continue
+		}
+		wrote := false
+		for _, line := range bytes.SplitAfter(frame, []byte{'\n'}) {
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				r.pending = append(r.pending, line...)
+			} else if !wrote {
+				r.pending = append(r.pending, "data: "...)
+				r.pending = append(r.pending, updated...)
+				r.pending = append(r.pending, '\n')
+				wrote = true
+			}
+		}
+	}
+	n := copy(dst, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
+}
+
 // streamCopy 流式复制（支持flusher与ctx取消）
 // 从proxy.go提取，遵循SRP原则
 // 简化实现：直接循环读取与写入，避免为每次读取创建goroutine导致泄漏
@@ -489,11 +575,11 @@ func streamTransformSSEEventsUntil(
 					}
 					if transform != nil {
 						chunks, transformErr := transform(rawEvent)
-						if transformErr != nil {
-							return transformErr
-						}
 						if writeErr := writeSSEChunks(dst, chunks); writeErr != nil {
 							return writeErr
+						}
+						if transformErr != nil {
+							return transformErr
 						}
 					}
 					if stopAfterEvent != nil && stopAfterEvent() {

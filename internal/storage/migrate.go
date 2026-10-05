@@ -102,6 +102,7 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		schema.DefineChannelModelsTable,
 		schema.DefineChannelModelCooldownsTable,
 		schema.DefineChannelURLStatesTable,
+		schema.DefineOAuthQuotaCostLedgerTable,
 		schema.DefineAuthTokensTable,
 		schema.DefineSystemSettingsTable,
 		schema.DefineWebSessionsTable,
@@ -146,6 +147,11 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		if _, err := db.ExecContext(ctx, buildDDL(tb, dialect)); err != nil {
 			return fmt.Errorf("create %s table: %w", tb.Name(), err)
 		}
+		if tb.Name() == "oauth_quota_cost_ledger" {
+			if err := ensureOAuthQuotaLedgerBinaryKeys(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate OAuth quota ledger key collation: %w", err)
+			}
+		}
 		if tb.Name() == "debug_logs" {
 			if err := ensureDebugLogsProtocolMetadata(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate debug_logs protocol metadata: %w", err)
@@ -159,6 +165,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			}
 			if err := ensureLogsCostMultiplier(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate logs cost_multiplier: %w", err)
+			}
+			if err := ensureColumn(ctx, db, dialect, "logs", "codex_has_credits", "TINYINT NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return fmt.Errorf("migrate logs codex_has_credits: %w", err)
 			}
 			if err := ensureLogsUpstreamWebsocket(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate logs upstream_websocket: %w", err)
@@ -244,6 +253,11 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureAPIKeysNote(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys note: %w", err)
 			}
+			// 先把 detected_models 转成 TEXT，再放宽 allowed_models。
+			// 反过来会在「allowed 仍是 VARCHAR(2000)、detected 已是 VARCHAR(8000)」的半迁移库上再次超行长。
+			if err := ensureAPIKeysDetectedModels(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys detected_models: %w", err)
+			}
 			if err := ensureAPIKeysAllowedModels(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys allowed_models: %w", err)
 			}
@@ -310,6 +324,15 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelModelsDisabled(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channel_models disabled: %w", err)
 			}
+			if err := ensureChannelModelsPricing(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_models pricing: %w", err)
+			}
+			if err := ensureChannelModelsVariants(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_models variants: %w", err)
+			}
+			if err := deleteWildcardChannelModels(ctx, db); err != nil {
+				return fmt.Errorf("delete wildcard channel models: %w", err)
+			}
 			if err := repairLegacyChannelModelOrder(ctx, db, dialect); err != nil {
 				return fmt.Errorf("repair legacy channel_models order: %w", err)
 			}
@@ -346,6 +369,10 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	if err := backfillLogsClientProtocol(ctx, db, dialect); err != nil {
 		return fmt.Errorf("backfill logs client_protocol: %w", err)
 	}
+	// 账本基线依赖 channels 与账本表均已迁移完成。
+	if err := backfillOAuthQuotaCostLedger(ctx, db, dialect); err != nil {
+		return fmt.Errorf("backfill OAuth quota cost ledger: %w", err)
+	}
 
 	// 初始化默认配置
 	if err := initDefaultSettings(ctx, db, dialect); err != nil {
@@ -361,13 +388,18 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 }
 
 func cleanupRemovedSettings(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	// skip_tls_verify 已移除：仅允许通过环境变量 CCLOAD_ALLOW_INSECURE_TLS 控制
-	if err := deleteSystemSetting(ctx, db, dialect, "skip_tls_verify"); err != nil {
-		return err
-	}
-	// model_lookup_strip_date_suffix 已移除：不再提供日期后缀回退匹配开关（避免行为分叉）
-	if err := deleteSystemSetting(ctx, db, dialect, "model_lookup_strip_date_suffix"); err != nil {
-		return err
+	// 清理已移除或已统一到其他策略的历史配置，避免旧数据库继续向管理界面暴露。
+	for _, key := range []string{
+		"skip_tls_verify",
+		"model_lookup_strip_date_suffix",
+		"active_request_title_enabled",
+		"antigravity_connection_reuse_enabled",
+		"antigravity_max_idle_conns_per_host",
+		"antigravity_idle_conn_timeout_seconds",
+	} {
+		if err := deleteSystemSetting(ctx, db, dialect, key); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -494,6 +526,10 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 	settings := []struct {
 		key, value, valueType, desc, defaultVal string
 	}{
+		{config.TypeSafeEnabledSettingKey, "false", "bool", "TypeSafe 错误分析兜底（需配置密钥，保存后重启生效）", "false"},
+		{config.TypeSafeAPIKeySettingKey, "", "string", "TypeSafe API Key（留空保留；重置可清除并关闭 TypeSafe）", ""},
+		{config.APITokenLoginEnabledSettingKey, "false", "bool", "允许 API Token 登录网页（保存后重启生效，不影响 API 调用）", "false"},
+		{config.APITokenShowChannelsSettingKey, "false", "bool", "API Token 登录时显示渠道名和实际模型名（默认禁用，保存后重启生效；不开放渠道配置）", "false"},
 		{config.CodexBaseURLSettingKey, "", "string", "Codex OAuth 完整 Responses URL(留空使用渠道URL；填写后覆盖渠道URL)", ""},
 		{config.XAIBaseURLSettingKey, "", "string", "xAI OAuth API根地址(通常以/v1结尾；留空使用渠道URL；填写后覆盖渠道URL)", ""},
 		{config.AntigravityURLSettingKey, "", "string", "Antigravity OAuth API根地址(留空使用渠道URL；填写后覆盖渠道URL)", ""},
@@ -502,7 +538,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"max_key_retries", "3", "int", "单渠道最大Key重试次数", "3"},
 		{"max_concurrency", "1000", "int", "最大并发请求数(限制同时处理的代理请求数量)", "1000"},
 		{"http_read_timeout_seconds", "0", "duration", "下游请求读取超时(秒,覆盖请求头+请求体的整段读取,0=使用内建默认值120秒)", "0"},
-		{"max_body_bytes", "10485760", "int", "请求体最大字节数(默认10MB)", "10485760"},
+		{"max_body_bytes", "33554432", "int", "请求体最大字节数(默认32MB)", "33554432"},
 		{"max_image_body_bytes", "20971520", "int", "Images API 请求体最大字节数(默认20MB)", "20971520"},
 		{"cooldown_auth_seconds", "300", "int", "认证错误(401/402/403)初始冷却时间(秒)", "300"},
 		{"cooldown_server_seconds", "120", "int", "服务器错误(5xx)初始冷却时间(秒)", "120"},
@@ -517,13 +553,12 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 和 CodeBuddy system/developer 消息文本中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
 		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},
-		{"antigravity_connection_reuse_enabled", "true", "bool", "Antigravity 连接复用（重启生效）", "true"},
-		{"antigravity_max_idle_conns_per_host", "2", "int", "Antigravity 每主机空闲连接数（1–100，重启生效）", "2"},
-		{"antigravity_idle_conn_timeout_seconds", "30", "duration", "Antigravity 空闲连接超时（1–210 秒，重启生效）", "30"},
 		{"stream_timeout", "0", "duration", "流式请求总超时(秒,0=禁用)", "0"},
-		{"non_stream_timeout", "120", "duration", "非流式请求超时(秒,0=禁用)", "120"},
+		{"stream_idle_timeout", "0", "duration", "流式请求上游连续无数据超时(秒,0=禁用)", "0"},
+		{"non_stream_timeout", "600", "duration", "非流式请求超时(秒,0=禁用)", "600"},
 		{"anthropic_first_byte_timeout", "0", "duration", "Anthropic流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"anthropic_non_stream_timeout", "0", "duration", "Anthropic非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
+		{"anthropic_stream_idle_timeout", "180", "duration", "Anthropic流式请求上游连续无数据超时(秒,0=使用全局stream_idle_timeout)", "180"},
 		{"codex_first_byte_timeout", "0", "duration", "Codex流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"codex_non_stream_timeout", "0", "duration", "Codex非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
 		{"openai_first_byte_timeout", "0", "duration", "OpenAI流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
@@ -554,7 +589,6 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"debug_log_retention_minutes", strconv.Itoa(config.DefaultDebugLogRetentionMinutes), "int", "Debug日志保留时长(分钟,1-1440)", strconv.Itoa(config.DefaultDebugLogRetentionMinutes)},
 		// 前端自动刷新
 		{"auto_refresh_interval_seconds", "0", "int", "页面自动刷新间隔(秒,>=0;0=禁用,建议≥30;有对话框打开时跳过本次刷新)", "0"},
-		{config.ActiveRequestTitleEnabledSettingKey, "false", "bool", "有请求处理时在浏览器标题栏显示请求数量并闪烁", "false"},
 		// Responses WebSocket
 		{"responses_ws_max_sessions", "0", "int", responsesWSMaxSessionsDescription, "0"},
 		{"responses_ws_session_ttl_minutes", "0", "int", responsesWSSessionTTLDescription, "0"},
@@ -563,20 +597,30 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"responses_ws_max_connections_per_token", "0", "int", responsesWSMaxConnectionsPerTokenDescription, "0"},
 	}
 
-	var query string
+	// 单条多行 INSERT：逐条写入是迁移里语句数最多的一段，每次启动/建库都要付一遍往返。
+	var insertHead, rowSQL, insertTail string
 	switch dialect {
 	case DialectMySQL:
-		query = "INSERT IGNORE INTO system_settings (`key`, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP())"
+		insertHead = "INSERT IGNORE INTO system_settings (`key`, value, value_type, description, default_value, updated_at) VALUES "
+		rowSQL = "(?, ?, ?, ?, ?, UNIX_TIMESTAMP())"
 	case DialectPostgres:
-		query = `INSERT INTO system_settings ("key", value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT ("key") DO NOTHING`
+		insertHead = `INSERT INTO system_settings ("key", value, value_type, description, default_value, updated_at) VALUES `
+		rowSQL = "(?, ?, ?, ?, ?, EXTRACT(EPOCH FROM NOW())::BIGINT)"
+		insertTail = ` ON CONFLICT ("key") DO NOTHING`
 	default:
-		query = "INSERT OR IGNORE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, unixepoch())"
+		insertHead = "INSERT OR IGNORE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES "
+		rowSQL = "(?, ?, ?, ?, ?, unixepoch())"
 	}
 
-	for _, s := range settings {
-		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), s.key, s.value, s.valueType, s.desc, s.defaultVal); err != nil {
-			return fmt.Errorf("insert default setting %s: %w", s.key, err)
-		}
+	rows := make([]string, len(settings))
+	args := make([]any, 0, len(settings)*5)
+	for i, s := range settings {
+		rows[i] = rowSQL
+		args = append(args, s.key, s.value, s.valueType, s.desc, s.defaultVal)
+	}
+	query := insertHead + strings.Join(rows, ", ") + insertTail
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), args...); err != nil {
+		return fmt.Errorf("insert default settings: %w", err)
 	}
 
 	// 默认词表在 CLIProxyAPI 示例的 ["API","proxy"] 基础上加入 Claude/Anthropic。
@@ -600,10 +644,31 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		}
 	}
 
+	// 上调过的默认值：仅迁移仍停在旧默认值的记录，用户改过的值不动。
+	{
+		keyCol := quoteKeyIdent(dialect)
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		valueSQL := fmt.Sprintf("UPDATE system_settings SET value = ? WHERE %s = ? AND value = default_value AND default_value = ?", keyCol)
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		metaSQL := fmt.Sprintf("UPDATE system_settings SET description = ?, default_value = ? WHERE %s = ? AND default_value = ?", keyCol)
+		for _, raised := range []struct{ key, oldDefault, newDefault, desc string }{
+			{"max_body_bytes", "10485760", "33554432", "请求体最大字节数(默认32MB)"},
+			{"non_stream_timeout", "120", "600", "非流式请求超时(秒,0=禁用)"},
+		} {
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, valueSQL), raised.newDefault, raised.key, raised.oldDefault); err != nil {
+				return fmt.Errorf("migrate setting value %s: %w", raised.key, err)
+			}
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL), raised.desc, raised.newDefault, raised.key, raised.oldDefault); err != nil {
+				return fmt.Errorf("refresh setting default %s: %w", raised.key, err)
+			}
+		}
+	}
+
 	// 刷新部分配置项的元信息（description/default/value_type），避免"代码语义已变但DB描述仍旧"。
 	{
 		keyCol := quoteKeyIdent(dialect)
 		descriptionRefreshKeys := map[string]bool{
+			config.APITokenShowChannelsSettingKey:    true,
 			"antigravity_sensitive_words":            true,
 			"channel_test_content":                   true,
 			"channel_stats_range":                    true,

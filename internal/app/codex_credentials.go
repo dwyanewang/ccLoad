@@ -26,6 +26,9 @@ const (
 	codexUserAgent             = codexauth.DefaultUserAgent
 )
 
+// codexHTTPForwardHeaders are the request-scoped headers native Codex sends on
+// HTTP /responses (rust-v0.157.1). Attestation and residency are omitted: they
+// vouch for the client's own ChatGPT account, not the channel account.
 var codexHTTPForwardHeaders = []string{
 	"X-Codex-Beta-Features",
 	"Version",
@@ -33,6 +36,10 @@ var codexHTTPForwardHeaders = []string{
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
 	"X-Codex-Window-Id",
+	"X-Codex-Parent-Thread-Id",
+	"X-OpenAI-Subagent",
+	"X-OpenAI-Memgen-Request",
+	codexResponsesLiteHeader,
 	"User-Agent",
 	"Session_id",
 	"Session-Id",
@@ -90,8 +97,10 @@ func newCodexCredentialRefreshError(cfg *model.Config, cause error) error {
 }
 
 type codexPassiveUsageUpdate struct {
-	Windows   []codexauth.PassiveUsageWindow
-	SampledAt string
+	AccountID   string
+	SourceEpoch *time.Time
+	Windows     []codexauth.PassiveUsageWindow
+	SampledAt   string
 	// ReplaceScopes marks complete upstream groups; windows missing from one
 	// such group are stale and may be removed during the merge.
 	ReplaceScopes []string
@@ -241,7 +250,7 @@ func (m *codexCredentialManager) persistRefreshResult(
 			m.cache(currentCfg.ID, current)
 			return cloneCodexCredential(current), nil
 		}
-		merged, err := current.MergeRefresh(refreshed)
+		merged, err := current.MergeRefresh(refreshed, m.now())
 		if err != nil {
 			return nil, err
 		}
@@ -330,6 +339,7 @@ func cloneCodexCredential(credential *codexauth.Credential) *codexauth.Credentia
 	clone.PassiveUsage = codexauth.ClonePassiveUsage(credential.PassiveUsage)
 	clone.OAuthUsage = append([]byte(nil), credential.OAuthUsage...)
 	clone.QuotaCostUsage = oauthcost.Clone(credential.QuotaCostUsage)
+	clone.ModelManifest = credential.ModelManifest.Clone()
 	return &clone
 }
 
@@ -351,7 +361,10 @@ func (m *codexCredentialManager) updatePassiveUsage(
 	usageLock := &m.passiveLocks[uint64(cfg.ID)%uint64(len(m.passiveLocks))]
 	usageLock.Lock()
 	defer usageLock.Unlock()
-	update.Windows = m.observePassiveUsageWindows(cfg.ID, update.Windows, updateTime)
+	// 完整作用域需要保留全部成员；过滤已见窗口会把它们误判为已删除。
+	if len(update.ReplaceScopes) == 0 {
+		update.Windows = m.observePassiveUsageWindows(cfg.ID, update.Windows, updateTime, false)
+	}
 	if len(update.Windows) == 0 && len(update.ReplaceScopes) == 0 {
 		return false, nil
 	}
@@ -369,6 +382,11 @@ func (m *codexCredentialManager) updatePassiveUsage(
 		current, err := codexauth.ParseCredential([]byte(currentCfg.OAuthCredential))
 		if err != nil {
 			return false, fmt.Errorf("parse Codex passive usage: %w", err)
+		}
+		if updateTime.Before(current.QuotaCostUsage.EpochTime()) ||
+			(update.SourceEpoch != nil && !update.SourceEpoch.Equal(current.QuotaCostUsage.EpochTime())) ||
+			(update.AccountID != "" && update.AccountID != current.AccountID) {
+			return false, nil
 		}
 		updatedCredential := *current
 		var changed bool
@@ -394,13 +412,15 @@ func (m *codexCredentialManager) updatePassiveUsage(
 		quotaCostChanged := !reflect.DeepEqual(current.QuotaCostUsage, nextQuotaCostUsage)
 		updatedCredential.QuotaCostUsage = nextQuotaCostUsage
 		if !changed && !quotaCostChanged {
+			// 数据库已包含本次采样，无需写入也可以记住去重水位。
+			m.observePassiveUsageWindows(cfg.ID, update.Windows, updateTime, true)
 			return false, nil
 		}
 		payload, err := updatedCredential.JSON()
 		if err != nil {
 			return false, err
 		}
-		updated, _, err := m.store.CompareAndSwapOAuthUsage(
+		updated, err := m.store.CompareAndSwapOAuthUsage(
 			ctx, currentCfg.ID, model.AuthTypeCodexOAuth, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {
@@ -415,6 +435,7 @@ func (m *codexCredentialManager) updatePassiveUsage(
 		// A concurrent token refresh may have committed and cached a newer
 		// credential after this CAS. Dropping the cache is always safe; caching the
 		// local snapshot here could resurrect the old access token in memory.
+		m.observePassiveUsageWindows(cfg.ID, update.Windows, updateTime, true)
 		m.invalidateCredentialCache(currentCfg.ID)
 		return true, nil
 	}
@@ -424,6 +445,7 @@ func (m *codexCredentialManager) observePassiveUsageWindows(
 	channelID int64,
 	windows []codexauth.PassiveUsageWindow,
 	fallbackTime time.Time,
+	remember bool,
 ) []codexauth.PassiveUsageWindow {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -443,7 +465,9 @@ func (m *codexCredentialManager) observePassiveUsageWindows(
 		if previous, ok := observed[key]; ok && !sampledAt.After(previous) {
 			continue
 		}
-		observed[key] = sampledAt
+		if remember {
+			observed[key] = sampledAt
+		}
 		accepted = append(accepted, window)
 	}
 	return accepted
@@ -600,6 +624,25 @@ func copyCodexHTTPHeaders(dst, src http.Header) {
 	}
 }
 
+// applyCodexClientIdentity keeps an official client's User-Agent and Version
+// as sent, pairing Originator with the User-Agent client name as native Codex
+// does. The backend gates each model on its minimal_client_version through the
+// Version header alone (a missing Version is not gated), so the client's own
+// value yields the same result as a direct connection; deriving a Version from
+// the User-Agent would only add a gate. Every other identity is replaced by the
+// canonical triple as a whole.
+func applyCodexClientIdentity(h http.Header) {
+	userAgent := strings.TrimSpace(h.Get("User-Agent"))
+	if isCodexMultiAgentClient(userAgent) {
+		originator, _, _ := strings.Cut(userAgent, "/")
+		h.Set("Originator", originator)
+		return
+	}
+	h.Set("User-Agent", codexUserAgent)
+	h.Set("Version", codexVersion)
+	h.Set("Originator", codexOriginator)
+}
+
 func injectCodexHeaders(req *http.Request, cfg *model.Config, apiKey string, streaming bool) {
 	if req == nil || cfg == nil {
 		return
@@ -617,13 +660,7 @@ func injectCodexHeaders(req *http.Request, cfg *model.Config, apiKey string, str
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("Connection", "Keep-Alive")
-	// Official clients may omit Version; preserve their supplied identity as-is.
-	if !isCodexMultiAgentClient(req.Header.Get("User-Agent")) {
-		req.Header.Set("User-Agent", codexUserAgent)
-		req.Header.Set("Version", codexVersion)
-	}
-	req.Header.Set("Originator", codexOriginator)
+	applyCodexClientIdentity(req.Header)
 	if cfg.UsesCodexOAuth() && req.Header.Get("Session_id") == "" && req.Header.Get("Session-Id") == "" {
 		req.Header.Set("Session-Id", util.NewUUIDv4())
 	}

@@ -6,14 +6,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/storage/schema"
 	sqlstore "ccLoad/internal/storage/sql"
 
+	"github.com/tidwall/sjson"
 	_ "modernc.org/sqlite"
 )
 
@@ -26,6 +31,167 @@ func openTestDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// TestMigrate_SQLite_BackfillsOAuthQuotaLedgerWithLegacyBaseline 走真实的重开库迁移路径。
+func TestMigrate_SQLite_BackfillsOAuthQuotaLedgerWithLegacyBaseline(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	store, err := createSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	credentialJSON, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
+			{Key: "codex|primary", WindowSeconds: 5 * 60 * 60,
+				StartedAt: now.Add(-time.Hour).Unix(), ResetAt: now.Add(4 * time.Hour).Unix()},
+			{Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+				StartedAt: now.Add(-3 * 24 * time.Hour).Unix(), ResetAt: now.Add(4 * 24 * time.Hour).Unix()},
+			{Key: "codex-spark|secondary", Family: oauthcost.FamilySpark, WindowSeconds: 7 * 24 * 60 * 60,
+				StartedAt: now.Add(-7*24*time.Hour - time.Hour).Unix(), ResetAt: now.Add(-time.Hour).Unix()},
+		}},
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, legacy := range []int64{100_000, 5_000_000, 9_000_000} {
+		credentialJSON, err = sjson.Set(credentialJSON, fmt.Sprintf("quota_cost_usage.windows.%d.standard_cost_microusd", i), legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt, err := store.CreateConfig(ctx, &model.Config{
+		Name: "corrupt-ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, "UPDATE channels SET oauth_credential = ? WHERE id = ?", "{broken", corrupt.ID); err != nil {
+		t.Fatal(err)
+	}
+	oversized, err := store.CreateConfig(ctx, &model.Config{
+		Name: "oversized-ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversizedJSON := credentialJSON
+	for path, value := range map[string]int64{
+		"quota_cost_usage.windows.0.window_seconds": 1 << 55,
+		"quota_cost_usage.windows.0.started_at":     1,
+		"quota_cost_usage.windows.0.reset_at":       2,
+	} {
+		oversizedJSON, err = sjson.Set(oversizedJSON, path, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !json.Valid([]byte(oversizedJSON)) {
+		t.Fatal("oversized fixture is not valid JSON")
+	}
+	if _, err := store.ExecContext(ctx, "UPDATE channels SET oauth_credential = ? WHERE id = ?", oversizedJSON, oversized.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		at   time.Time
+		cost float64
+	}{
+		{now.Add(-2 * 24 * time.Hour), 1.5},
+		{now.Add(-30 * time.Minute), 0.5},
+	} {
+		if err := store.AddLog(ctx, &model.LogEntry{
+			Time: model.JSONTime{Time: entry.at}, ChannelID: created.ID, Model: "gpt-5.6-sol",
+			StatusCode: 200, Cost: entry.cost, CostMultiplier: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CleanupLogsBefore(ctx, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = ?", oauthQuotaCostLedgerMigrationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopen := func() *sqlstore.SQLStore {
+		t.Helper()
+		reopened, openErr := createSQLiteStore(path)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		t.Cleanup(func() { _ = reopened.Close() })
+		return reopened
+	}
+	assertCosts := func(s *sqlstore.SQLStore) {
+		t.Helper()
+		cfg, getErr := s.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		credential, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		views, viewErr := s.OAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{
+			created.ID: oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
+		}, now.Add(time.Second))
+		if viewErr != nil {
+			t.Fatal(viewErr)
+		}
+		view := views[created.ID]
+		for key, want := range map[string]int64{
+			"codex|primary":         500_000,
+			"codex|secondary":       5_000_000,
+			"codex-spark|secondary": 0,
+		} {
+			window := view.FindWindow(key)
+			if window == nil || window.StandardCostMicroUSD != want {
+				t.Fatalf("%s cost = %#v, want %d (view %#v)", key, window, want, view)
+			}
+		}
+	}
+
+	// 旧窗口时长若溢出 Duration，启动迁移曾在推进窗口时无限循环。
+	type openResult struct {
+		store *sqlstore.SQLStore
+		err   error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		s, openErr := createSQLiteStore(path)
+		opened <- openResult{store: s, err: openErr}
+	}()
+	var migrated *sqlstore.SQLStore
+	select {
+	case result := <-opened:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		migrated = result.store
+		t.Cleanup(func() { _ = migrated.Close() })
+	case <-time.After(10 * time.Second):
+		t.Fatal("SQLite migration hung on an oversized legacy window")
+	}
+	assertCosts(migrated)
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCosts(reopen())
 }
 
 func TestMigrateDailyChannelChecks(t *testing.T) {
@@ -332,6 +498,43 @@ func TestMigrate_SQLite_AntigravitySensitiveWordsDefault(t *testing.T) {
 		t.Fatalf("refresh custom value metadata: %v", err)
 	}
 	assertSetting(customValue, wantDefault)
+}
+
+func TestMigrate_SQLite_RaisedDefaultsMigrateUntouchedValues(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate new database: %v", err)
+	}
+	legacy := func(key, value, defaultValue string) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `UPDATE system_settings SET value = ?, default_value = ? WHERE key = ?`,
+			value, defaultValue, key); err != nil {
+			t.Fatalf("restore legacy %s: %v", key, err)
+		}
+	}
+	assertSetting := func(key, wantValue, wantDefault string) {
+		t.Helper()
+		var value, defaultValue string
+		if err := db.QueryRowContext(ctx, `SELECT value, default_value FROM system_settings WHERE key = ?`, key).
+			Scan(&value, &defaultValue); err != nil {
+			t.Fatalf("query %s: %v", key, err)
+		}
+		if value != wantValue || defaultValue != wantDefault {
+			t.Fatalf("%s value/default=%q/%q, want %q/%q", key, value, defaultValue, wantValue, wantDefault)
+		}
+	}
+
+	assertSetting("max_body_bytes", "33554432", "33554432")
+	assertSetting("non_stream_timeout", "600", "600")
+
+	legacy("max_body_bytes", "10485760", "10485760")
+	legacy("non_stream_timeout", "300", "120")
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy defaults: %v", err)
+	}
+	assertSetting("max_body_bytes", "33554432", "33554432")
+	assertSetting("non_stream_timeout", "300", "600")
 }
 
 func TestMigrateSQLite_BackfillsClientProtocolFromHistoricalModels(t *testing.T) {
@@ -1311,6 +1514,28 @@ func TestMigrateSQLite_AddsChannelModelsDisabled(t *testing.T) {
 	}
 }
 
+func TestMigrateSQLite_AddsChannelModelsPricing(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channel_models (
+			channel_id INTEGER NOT NULL, model TEXT NOT NULL, redirect_model TEXT NOT NULL DEFAULT '',
+			disabled INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (channel_id, model)
+		);
+		INSERT INTO channel_models (channel_id, model) VALUES (1, 'legacy-model');
+	`); err != nil {
+		t.Fatalf("create legacy channel_models: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy channel_models: %v", err)
+	}
+	var pricing sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT pricing FROM channel_models WHERE model = 'legacy-model'`).Scan(&pricing); err != nil || pricing.Valid {
+		t.Fatalf("legacy pricing = (%v, %v), want NULL", pricing, err)
+	}
+}
+
 func TestNeedChannelModelsMigration_SQLite(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1579,7 +1804,6 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"health_score_update_interval",
 		"health_min_confident_sample",
 		"cooldown_fallback_enabled",
-		"active_request_title_enabled",
 		"responses_ws_max_sessions",
 		"responses_ws_session_ttl_minutes",
 		"responses_ws_max_transcript_bytes",
@@ -1609,9 +1833,6 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		}
 		if strings.HasPrefix(key, "responses_ws_") && (val != "0" || defaultValue != "0") {
 			t.Errorf("setting %q initial/default value = %q/%q, want 0/0", key, val, defaultValue)
-		}
-		if key == "active_request_title_enabled" && (val != "false" || defaultValue != "false") {
-			t.Errorf("setting %q initial/default value = %q/%q, want false/false", key, val, defaultValue)
 		}
 		if (key == "CODEX_BASE_URL" || key == "XAI_BASE_URL" || key == "ANTIGRAVITY_URL" || key == "ANTHROPIC_BASE_URL") && val != "" {
 			t.Errorf("setting %q default = %q, want empty", key, val)
@@ -1902,23 +2123,38 @@ func TestCleanupRemovedSettings_SQLite(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	// 插入一个应该被清理的旧设置
-	_, err := db.ExecContext(ctx,
-		"INSERT OR REPLACE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES ('model_lookup_strip_date_suffix', 'true', 'bool', 'old', 'true', unixepoch())")
-	if err != nil {
-		t.Fatalf("insert old setting: %v", err)
+	removedKeys := []string{
+		"skip_tls_verify",
+		"model_lookup_strip_date_suffix",
+		"active_request_title_enabled",
+		"antigravity_connection_reuse_enabled",
+		"antigravity_max_idle_conns_per_host",
+		"antigravity_idle_conn_timeout_seconds",
+	}
+	for _, key := range removedKeys {
+		_, err := db.ExecContext(ctx,
+			"INSERT OR REPLACE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES (?, 'true', 'bool', 'old', 'true', unixepoch())",
+			key,
+		)
+		if err != nil {
+			t.Fatalf("insert old setting %s: %v", key, err)
+		}
 	}
 
 	if err := cleanupRemovedSettings(ctx, db, DialectSQLite); err != nil {
 		t.Fatalf("cleanupRemovedSettings: %v", err)
 	}
 
-	var cnt int
-	_ = db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM system_settings WHERE key='model_lookup_strip_date_suffix'",
-	).Scan(&cnt)
-	if cnt != 0 {
-		t.Fatal("expected model_lookup_strip_date_suffix to be removed")
+	for _, key := range removedKeys {
+		var count int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM system_settings WHERE key=?", key,
+		).Scan(&count); err != nil {
+			t.Fatalf("count removed setting %s: %v", key, err)
+		}
+		if count != 0 {
+			t.Fatalf("expected %s to be removed", key)
+		}
 	}
 }
 
@@ -2233,5 +2469,34 @@ func testSequentialKeyPrioritiesMigration(t *testing.T, db *sql.DB, dialect Dial
 	}
 	if total != 0 {
 		t.Fatalf("migration reapplied: priority sum=%d", total)
+	}
+}
+
+func TestInitDefaultSettings_RefreshesTokenVisibilityDescription(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatal(err)
+	}
+	var value, defaultValue, description string
+	readSetting := func() {
+		t.Helper()
+		if err := db.QueryRowContext(ctx, `SELECT value, default_value, description FROM system_settings WHERE key = 'api_token_show_channels'`).Scan(&value, &defaultValue, &description); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readSetting()
+	if value != "false" || defaultValue != "false" || !strings.Contains(description, "实际模型名") {
+		t.Fatalf("unexpected initial setting: %q %q %q", value, defaultValue, description)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE system_settings SET value = 'true', description = 'old description' WHERE key = 'api_token_show_channels'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
+		t.Fatal(err)
+	}
+	readSetting()
+	if value != "true" || defaultValue != "false" || !strings.Contains(description, "实际模型名") {
+		t.Fatalf("saved value changed or description not refreshed: %q %q %q", value, defaultValue, description)
 	}
 }

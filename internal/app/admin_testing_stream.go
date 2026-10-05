@@ -45,14 +45,20 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		return
 	}
 
+	persistedCfg := cfg
+	cfg, err = s.selectChannelTestModel(cfg, &testReq, false)
+	if err != nil {
+		writeChatErrorEvent(c, err.Error())
+		return
+	}
+
 	apiKeys, err := s.store.GetAPIKeys(c.Request.Context(), id)
 	if err != nil {
 		writeChatErrorEvent(c, "failed to load api keys")
 		return
 	}
-	persistedCfg := cfg
 	cfg, keySelection, err := s.prepareChannelTestAuth(
-		c.Request.Context(), cfg, apiKeys, testReq.Model, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
+		c.Request.Context(), cfg, apiKeys, testReq.Model, resolveClientProtocol(&testReq), testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
 		oauthCredentialRefreshIfNeeded,
 	)
 	if err != nil {
@@ -60,10 +66,7 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		return
 	}
 
-	if !cfg.SupportsModel(model.RoutingModelName(testReq.Model)) {
-		writeChatErrorEvent(c, "模型 "+testReq.Model+" 不在此渠道的支持列表中")
-		return
-	}
+	s.bindChannelTestBilling(cfg, &testReq)
 
 	if strings.TrimSpace(testReq.Content) == "" && len(testReq.Messages) == 0 {
 		testReq.Content = configuredChannelTestContent(s.configService)
@@ -139,7 +142,7 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 				return
 			}
 			lastResult = attempt.result
-			if !isChannelTestProtocolEndpointMissing(lastResult) {
+			if !isChannelTestProtocolEndpointMissing(cfg, lastResult) {
 				break
 			}
 			capabilityExhausted = protocolIdx == len(upstreamProtocols)-1
@@ -214,6 +217,18 @@ type chatStreamResult struct {
 	capacityRetries  int
 	errorResult      map[string]any
 	debugData        *model.DebugLogEntry
+
+	// requestedServiceTier 是上游请求体声明的计费档位，与上游回显合并后参与计费。
+	requestedServiceTier string
+}
+
+// costUSD 与非流式测试、代理同一口径计算本次流式测试成本；ok=false 表示无可计费用量。
+func (sr *chatStreamResult) costUSD(testReq *testutil.TestChannelRequest) (float64, bool) {
+	actualModel := sr.model
+	if actualModel == "" {
+		actualModel = testReq.Model
+	}
+	return channelTestCostUSD(testReq, actualModel, sr.requestedServiceTier, sr.usageParser)
 }
 
 func chatSummaryEventChunk(sr *chatStreamResult, testReq *testutil.TestChannelRequest) []byte {
@@ -244,21 +259,8 @@ func chatSummaryEventChunk(sr *chatStreamResult, testReq *testutil.TestChannelRe
 			summary["speed"] = math.Round(speed*10) / 10
 		}
 
-		// Calculate cost
-		cache5m, cache1h, _ := sr.usageParser.GetCacheBreakdown()
-		if input+output+cacheRead+cacheCreation > 0 {
-			pricingModel := sr.model
-			if pricingModel == "" {
-				pricingModel = testReq.Model
-			}
-			cost := util.CalculateCostDetailed(
-				model.RoutingModelName(pricingModel),
-				input, output, cacheRead,
-				cache5m, cache1h,
-			) + sr.usageParser.GetToolCostUSD()
+		if cost, ok := sr.costUSD(testReq); ok {
 			summary["cost_usd"] = cost
-		} else if toolCost := sr.usageParser.GetToolCostUSD(); toolCost > 0 {
-			summary["cost_usd"] = toolCost
 		}
 	}
 
@@ -282,7 +284,8 @@ func (s *Server) streamCursorChannelChat(
 ) {
 	start := time.Now()
 	attemptReq := *testReq
-	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, originalModel, clientProtocol)
+	selected, _ := s.firstModelRow(cfg, originalModel)
+	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, selected, clientProtocol)
 	// The admin endpoint always speaks SSE to the browser. The SDK itself also
 	// streams, so emitting a native streaming envelope avoids buffering a
 	// nominally non-streaming test before it is normalized for the frontend.
@@ -461,7 +464,8 @@ func (s *Server) streamChatWithURLForProtocol(
 	originalModel string,
 ) (out chatURLAttemptResult) {
 	attemptReq := *testReq
-	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, originalModel, upstreamProtocol)
+	selected, _ := s.firstModelRow(cfg, originalModel)
+	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, selected, upstreamProtocol)
 	testReq = &attemptReq
 	defer func() {
 		out.actualModel = attemptReq.Model
@@ -535,13 +539,14 @@ func (s *Server) streamChatWithURLForProtocol(
 	}
 
 	sr := &chatStreamResult{
-		start:            start,
-		usageParser:      newSSEUsageParser(requestPlan.upstreamProtocol),
-		model:            testReq.Model,
-		clientProtocol:   requestPlan.clientProtocol,
-		upstreamProtocol: requestPlan.upstreamProtocol,
-		statusCode:       resp.StatusCode,
-		requestThinking:  requestThinking,
+		start:                start,
+		usageParser:          newSSEUsageParser(requestPlan.upstreamProtocol),
+		model:                testReq.Model,
+		clientProtocol:       requestPlan.clientProtocol,
+		upstreamProtocol:     requestPlan.upstreamProtocol,
+		statusCode:           resp.StatusCode,
+		requestThinking:      requestThinking,
+		requestedServiceTier: requestPlan.requestedServiceTier(),
 	}
 
 	firstContentMarked := false
@@ -830,6 +835,7 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 	}
 	if sr.usageParser != nil {
 		input, output, cacheRead, cacheCreation := sr.usageParser.GetUsage()
+		result["codex_has_credits"] = sr.usageParser.GetCodexHasCredits()
 		cache5m, cache1h, _ := sr.usageParser.GetCacheBreakdown()
 		reasoningTokens := sr.usageParser.GetReasoningTokens()
 		if input+output+cacheRead+cacheCreation+reasoningTokens > 0 {
@@ -840,12 +846,8 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 				"cache_5m_input_tokens": cache5m, "cache_1h_input_tokens": cache1h,
 			}
 		}
-		if input+output+cacheRead+cacheCreation > 0 {
-			pricingModel := sr.model
-			if pricingModel == "" {
-				pricingModel = testReq.Model
-			}
-			result["cost_usd"] = util.CalculateCostDetailed(model.RoutingModelName(pricingModel), input, output, cacheRead, cache5m, cache1h) + sr.usageParser.GetToolCostUSD()
+		if cost, ok := sr.costUSD(testReq); ok {
+			result["cost_usd"] = cost
 		}
 		if effort := sr.usageParser.GetThinkingEffort(); effort != "" {
 			result["thinking_effort"] = effort
@@ -890,14 +892,17 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 	ctx := c.Request.Context()
 	requestPlan.debugCapture.captureTranslatedResponseMeta(resp.StatusCode, resp.Header)
 
-	src := readerWithCloser{Reader: resp.Body, Closer: resp.Body}
+	src := resp.Body
+	if requestPlan.antigravityOAuth {
+		src = terminateAntigravitySSE(src)
+	}
 	return streamTransformSSEEvents(ctx, src, c.Writer,
 		func(rawEvent []byte) error {
 			parserEvent := rawEvent
 			if requestPlan.antigravityOAuth {
 				var err error
 				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || parserEvent == nil {
 					return err
 				}
 			}
@@ -909,9 +914,13 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 		func(rawEvent []byte) ([][]byte, error) {
 			translatedRequestBody := requestPlan.requestBody
 			if requestPlan.antigravityOAuth {
+				// 与代理链路一致：后端错误帧只交给 usage parser，不进转换器。
+				if isAntigravityErrorPayload(antigravityEventPayload(rawEvent)) {
+					return nil, nil
+				}
 				var err error
 				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || rawEvent == nil {
 					return nil, err
 				}
 				translatedRequestBody, err = unwrapAntigravityRequest(requestPlan.requestBody)

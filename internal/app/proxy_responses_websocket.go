@@ -461,8 +461,13 @@ func (s *Server) executeResponsesWebsocketTurn(
 	if len(candidates) == 0 {
 		return responsesWebsocketTurnResult{}, errors.New("no available upstream")
 	}
+	sessionAffinityKey := codexSessionAffinityKey(tokenHashString, c.Request.Header)
+	sessionAffinity, hasSessionAffinity := s.sessionAffinity.lookup(sessionAffinityKey, time.Now())
+	if hasSessionAffinity {
+		candidates = preferSessionAffinityChannel(candidates, sessionAffinity.channelID)
+	}
 	if channelID, ok := executionSession.routeChannelSnapshot(); ok {
-		candidates = prioritizePinnedCodexChannel(candidates, channelID)
+		candidates = prioritizePinnedChannel(candidates, channelID)
 	}
 	if allowLocalPrewarm && responsesWebsocketGenerateDisabled(requestBody) &&
 		!isNativeCodexWebsocketCandidate(candidates[0]) {
@@ -475,26 +480,28 @@ func (s *Server) executeResponsesWebsocketTurn(
 	header := responsesWebsocketUpstreamHeaders(c.Request.Header)
 	header.Set("Content-Type", "application/json")
 	reqCtx := &proxyRequestContext{
-		clientModel:     clientModel,
-		originalModel:   modelName,
-		requestedModel:  requestedModel,
-		clientProtocol:  protocol.Codex,
-		codexClient:     isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
-		requestMethod:   http.MethodPost,
-		requestPath:     "/v1/responses",
-		rawQuery:        c.Request.URL.RawQuery,
-		body:            requestBody,
-		translatedBody:  requestBody,
-		header:          header,
-		isStreaming:     true,
-		tokenHash:       tokenHashString,
-		tokenID:         tokenIDInt64,
-		clientIP:        c.ClientIP(),
-		startTime:       startTime,
-		thinkingEffort:  thinkingEffort,
-		routingSession:  executionSession,
-		nativeCodexWS:   nativeCodexWS,
-		nativeCodexBody: bytes.Clone(nativeRequestBody),
+		clientModel:        clientModel,
+		originalModel:      modelName,
+		requestedModel:     requestedModel,
+		clientProtocol:     protocol.Codex,
+		codexClient:        isCodexMultiAgentClient(codexMultiAgentUserAgent(c.Request.Header)),
+		requestMethod:      http.MethodPost,
+		requestPath:        "/v1/responses",
+		rawQuery:           c.Request.URL.RawQuery,
+		body:               requestBody,
+		translatedBody:     requestBody,
+		header:             header,
+		isStreaming:        true,
+		tokenHash:          tokenHashString,
+		tokenID:            tokenIDInt64,
+		clientIP:           c.ClientIP(),
+		startTime:          startTime,
+		thinkingEffort:     thinkingEffort,
+		routingSession:     executionSession,
+		nativeCodexWS:      nativeCodexWS,
+		nativeCodexBody:    bytes.Clone(nativeRequestBody),
+		sessionAffinityKey: sessionAffinityKey,
+		sessionAffinity:    sessionAffinity,
 	}
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
@@ -726,7 +733,7 @@ func isResponsesWebsocketMessageTooBigPayload(payload []byte) bool {
 	return strings.TrimSpace(gjson.GetBytes(payload, "error.code").String()) == "message_too_big"
 }
 
-func prioritizePinnedCodexChannel(candidates []*model.Config, channelID int64) []*model.Config {
+func prioritizePinnedChannel(candidates []*model.Config, channelID int64) []*model.Config {
 	for index, candidate := range candidates {
 		if candidate == nil || candidate.ID != channelID || index == 0 {
 			continue
@@ -840,7 +847,7 @@ func (w *responsesWebsocketBridgeWriter) Write(data []byte) (int, error) {
 			w.failed = true
 			w.failedPayload = bytes.Clone(payload)
 			w.closedForMessageTooBig = true
-			continue
+			return 0, nil
 		}
 		if eventType == "error" || eventType == "response.failed" {
 			w.failed = true

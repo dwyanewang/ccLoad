@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/sjson"
 )
 
 var errUnknownClientProtocol = errors.New("unknown client protocol for path")
@@ -63,10 +65,10 @@ func (s *Server) acquireConcurrencySlot(c *gin.Context) (release func(), ok bool
 		return release, true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "request timeout while waiting for slot"})
+		writeLocalProxyError(c, http.StatusGatewayTimeout, "request timeout while waiting for slot")
 		return nil, false
 	}
-	c.JSON(StatusClientClosedRequest, gin.H{"error": "request cancelled while waiting for slot"})
+	writeLocalProxyError(c, StatusClientClosedRequest, "request cancelled while waiting for slot")
 	return nil, false
 }
 
@@ -195,6 +197,15 @@ func parseIncomingRequest(c *gin.Context, bodyLimits requestBodyLimits) (incomin
 	}
 	hasModel := originalModel != ""
 	requestFamily := protocol.DetectRequestFamily(requestPath)
+	if reqModel.Model != "" &&
+		(requestFamily == protocol.RequestFamilyMessages || requestFamily == protocol.RequestFamilyCountTokens) {
+		if normalized := trimClaudeCodeLongContextSuffix(originalModel); normalized != originalModel {
+			if all, err = sjson.SetBytes(all, "model", normalized); err != nil {
+				return incomingRequest{}, fmt.Errorf("normalize model: %w", err)
+			}
+			originalModel = normalized
+		}
+	}
 
 	// GET 请求保留既有通配选路语义；Codex alpha/search 的业务模型保持为空。
 	if originalModel == "" {
@@ -213,6 +224,18 @@ func parseIncomingRequest(c *gin.Context, bodyLimits requestBodyLimits) (incomin
 		isStreaming:    isStreaming,
 		hasModel:       hasModel,
 	}, nil
+}
+
+const claudeCodeLongContextSuffix = "[1m]"
+
+// trimClaudeCodeLongContextSuffix 去掉泄漏的 [1m]（含重复形式）。Claude Code 把它当客户端
+// 上下文选择器，通常发请求前自行去掉；泄漏时带后缀选路必然落空（对齐 sub2api）。
+func trimClaudeCodeLongContextSuffix(modelName string) string {
+	for len(modelName) > len(claudeCodeLongContextSuffix) &&
+		strings.EqualFold(modelName[len(modelName)-len(claudeCodeLongContextSuffix):], claudeCodeLongContextSuffix) {
+		modelName = modelName[:len(modelName)-len(claudeCodeLongContextSuffix)]
+	}
+	return modelName
 }
 
 // requestBodyLimits 是单个 Server 的不可变请求体上限。
@@ -302,11 +325,61 @@ func (s *Server) selectRouteCandidates(ctx context.Context, c *gin.Context, orig
 	return s.selectCandidatesByModelAndClientProtocol(ctx, originalModel, clientProtocol)
 }
 
+// Only Anthropic's first-party origin has a measured native count_tokens wire.
+// A channel with mixed targets is left to the local estimator so URL fallback
+// cannot silently send this auxiliary request to a third-party gateway.
+func (s *Server) officialAnthropicCountTokensCandidates(cands []*model.Config) []*model.Config {
+	selected := make([]*model.Config, 0, len(cands))
+	for _, cfg := range cands {
+		runtimeCfg := s.withOAuthBaseURLOverride(cfg)
+		if len(runtimeCfg.URLs) == 0 {
+			continue
+		}
+		allOfficial := true
+		for _, entry := range runtimeCfg.URLs {
+			parsed, err := url.Parse(model.StripExactUpstreamURLMarker(entry.URL))
+			if err != nil || !entry.SupportsProtocol(string(protocol.Anthropic)) || !isOfficialAnthropicURL(parsed) {
+				allOfficial = false
+				break
+			}
+		}
+		if allOfficial {
+			selected = append(selected, cfg)
+		}
+	}
+	return selected
+}
+
+// handleLocalCountTokens 用本地估算应答 count_tokens，并按 count_tokens 来源记一条无渠道日志。
+func (s *Server) handleLocalCountTokens(c *gin.Context, body []byte, entry *model.LogEntry) {
+	status, payload, inputTokens := localCountTokens(body)
+	respBody, _ := sonic.Marshal(payload)
+	c.Data(status, "application/json; charset=utf-8", respBody)
+
+	entry.LogSource = model.LogSourceCountTokens
+	entry.StatusCode = status
+	entry.InputTokens = inputTokens
+	entry.Duration = time.Since(entry.Time.Time).Seconds()
+	if s.configService.GetBool("debug_log_enabled", false) {
+		entry.DebugData = &model.DebugLogEntry{
+			CreatedAt:   time.Now().Unix(),
+			ReqMethod:   c.Request.Method,
+			ReqURL:      c.Request.URL.String(),
+			ReqHeaders:  encodeDebugHeaders(c.Request.Header),
+			ReqBody:     body,
+			RespStatus:  status,
+			RespHeaders: encodeDebugHeaders(c.Writer.Header()),
+			RespBody:    respBody,
+		}
+	}
+	s.AddLogAsync(entry)
+}
+
 // ============================================================================
 // 主请求处理器
 // ============================================================================
 
-// handleSpecialRoutes 处理特殊路由（模型列表、token计数等）
+// handleSpecialRoutes 处理不需要上游渠道的特殊路由。
 // 返回 true 表示已处理，调用方应直接返回
 func (s *Server) handleSpecialRoutes(c *gin.Context) bool {
 	path := c.Request.URL.Path
@@ -318,9 +391,6 @@ func (s *Server) handleSpecialRoutes(c *gin.Context) bool {
 		return true
 	case method == http.MethodGet && path == "/v1beta/models":
 		s.handleListGeminiModels(c)
-		return true
-	case method == http.MethodPost && path == "/v1/messages/count_tokens":
-		s.handleCountTokens(c)
 		return true
 	}
 	return false
@@ -360,12 +430,12 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, errBodyTooLarge):
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+			writeLocalProxyError(c, http.StatusRequestEntityTooLarge, err.Error())
 		case errors.Is(err, errBodyReadTimeout):
 			// 408 而不是 400：请求本身没问题，是客户端没在读取超时内传完。
-			c.JSON(http.StatusRequestTimeout, gin.H{"error": err.Error()})
+			writeLocalProxyError(c, http.StatusRequestTimeout, err.Error())
 		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			writeLocalProxyError(c, http.StatusBadRequest, err.Error())
 		}
 		return
 	}
@@ -375,10 +445,12 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 
 	clientProtocol, effectiveRequestPath := clientRequestMetadata(c)
 	if err := validateClientBodyMatchesProtocol(clientProtocol, all); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeLocalProxyError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	if protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyAlphaSearch {
+	requestFamily := protocol.DetectRequestFamily(effectiveRequestPath)
+	countTokensRequest := requestFamily == protocol.RequestFamilyCountTokens
+	if requestFamily == protocol.RequestFamilyAlphaSearch {
 		all = sanitizeCodexAlphaSearchBody(all)
 	}
 
@@ -403,8 +475,26 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	tokenID, _ := c.Get("token_id")
 	tokenIDInt64, _ := tokenID.(int64)
+	localCountTokensLog := func(reason string) *model.LogEntry {
+		return &model.LogEntry{
+			Time:           model.JSONTime{Time: startTime},
+			Model:          clientModel,
+			AuthTokenID:    tokenIDInt64,
+			ClientProtocol: string(clientProtocol),
+			ClientIP:       c.ClientIP(),
+			Message:        "local: " + reason,
+		}
+	}
 
-	if !s.enforceTokenLimits(c, tokenHashStr, incoming.authorizationModel()) {
+	// count_tokens is an auxiliary, non-billable endpoint: an exhausted budget
+	// still gets an estimate. A model outside the token's whitelist must not
+	// reach a first-party account either, so it gets the local estimate too.
+	if countTokensRequest {
+		if !s.tokenModelAllowed(tokenHashStr, incoming.authorizationModel()) {
+			s.handleLocalCountTokens(c, all, localCountTokensLog("model restricted"))
+			return
+		}
+	} else if !s.enforceTokenLimits(c, tokenHashStr, incoming.authorizationModel()) {
 		return
 	}
 
@@ -422,7 +512,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	var executionSessionRequestBody []byte
 	var nativeRequestBody []byte
 	if clientProtocol == protocol.Codex && isStreaming && requestMethod == http.MethodPost &&
-		protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyResponses {
+		requestFamily == protocol.RequestFamilyResponses {
 		sessionID := responsesExecutionSessionID(c.Request.Header)
 		// Ordinary HTTP requests only need process-local state when the client supplied
 		// the explicit Session-Id contract. Cache routing hints are not conversation IDs.
@@ -431,12 +521,12 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			var errSession error
 			executionSession, releaseSession, errSession = s.responsesExecutionSessions.acquire(tokenHashStr, sessionID)
 			if errSession != nil {
-				c.JSON(http.StatusTooManyRequests, gin.H{"error": errSession.Error()})
+				writeLocalProxyError(c, http.StatusTooManyRequests, errSession.Error())
 				return
 			}
 			defer releaseSession()
 			if errAcquire := executionSession.acquireTurn(ctx); errAcquire != nil {
-				c.JSON(http.StatusRequestTimeout, gin.H{"error": errAcquire.Error()})
+				writeLocalProxyError(c, http.StatusRequestTimeout, errAcquire.Error())
 				return
 			}
 			defer executionSession.releaseTurn()
@@ -444,7 +534,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			replayBody, incrementalBody, localContinuation, errNormalize :=
 				executionSession.transcript.normalizeHTTPRequests(all)
 			if errNormalize != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": errNormalize.Error()})
+				writeLocalProxyError(c, http.StatusBadRequest, errNormalize.Error())
 				return
 			}
 			if !localContinuation {
@@ -462,28 +552,38 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 
 	cands, err := s.selectRouteCandidates(ctx, c, originalModel, string(clientProtocol))
-	if err == nil && requestMethod == http.MethodPost && protocol.DetectRequestFamily(effectiveRequestPath) != protocol.RequestFamilyAlphaSearch {
+	if err == nil && requestMethod == http.MethodPost && requestFamily != protocol.RequestFamilyAlphaSearch {
 		cands = s.appendAntigravityCreditsCandidates(ctx, cands, originalModel, string(clientProtocol), all)
 	}
 	if err != nil {
 		if errors.Is(err, errUnknownClientProtocol) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "unsupported path"})
+			writeLocalProxyError(c, http.StatusNotFound, "unsupported path")
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		writeLocalProxyError(c, http.StatusInternalServerError, "internal error")
 		return
+	}
+	if countTokensRequest {
+		cands = s.officialAnthropicCountTokensCandidates(cands)
+		if len(cands) == 0 {
+			s.handleLocalCountTokens(c, all, localCountTokensLog("no official channel"))
+			return
+		}
 	}
 
 	if len(cands) == 0 {
-		if protocol.DetectRequestFamily(effectiveRequestPath) == protocol.RequestFamilyAlphaSearch {
+		if requestFamily == protocol.RequestFamilyAlphaSearch {
 			writeEmptyAlphaSearchResponse(c.Writer)
 			return
 		}
 		if channelRestrictionDeniedFromContext(ctx) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "no allowed upstream channel for this token",
-			})
+			writeLocalProxyError(c, http.StatusForbidden, "no allowed upstream channel for this token")
 			return
+		}
+		status, message := http.StatusServiceUnavailable, "no available upstream (all cooled or none)"
+		// 模型根本没配置时返回 404：Claude Code 对 5xx 会退避重试多次才报错。
+		if clientProtocol == protocol.Anthropic && !s.modelConfigured(ctx, originalModel) {
+			status, message = http.StatusNotFound, fmt.Sprintf("model: %s", originalModel)
 		}
 		s.AddLogAsync(&model.LogEntry{
 			Time:           model.JSONTime{Time: time.Now()},
@@ -491,13 +591,13 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			LogSource:      model.LogSourceProxy,
 			AuthTokenID:    tokenIDInt64,
 			ClientProtocol: string(clientProtocol),
-			StatusCode:     503,
-			Message:        "no available upstream (all cooled or none)",
+			StatusCode:     status,
+			Message:        message,
 			IsStreaming:    isStreaming,
 			ClientIP:       c.ClientIP(),
 			ThinkingEffort: thinkingEffort,
 		})
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available upstream (all cooled or none)"})
+		writeLocalProxyError(c, status, message)
 		return
 	}
 
@@ -506,16 +606,26 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		if restricted {
 			cands = filtered
 			if len(cands) == 0 {
-				c.JSON(http.StatusForbidden, gin.H{
-					"error": "no allowed upstream channel for this token",
-				})
+				writeLocalProxyError(c, http.StatusForbidden, "no allowed upstream channel for this token")
 				return
 			}
 		}
 	}
+	var sessionAffinityKey string
+	switch {
+	case clientProtocol == protocol.Anthropic && requestFamily == protocol.RequestFamilyMessages:
+		sessionAffinityKey = anthropicSessionAffinityKey(tokenHashStr, c.Request.Header, all)
+	case clientProtocol == protocol.Codex && requestFamily == protocol.RequestFamilyResponses:
+		sessionAffinityKey = codexSessionAffinityKey(tokenHashStr, c.Request.Header)
+	}
+	sessionAffinity, hasSessionAffinity := s.sessionAffinity.lookup(sessionAffinityKey, time.Now())
+	if hasSessionAffinity {
+		cands = preferSessionAffinityChannel(cands, sessionAffinity.channelID)
+	}
+	// 执行会话已钉住的渠道（在用的上游 WS 或 RetryOtherKeys 首选渠道）优先于会话粘性。
 	if routingSession != nil {
 		if channelID, ok := routingSession.routeChannelSnapshot(); ok {
-			cands = prioritizePinnedCodexChannel(cands, channelID)
+			cands = prioritizePinnedChannel(cands, channelID)
 		}
 	}
 
@@ -537,6 +647,9 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		clientIP:       c.ClientIP(),
 		startTime:      startTime,
 		thinkingEffort: thinkingEffort,
+
+		sessionAffinityKey: sessionAffinityKey,
+		sessionAffinity:    sessionAffinity,
 	}
 	if routingSession != nil {
 		reqCtx.routingSession = routingSession
@@ -570,6 +683,10 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		if executionSession != nil && lastResult != nil && lastResult.hasResponsesTurn {
 			s.responsesExecutionSessions.commit(executionSession, executionSessionRequestBody, lastResult.responsesTurn)
 		}
+		return
+	}
+	if countTokensRequest && (lastResult == nil || !lastResult.isClientCanceled) {
+		s.handleLocalCountTokens(c, all, localCountTokensLog("upstream failed"))
 		return
 	}
 
@@ -618,17 +735,18 @@ func shouldStopTryingChannels(result *proxyResult) bool {
 	return result.nextAction == cooldown.ActionReturnClient
 }
 
+// tokenModelAllowed 报告令牌模型白名单是否放行该模型；无令牌或无模型时不受限。
+func (s *Server) tokenModelAllowed(tokenHash, modelName string) bool {
+	return tokenHash == "" || modelName == "" || s.authService.IsModelAllowed(tokenHash, modelName)
+}
+
 // enforceTokenLimits 检查 token 的模型限制与费用限额。
 // 违规时已写响应并返回 false，调用方应直接 return。
 func (s *Server) enforceTokenLimits(c *gin.Context, tokenHash, originalModel string) bool {
 	// 检查令牌模型限制（2026-01新增）
-	if tokenHash != "" && originalModel != "" {
-		if !s.authService.IsModelAllowed(tokenHash, originalModel) {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": fmt.Sprintf("model '%s' is not allowed for this token", originalModel),
-			})
-			return false
-		}
+	if !s.tokenModelAllowed(tokenHash, originalModel) {
+		writeLocalProxyError(c, http.StatusForbidden, fmt.Sprintf("model '%s' is not allowed for this token", originalModel))
+		return false
 	}
 
 	// 检查令牌费用限额（2026-01新增）
@@ -652,9 +770,18 @@ func (s *Server) enforceTokenLimits(c *gin.Context, tokenHash, originalModel str
 			case "total":
 				prefix = "Total cost"
 			}
+			message := fmt.Sprintf("%s limit exceeded: $%.2f used of $%.2f limit", prefix, used, limit)
+			// 额度要等窗口滚动或管理员调整才会恢复，客户端退避重试毫无意义。
+			c.Header("x-should-retry", "false")
+			if clientProtocol, _ := clientRequestMetadata(c); clientProtocol == protocol.Anthropic {
+				body := anthropicErrorBody(http.StatusTooManyRequests, message)
+				body["error"].(gin.H)["code"] = "cost_limit_exceeded"
+				c.JSON(http.StatusTooManyRequests, body)
+				return false
+			}
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
-					"message": fmt.Sprintf("%s limit exceeded: $%.2f used of $%.2f limit", prefix, used, limit),
+					"message": message,
 					"type":    "insufficient_quota",
 					"code":    "cost_limit_exceeded",
 				},
@@ -712,8 +839,7 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 			cfg = current.Clone()
 			cfg.AntigravityCredits = true
 			cfg.CooldownFallback = false
-			actualModel := s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(protocol.Gemini))
-			if !s.antigravityCredentials.standardQuotaUntil(cfg, actualModel).After(time.Now()) {
+			if len(s.applicableModelRows(cfg, reqCtx.originalModel, time.Now())) == 0 {
 				continue
 			}
 			eligible, filterErr := s.filterCooldownChannelsStrict(ctx, []*model.Config{cfg}, reqCtx.originalModel, string(reqCtx.clientProtocol))
@@ -722,6 +848,9 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 			}
 		}
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		if errors.Is(err, errNoAvailableModelRow) {
+			continue
+		}
 		if err != nil && errors.Is(err, ErrNoAPIKeyForModel) {
 			log.Printf("[INFO] 渠道 %s (ID=%d) 没有可用于模型 %s 的 Key，跳过该渠道", cfg.Name, cfg.ID, reqCtx.originalModel)
 			continue
@@ -731,7 +860,9 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 		// 使用 cooldownManager.HandleError 统一处理（DRY原则）
 		if err != nil && errors.Is(err, ErrAllKeysUnavailable) {
 			// 统一走 applyCooldownDecision：断开取消链+按决策执行缓存失效
-			s.applyCooldownDecision(ctx, cfg, httpErrorInputFromParts(cfg.ID, cooldown.NoKeyIndex, 503, nil, nil))
+			if !reqCtx.countTokens() {
+				s.applyCooldownDecision(ctx, cfg, httpErrorInputFromParts(cfg.ID, cooldown.NoKeyIndex, 503, nil, nil))
+			}
 			continue
 		}
 
@@ -842,11 +973,16 @@ func (s *Server) writeFinalProxyResponse(
 	}
 
 	if lastResult != nil && lastResult.status != 0 {
+		body := lastResult.body
+		// 无响应头即网关本地失败（网络错误、凭证不可用等），不是上游原文，需按客户端协议成形。
+		if lastResult.header == nil && reqCtx.clientProtocol == protocol.Anthropic {
+			body = anthropicLocalFailureBody(finalStatus, body)
+		}
 		// 透明代理原则：透传所有上游响应（状态码+header+body）
-		writeResponseWithHeaders(c.Writer, finalStatus, lastResult.header, lastResult.body)
+		writeResponseWithHeaders(c.Writer, finalStatus, lastResult.header, body)
 		return
 	}
 
 	disableResponseWriteTimeout(c.Writer, "最终响应")
-	c.JSON(finalStatus, gin.H{"error": "no upstream available"})
+	writeLocalProxyError(c, finalStatus, "no upstream available")
 }

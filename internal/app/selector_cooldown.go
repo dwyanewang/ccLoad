@@ -3,8 +3,10 @@ package app
 import (
 	"cmp"
 	"context"
+	"errors"
 	"log"
 	"slices"
+	"strings"
 	"time"
 
 	modelpkg "ccLoad/internal/model"
@@ -13,6 +15,8 @@ import (
 )
 
 type channelRestrictionTokenContextKey struct{}
+
+var errNoAvailableModelRow = errors.New("no available model row for channel")
 
 type channelRestrictionState struct {
 	tokenHash string
@@ -137,8 +141,57 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 		}
 	}
 
+	// Compute actual row/Key combinations once for both filtering and fallback.
+	rowReadiness := make(map[int64]time.Time, len(channels))
+	if requestModel != "" && requestModel != "*" {
+		eligible := channels[:0]
+		for _, cfg := range channels {
+			var keys []*modelpkg.APIKey
+			if !cfg.UsesOAuth() {
+				keys, err = s.getAPIKeysSnapshot(ctx, cfg.ID)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					log.Printf("[ERROR] 获取渠道 %d 的 Key 失败，跳过该渠道: %v", cfg.ID, err)
+					continue
+				}
+				// Channels without credentials retain model-only candidate
+				// selection; the forwarding boundary reports the missing Key.
+				if len(keys) == 0 {
+					keys = nil
+				}
+			}
+			found := false
+			var earliest time.Time
+			for _, row := range s.enumerateModelRows(cfg, requestModel) {
+				if row.entry.Disabled || (cfg.AntigravityCredits && !s.modelRowApplicable(cfg, row, now)) {
+					continue
+				}
+				readyAt, authorized := s.modelRowWithKeysReadyAt(cfg, row, requestProtocol, modelCooldowns[cfg.ID], keys, now)
+				if !authorized {
+					continue
+				}
+				if readyAt.IsZero() {
+					earliest = readyAt
+					found = true
+					break
+				}
+				if !found || readyAt.Before(earliest) {
+					earliest = readyAt
+				}
+				found = true
+			}
+			if found {
+				rowReadiness[cfg.ID] = earliest
+				eligible = append(eligible, cfg)
+			}
+		}
+		channels = eligible
+	}
+
 	// 先执行冷却过滤，保证冷却语义不被绕开（正确性优先）
-	filtered := s.filterCooledChannels(channels, requestModel, requestProtocol, channelCooldowns, keyCooldowns, modelCooldowns, now)
+	filtered := s.filterCooledChannels(channels, requestModel, channelCooldowns, keyCooldowns, rowReadiness, now)
 	if len(filtered) == 0 {
 		if !allowAllCooledFallback {
 			return nil, nil
@@ -154,7 +207,7 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 			return nil, nil
 		}
 
-		best, readyIn := s.pickBestChannelWhenAllCooled(channels, requestModel, requestProtocol, channelCooldowns, keyCooldowns, modelCooldowns, now)
+		best, readyIn := s.pickBestChannelWhenAllCooled(channels, channelCooldowns, keyCooldowns, rowReadiness, now)
 		if best != nil {
 			log.Printf("[INFO] 所有渠道冷却中，兜底使用渠道 %d（%.1fs 后就绪）", best.ID, readyIn.Seconds())
 			return []*modelpkg.Config{cooldownFallbackCandidate(best)}, nil
@@ -195,11 +248,9 @@ func cooldownFallbackCandidate(cfg *modelpkg.Config) *modelpkg.Config {
 // 选择规则：最早恢复 > 有效优先级高 > 基础优先级高
 func (s *Server) pickBestChannelWhenAllCooled(
 	channels []*modelpkg.Config,
-	requestModel string,
-	requestProtocol string,
 	channelCooldowns map[int64]time.Time,
 	keyCooldowns map[int64]map[int]time.Time,
-	modelCooldowns map[int64]map[string]time.Time,
+	rowReadiness map[int64]time.Time,
 	now time.Time,
 ) (*modelpkg.Config, time.Duration) {
 	if len(channels) == 0 {
@@ -218,8 +269,11 @@ func (s *Server) pickBestChannelWhenAllCooled(
 		if until, ok := channelCooldowns[ch.ID]; ok && until.After(readyAt) {
 			readyAt = until
 		}
-		if until, ok := s.modelCooldownUntil(ch, requestModel, requestProtocol, modelCooldowns); ok && until.After(readyAt) {
-			readyAt = until
+		if until, ok := rowReadiness[ch.ID]; ok {
+			if until.After(readyAt) {
+				readyAt = until
+			}
+			return readyAt
 		}
 		// Key全冷却时，取最早解禁时间
 		if ch.KeyCount > 0 {
@@ -303,15 +357,14 @@ func (s *Server) pickBestChannelWhenAllCooled(
 func (s *Server) filterCooledChannels(
 	channels []*modelpkg.Config,
 	requestModel string,
-	requestProtocol string,
 	channelCooldowns map[int64]time.Time,
 	keyCooldowns map[int64]map[int]time.Time,
-	modelCooldowns map[int64]map[string]time.Time,
+	rowReadiness map[int64]time.Time,
 	now time.Time,
 ) []*modelpkg.Config {
 	filtered := channels[:0]
 	for _, cfg := range channels {
-		if !cfg.AntigravityCredits && s.antigravityCredentials.standardQuotaUntil(cfg, s.resolveFinalUpstreamModel(cfg, requestModel, "gemini")).After(now) {
+		if requestModel != "*" && requestModel != "" && len(s.applicableModelRows(cfg, requestModel, now)) == 0 {
 			continue
 		}
 		// 1. 检查渠道级冷却
@@ -321,8 +374,11 @@ func (s *Server) filterCooledChannels(
 			}
 		}
 
-		// 2. 检查当前请求在该渠道映射到的实际模型是否冷却
-		if cooldownUntil, exists := s.modelCooldownUntil(cfg, requestModel, requestProtocol, modelCooldowns); exists && cooldownUntil.After(now) {
+		// 2. 检查当前请求是否存在模型、协议与 Key 均可用的组合
+		if until, exists := rowReadiness[cfg.ID]; exists {
+			if !until.After(now) {
+				filtered = append(filtered, cfg)
+			}
 			continue
 		}
 
@@ -348,55 +404,199 @@ func (s *Server) filterCooledChannels(
 	return filtered
 }
 
-func (s *Server) modelCooldownUntil(
-	cfg *modelpkg.Config,
-	requestModel string,
-	requestProtocol string,
-	modelCooldowns map[int64]map[string]time.Time,
-) (time.Time, bool) {
-	if cfg == nil || requestModel == "" || requestModel == "*" {
-		return time.Time{}, false
-	}
-	models := modelCooldowns[cfg.ID]
-	if len(models) == 0 {
-		return time.Time{}, false
-	}
-	possibleModels := s.possibleActualModels(cfg, requestModel, requestProtocol)
-	if len(possibleModels) == 0 {
-		return time.Time{}, false
-	}
-
-	var earliest time.Time
-	for _, actualModel := range possibleModels {
-		until, ok := models[actualModel]
-		if !ok || !until.After(time.Now()) {
-			return time.Time{}, false
-		}
-		if earliest.IsZero() || until.Before(earliest) {
-			earliest = until
-		}
-	}
-	return earliest, true
-}
-
 func (s *Server) possibleActualModels(cfg *modelpkg.Config, requestModel, requestProtocol string) []string {
 	client := protocol.Protocol(util.NormalizeProtocol(requestProtocol))
 	protocols := possibleUpstreamProtocols(cfg, client)
 
 	seen := make(map[string]struct{}, len(protocols))
 	models := make([]string, 0, len(protocols))
-	for _, upstreamProtocol := range protocols {
-		actualModel := s.resolveFinalUpstreamModel(cfg, requestModel, string(upstreamProtocol))
-		if actualModel == "" {
-			continue
+	for _, selected := range s.applicableModelRows(cfg, requestModel, time.Now()) {
+		for _, upstreamProtocol := range protocols {
+			actualModel := s.resolveFinalUpstreamModel(cfg, selected, string(upstreamProtocol))
+			if actualModel == "" {
+				continue
+			}
+			if _, ok := seen[actualModel]; ok {
+				continue
+			}
+			seen[actualModel] = struct{}{}
+			models = append(models, actualModel)
 		}
-		if _, ok := seen[actualModel]; ok {
-			continue
-		}
-		seen[actualModel] = struct{}{}
-		models = append(models, actualModel)
 	}
 	return models
+}
+
+func (s *Server) applicableModelRows(cfg *modelpkg.Config, requested string, now time.Time) []modelRoutingSelection {
+	rows := s.enumerateModelRows(cfg, requested)
+	result := rows[:0]
+	for _, selected := range rows {
+		if !s.modelRowApplicable(cfg, selected, now) {
+			continue
+		}
+		result = append(result, selected)
+	}
+	return result
+}
+
+func (s *Server) modelRowApplicable(cfg *modelpkg.Config, selected modelRoutingSelection, now time.Time) bool {
+	if selected.entry.Disabled {
+		return false
+	}
+	geminiModel := s.resolveFinalUpstreamModel(cfg, selected, string(protocol.Gemini))
+	quotaUntil := s.antigravityCredentials.standardQuotaUntil(cfg, geminiModel)
+	if cfg.AntigravityCredits {
+		return antigravityClaudeModel(geminiModel) && quotaUntil.After(now)
+	}
+	return cfg.CooldownFallback || !quotaUntil.After(now)
+}
+
+// modelRowWithKeysReadyAt evaluates complete protocol/Key combinations. A
+// zero time means ready now; false means no authorized combination exists.
+func (s *Server) modelRowWithKeysReadyAt(cfg *modelpkg.Config, selected modelRoutingSelection, requestProtocol string, cooldowns map[string]time.Time, keys []*modelpkg.APIKey, now time.Time) (time.Time, bool) {
+	protocols := possibleUpstreamProtocols(cfg, protocol.Protocol(util.NormalizeProtocol(requestProtocol)))
+	var earliest time.Time
+	found := false
+	for _, upstream := range protocols {
+		actual := s.resolveFinalUpstreamModel(cfg, selected, string(upstream))
+		modelUntil := cooldowns[actual]
+		if !modelUntil.After(now) {
+			modelUntil = time.Time{}
+		}
+		if keys == nil {
+			if !found || modelUntil.Before(earliest) {
+				earliest = modelUntil
+			}
+			found = true
+			continue
+		}
+		for _, key := range keys {
+			if key == nil || key.Disabled || !key.AllowsModel(selected.logicalModel) || !key.AllowsUpstreamModel(actual) {
+				continue
+			}
+			readyAt := modelUntil
+			if key.IsCoolingDown(now) {
+				if until := time.Unix(key.CooldownUntil, 0); until.After(readyAt) {
+					readyAt = until
+				}
+			}
+			// OAuth 渠道 (AntigravityCredits) 不走 Key 循环，CooldownFallback 需尾部
+			// standardQuotaUntil 合并；此守卫只对普通 API Key 渠道生效。
+			if readyAt.IsZero() && !cfg.AntigravityCredits && !cfg.CooldownFallback {
+				return readyAt, true
+			}
+			if !found || readyAt.Before(earliest) {
+				earliest = readyAt
+			}
+			found = true
+		}
+	}
+	if found && !cfg.AntigravityCredits && !cfg.CooldownFallback {
+		actual := s.resolveFinalUpstreamModel(cfg, selected, string(protocol.Gemini))
+		if until := s.antigravityCredentials.standardQuotaUntil(cfg, actual); until.After(now) && until.After(earliest) {
+			earliest = until
+		}
+	}
+	return earliest, found
+}
+
+func (s *Server) keyAllowsModelRow(cfg *modelpkg.Config, key *modelpkg.APIKey, selected modelRoutingSelection, requestProtocol string) bool {
+	if key == nil || key.Disabled {
+		return false
+	}
+	return s.keyModelScopeAllowsRow(cfg, key, selected, possibleUpstreamProtocols(cfg, protocol.Protocol(util.NormalizeProtocol(requestProtocol))))
+}
+
+func (s *Server) keyModelScopeAllowsRow(cfg *modelpkg.Config, key *modelpkg.APIKey, selected modelRoutingSelection, protocols []protocol.Protocol) bool {
+	if key == nil || !key.AllowsModel(selected.logicalModel) {
+		return false
+	}
+	for _, upstream := range protocols {
+		if key.AllowsUpstreamModel(s.resolveFinalUpstreamModel(cfg, selected, string(upstream))) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) selectChannelModelRow(ctx context.Context, cfg *modelpkg.Config, requested, requestProtocol string, session *responsesExecutionSession, apiKeys []*modelpkg.APIKey) (modelRoutingSelection, error) {
+	if requested == "" || requested == "*" {
+		return modelRoutingSelection{logicalModel: requested, entry: modelpkg.ModelEntry{Model: requested}, wildcard: true}, nil
+	}
+	rows := s.configuredModelRows(cfg, requested)
+	if len(rows) == 0 {
+		return modelRoutingSelection{}, errNoAvailableModelRow
+	}
+	allCooldowns, err := s.getAllModelCooldowns(ctx)
+	if err != nil {
+		if cfg.AntigravityCredits {
+			return modelRoutingSelection{}, err
+		}
+		log.Printf("[ERROR] 获取模型冷却状态失败，跳过选行冷却过滤: %v", err)
+		allCooldowns = nil
+	}
+	cooldowns := allCooldowns[cfg.ID]
+	now := time.Now()
+	available := make([]bool, len(rows))
+	hasAvailable := false
+	hasAuthorized := false
+	bestFallback := -1
+	var earliest time.Time
+	for i, selected := range rows {
+		readyAt, authorized := s.modelRowWithKeysReadyAt(cfg, selected, requestProtocol, cooldowns, apiKeys, now)
+		if !authorized {
+			continue
+		}
+		hasAuthorized = true
+		if !s.modelRowApplicable(cfg, selected, now) {
+			continue
+		}
+		available[i] = readyAt.IsZero()
+		hasAvailable = hasAvailable || available[i]
+		if cfg.CooldownFallback {
+			if bestFallback < 0 || readyAt.Before(earliest) {
+				bestFallback, earliest = i, readyAt
+			}
+			continue
+		}
+	}
+	if apiKeys != nil && !hasAuthorized {
+		return modelRoutingSelection{}, ErrNoAPIKeyForModel
+	}
+	if session != nil {
+		if bound, ok := session.boundModelRow(cfg.ID, rows[0].logicalModel); ok {
+			for i, selected := range rows {
+				if available[i] && selected.entry.Model == bound.entry.Model &&
+					strings.EqualFold(selected.entry.RedirectModel, bound.entry.RedirectModel) {
+					return selected, nil
+				}
+			}
+			session.forgetModelRow(cfg.ID, rows[0].logicalModel)
+		}
+	}
+	remember := func(selected modelRoutingSelection) (modelRoutingSelection, error) {
+		if session != nil {
+			session.rememberModelRow(cfg.ID, selected)
+		}
+		return selected, nil
+	}
+	if cfg.CooldownFallback && !hasAvailable && bestFallback >= 0 {
+		return remember(rows[bestFallback])
+	}
+	if len(rows) == 1 && available[0] {
+		return remember(rows[0])
+	}
+	if s.keySelector != nil {
+		if index, ok := s.keySelector.SelectModelRow(cfg.ID, rows[0].logicalModel, available); ok {
+			return remember(rows[index])
+		}
+	} else {
+		for i, ok := range available {
+			if ok {
+				return remember(rows[i])
+			}
+		}
+	}
+	return modelRoutingSelection{}, errNoAvailableModelRow
 }
 
 func possibleUpstreamProtocols(cfg *modelpkg.Config, client protocol.Protocol) []protocol.Protocol {
@@ -406,7 +606,7 @@ func possibleUpstreamProtocols(cfg *modelpkg.Config, client protocol.Protocol) [
 	seen := make(map[protocol.Protocol]struct{})
 	result := make([]protocol.Protocol, 0, len(localFallbackProtocolOrder))
 	appendProtocol := func(candidate protocol.Protocol) {
-		if !protocol.IsValid(candidate) {
+		if !configCanUseUpstreamProtocol(cfg, candidate) {
 			return
 		}
 		if _, exists := seen[candidate]; exists {

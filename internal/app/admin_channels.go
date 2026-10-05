@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
 	"ccLoad/internal/zaiauth"
@@ -177,9 +179,14 @@ func (s *Server) handleListChannels(c *gin.Context) {
 		protocolProbeRetries: s.protocolCapabilities.unsupportedRetrySummaries(now),
 		apiKeysMap:           allAPIKeys,
 	}
+	metadata := make([]channelOAuthMetadata, len(cfgs))
+	for i, cfg := range cfgs {
+		metadata[i] = channelOAuthMetadataFromCredential(cfg)
+	}
+	s.attachChannelQuotaCosts(c.Request.Context(), cfgs, metadata, now)
 	out := make([]ChannelWithCooldown, 0, len(cfgs))
-	for _, cfg := range cfgs {
-		channel := ectx.enrichChannel(cfg)
+	for i, cfg := range cfgs {
+		channel := ectx.enrichChannel(cfg, metadata[i])
 		channel.ManagementAccount = s.managementAccountView(cfg)
 		out = append(out, channel)
 	}
@@ -385,8 +392,7 @@ func channelCostMultiplierRange(cfg *model.Config, apiKeys []*model.APIKey) (flo
 	return m, m
 }
 
-func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config) ChannelWithCooldown {
-	metadata := channelOAuthMetadataFromCredential(cfg)
+func (ectx *channelEnrichmentContext) enrichChannel(cfg *model.Config, metadata channelOAuthMetadata) ChannelWithCooldown {
 	oc := ChannelWithCooldown{
 		Config:                       cfg,
 		CodexPlanType:                metadata.planType,
@@ -468,6 +474,8 @@ type channelOAuthMetadata struct {
 	xaiEntitlementStatus    string
 	codeBuddyEnterprise     bool
 	codeBuddyInternational  bool
+	tracksQuotaCost         bool
+	quotaUsage              *oauthcost.Usage
 }
 
 func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata {
@@ -486,10 +494,11 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 		if usage != nil {
 			usage.Credits = credential.Credits.Clone()
 		}
-		usage = attachOAuthQuotaCostUsage(usage, credential.QuotaCostUsage)
 		return channelOAuthMetadata{
 			antigravityPaidTier: credential.PaidTier.DisplayName(),
 			oauthUsage:          usage,
+			tracksQuotaCost:     true,
+			quotaUsage:          oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
 		}
 	}
 	if cfg.UsesXAIOAuth() {
@@ -498,12 +507,13 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 			return channelOAuthMetadata{}
 		}
 		usage, _, _ := persistedOAuthUsage(credential.OAuthUsage, xaiauth.ChannelType)
-		usage = attachOAuthQuotaCostUsage(usage, credential.QuotaCostUsage)
 		return channelOAuthMetadata{
 			xaiEmail:             credential.Identity().Email,
 			xaiSubscriptionTier:  strings.TrimSpace(credential.SubscriptionTier),
 			xaiEntitlementStatus: strings.TrimSpace(credential.EntitlementStatus),
 			oauthUsage:           usage,
+			tracksQuotaCost:      true,
+			quotaUsage:           oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
 		}
 	}
 	if cfg.UsesAnthropicOAuth() {
@@ -521,7 +531,9 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 		)
 		return channelOAuthMetadata{
 			anthropicPlanType: strings.TrimSpace(credential.PlanType),
-			oauthUsage:        attachOAuthQuotaCostUsage(usage, credential.QuotaCostUsage),
+			oauthUsage:        usage,
+			tracksQuotaCost:   true,
+			quotaUsage:        oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
 		}
 	}
 	if cfg.UsesZAIOAuth() {
@@ -576,8 +588,10 @@ func channelOAuthMetadataFromCredential(cfg *model.Config) channelOAuthMetadata 
 		active, activeSampledAt, codexPassiveUsageSummary(credential), passiveSampledAt,
 	)
 	metadata := channelOAuthMetadata{
-		planType:   credential.PlanType,
-		oauthUsage: attachOAuthQuotaCostUsage(usage, credential.QuotaCostUsage),
+		planType:        credential.PlanType,
+		oauthUsage:      usage,
+		tracksQuotaCost: true,
+		quotaUsage:      oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
 	}
 	if until, ok := credential.SubscriptionActiveUntil(); ok {
 		metadata.subscriptionActiveUntil = &until
@@ -719,6 +733,7 @@ func (s *Server) handleCreateChannel(c *gin.Context) {
 			APIKey:          entry.APIKey,
 			Note:            entry.Note,
 			AllowedModels:   append([]string(nil), entry.AllowedModels...),
+			DetectedModels:  append([]string(nil), entry.DetectedModels...),
 			ModelScopeEmpty: entry.ModelScopeEmpty,
 			KeyStrategy:     keyStrategy,
 			Disabled:        entry.ModelScopeEmpty,
@@ -799,18 +814,19 @@ func (s *Server) buildChannelDetail(ctx context.Context, id int64, cfg *model.Co
 	}
 
 	now := time.Now()
-	metadata := channelOAuthMetadataFromCredential(cfg)
+	metadata := []channelOAuthMetadata{channelOAuthMetadataFromCredential(cfg)}
+	s.attachChannelQuotaCosts(ctx, []*model.Config{cfg}, metadata, now)
 	detail := ChannelWithCooldown{
 		Config:                       cfg,
-		CodexPlanType:                metadata.planType,
-		CodexSubscriptionActiveUntil: metadata.subscriptionActiveUntil,
-		AnthropicPlanType:            metadata.anthropicPlanType,
-		OAuthUsage:                   metadata.oauthUsage,
-		AntigravityPaidTier:          metadata.antigravityPaidTier,
-		XAIEmail:                     metadata.xaiEmail,
-		XAISubscriptionTier:          metadata.xaiSubscriptionTier,
+		CodexPlanType:                metadata[0].planType,
+		CodexSubscriptionActiveUntil: metadata[0].subscriptionActiveUntil,
+		AnthropicPlanType:            metadata[0].anthropicPlanType,
+		OAuthUsage:                   metadata[0].oauthUsage,
+		AntigravityPaidTier:          metadata[0].antigravityPaidTier,
+		XAIEmail:                     metadata[0].xaiEmail,
+		XAISubscriptionTier:          metadata[0].xaiSubscriptionTier,
 		ManagementAccount:            s.managementAccountView(cfg),
-		XAIEntitlementStatus:         metadata.xaiEntitlementStatus,
+		XAIEntitlementStatus:         metadata[0].xaiEntitlementStatus,
 		KeyStrategy:                  channelKeyStrategy(apiKeys),
 		ModelCooldowns:               activeModelCooldownInfos(allModelCooldowns[id], now),
 	}
@@ -1105,6 +1121,7 @@ func (s *Server) handleAPIKeyToggle(c *gin.Context, disable bool) {
 		// discovery will not treat this key as a usable fallback later.
 		scope := model.APIKeyModelScope{
 			AllowedModels:   append([]string(nil), key.AllowedModels...),
+			DetectedModels:  append([]string(nil), key.DetectedModels...),
 			ModelScopeEmpty: false,
 			Disabled:        true,
 		}
@@ -1119,6 +1136,7 @@ func (s *Server) handleAPIKeyToggle(c *gin.Context, disable bool) {
 		// if one exists (the normal empty-scope state has none).
 		scope := model.APIKeyModelScope{
 			AllowedModels:   append([]string(nil), key.AllowedModels...),
+			DetectedModels:  append([]string(nil), key.DetectedModels...),
 			ModelScopeEmpty: false,
 			Disabled:        false,
 		}
@@ -1152,24 +1170,27 @@ func (s *Server) handleUpdateChannelModelDisabled(c *gin.Context, id int64, mode
 		return
 	}
 
-	found := -1
+	found := false
+	changed := false
 	for i := range cfg.ModelEntries {
 		if strings.EqualFold(cfg.ModelEntries[i].Model, modelName) {
-			found = i
-			break
+			found = true
+			if cfg.ModelEntries[i].Disabled != disabled {
+				cfg.ModelEntries[i].Disabled = disabled
+				changed = true
+			}
 		}
 	}
-	if found < 0 {
+	if !found {
 		RespondErrorMsg(c, http.StatusNotFound, "model not found")
 		return
 	}
 
-	if cfg.ModelEntries[found].Disabled == disabled {
+	if !changed {
 		RespondJSON(c, http.StatusOK, cfg)
 		return
 	}
 
-	cfg.ModelEntries[found].Disabled = disabled
 	upd, err := s.store.UpdateConfig(ctx, id, cfg)
 	if err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
@@ -1344,11 +1365,6 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		req.ManagementAccount = resolvedManagement
 	}
 
-	// 检测api_key是否变化（需要重建API Keys）
-	if existing.UsesOAuth() {
-		oldKeys = nil
-	}
-
 	newKeys := req.normalizeAPIKeys()
 	normalizeAPIKeyScopesForModels(newKeys, req.Models)
 	keyStrategy := strings.TrimSpace(req.KeyStrategy)
@@ -1356,8 +1372,8 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 		keyStrategy = channelKeyStrategy(oldKeys)
 	}
 
-	// 比较Key数量和内容是否变化
-	keyChanged := len(oldKeys) != len(newKeys)
+	// OAuth 合成 Key 仅回传倍率，不参与实际 API Key 变更判断。
+	keyChanged := !existing.UsesOAuth() && len(oldKeys) != len(newKeys)
 	if !keyChanged {
 		for i, oldKey := range oldKeys {
 			if i >= len(newKeys) || oldKey.APIKey != newKeys[i].APIKey {
@@ -1382,9 +1398,11 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 			if newKeys[i].CostMultiplier != nil && *newKeys[i].CostMultiplier != oldKey.CostMultiplier {
 				multipliersByIndex[oldKey.KeyIndex] = *newKeys[i].CostMultiplier
 			}
-			if !slices.Equal(oldKey.AllowedModels, newKeys[i].AllowedModels) || oldKey.ModelScopeEmpty != newKeys[i].ModelScopeEmpty {
+			if !slices.Equal(oldKey.AllowedModels, newKeys[i].AllowedModels) ||
+				!slices.Equal(oldKey.DetectedModels, newKeys[i].DetectedModels) || oldKey.ModelScopeEmpty != newKeys[i].ModelScopeEmpty {
 				scopesByIndex[oldKey.KeyIndex] = model.APIKeyModelScope{
 					AllowedModels:   append([]string(nil), newKeys[i].AllowedModels...),
+					DetectedModels:  append([]string(nil), newKeys[i].DetectedModels...),
 					ModelScopeEmpty: newKeys[i].ModelScopeEmpty,
 					// Only preserve a manually disabled key. A key disabled because
 					// its previous scope became empty is re-enabled by an explicit
@@ -1466,6 +1484,7 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 				APIKey:          key.APIKey,
 				Note:            key.Note,
 				AllowedModels:   append([]string(nil), key.AllowedModels...),
+				DetectedModels:  append([]string(nil), key.DetectedModels...),
 				ModelScopeEmpty: key.ModelScopeEmpty,
 				KeyStrategy:     keyStrategy,
 				Disabled:        wasDisabled || key.ModelScopeEmpty,
@@ -1532,6 +1551,10 @@ func (s *Server) handleUpdateChannel(c *gin.Context, id int64) {
 	} else {
 		s.InvalidateAPIKeysCache(id)
 	}
+	if keyChanged || protocolCapabilityConfigChanged(existing, upd) {
+		// URL、协议声明、转换模式或 Key 等可能已变化，只重新探测本渠道。
+		s.protocolCapabilities.clearChannels(id)
+	}
 
 	// 渠道更新后刷新缓存，确保选择器立即生效
 	s.InvalidateChannelListCache()
@@ -1565,6 +1588,9 @@ func preserveOmittedAPIKeyMetadata(submitted []ChannelAPIKeyRequest, existing []
 				priority := oldKey.Priority
 				submitted[i].Priority = &priority
 			}
+			if !submitted[i].detectedModelsSet {
+				submitted[i].DetectedModels = append([]string(nil), oldKey.DetectedModels...)
+			}
 			if submitted[i].allowedModelsSet {
 				continue
 			}
@@ -1579,19 +1605,11 @@ func preserveOmittedAPIKeyMetadata(submitted []ChannelAPIKeyRequest, existing []
 // key rebuild must not reintroduce a model deleted from the channel.
 func normalizeAPIKeyScopesForModels(keys []ChannelAPIKeyRequest, entries []model.ModelEntry) {
 	configured := make(map[string]struct{}, len(entries))
-	wildcard := false
 	for _, entry := range entries {
 		name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(entry.Model)))
-		if name == "*" {
-			wildcard = true
-			continue
-		}
 		if name != "" {
 			configured[name] = struct{}{}
 		}
-	}
-	if wildcard {
-		return
 	}
 	for i := range keys {
 		if keys[i].ModelScopeEmpty || len(keys[i].AllowedModels) == 0 {
@@ -1752,7 +1770,7 @@ func (s *Server) HandleDeleteAPIKey(c *gin.Context) {
 	})
 }
 
-// HandleAddModels 添加模型到渠道（去重）
+// HandleAddModels 按请求模型和目标身份追加配置行。
 // POST /admin/channels/:id/models
 func (s *Server) HandleAddModels(c *gin.Context) {
 	channelID, err := ParseInt64Param(c, "id")
@@ -1784,17 +1802,23 @@ func (s *Server) HandleAddModels(c *gin.Context) {
 		}
 	}
 
-	// 去重合并（大小写不敏感，兼容 MySQL utf8mb4_general_ci 排序规则）
-	existing := make(map[string]bool)
+	// 已存在的完整配置行不重复追加；同名不同目标是独立行。
+	existing := make(map[model.ModelEntryIdentity]bool)
 	for _, e := range cfg.ModelEntries {
-		existing[strings.ToLower(e.Model)] = true
+		existing[e.Identity()] = true
 	}
 	for _, e := range req.Models {
-		key := strings.ToLower(e.Model)
+		key := e.Identity()
 		if !existing[key] {
 			cfg.ModelEntries = append(cfg.ModelEntries, e)
 			existing[key] = true
 		}
+	}
+	if normalized, err := model.ValidateModelEntries(cfg.ModelEntries); err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
+		return
+	} else {
+		cfg.ModelEntries = normalized
 	}
 
 	if _, err := s.store.UpdateConfig(ctx, channelID, cfg); err != nil {
@@ -1852,6 +1876,62 @@ func (s *Server) HandleDeleteModels(c *gin.Context) {
 	s.InvalidateAPIKeysCache(channelID)
 	s.InvalidateChannelListCache()
 	RespondJSON(c, http.StatusOK, gin.H{"remaining": len(remaining)})
+}
+
+// HandleBatchDeleteModels 批量删除多个渠道中的指定模型。
+// POST /admin/channels/models/batch-delete
+func (s *Server) HandleBatchDeleteModels(c *gin.Context) {
+	var req struct {
+		Operations []struct {
+			ChannelID int64    `json:"channel_id"`
+			Models    []string `json:"models"`
+		} `json:"operations"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		RespondError(c, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Operations) == 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "operations cannot be empty")
+		return
+	}
+
+	operations := make([]model.BatchModelDeleteOperation, 0, len(req.Operations))
+	for i, operation := range req.Operations {
+		if operation.ChannelID <= 0 {
+			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("operations[%d].channel_id is invalid", i))
+			return
+		}
+		if len(operation.Models) == 0 {
+			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("operations[%d].models cannot be empty", i))
+			return
+		}
+		operations = append(operations, model.BatchModelDeleteOperation{
+			ChannelID: operation.ChannelID,
+			Models:    operation.Models,
+		})
+	}
+
+	result, err := s.store.BatchDeleteModels(c.Request.Context(), operations)
+	if err != nil {
+		log.Printf("批量删除渠道模型失败: %v", err)
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	for _, operation := range operations {
+		s.InvalidateAPIKeysCache(operation.ChannelID)
+	}
+	if result.Updated > 0 {
+		s.InvalidateChannelListCache()
+	}
+
+	RespondJSON(c, http.StatusOK, gin.H{
+		"total":           len(operations),
+		"updated":         result.Updated,
+		"unchanged":       result.Unchanged,
+		"not_found":       result.NotFound,
+		"not_found_count": len(result.NotFound),
+	})
 }
 
 // HandleBatchUpdatePriority 批量更新渠道优先级
@@ -2061,6 +2141,10 @@ func (s *Server) HandleBatchPatchChannels(c *gin.Context) {
 	result, err := s.store.BatchPatchConfigs(c.Request.Context(), channelIDs, patch)
 	if err != nil {
 		log.Printf("批量更新渠道高级配置失败: %v", err)
+		if errors.Is(err, model.ErrInvalidModelEntries) {
+			RespondError(c, http.StatusBadRequest, err)
+			return
+		}
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
@@ -2069,6 +2153,9 @@ func (s *Server) HandleBatchPatchChannels(c *gin.Context) {
 			for _, channelID := range channelIDs {
 				s.InvalidateAPIKeysCache(channelID)
 			}
+		}
+		if patch.ProtocolTransformMode != nil {
+			s.protocolCapabilities.clearChannels(channelIDs...)
 		}
 		s.InvalidateChannelListCache()
 	}
@@ -2228,6 +2315,7 @@ func (s *Server) disableChannelIfOAuthSnapshotMatches(
 
 func (s *Server) removeDeletedChannelRuntimeState(cfg *model.Config) {
 	id := cfg.ID
+	s.protocolCapabilities.clearChannels(id)
 	if s.keySelector != nil {
 		s.keySelector.RemoveChannelCounter(id)
 	}

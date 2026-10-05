@@ -126,7 +126,11 @@ func (s *Server) forwardCursorAgent(
 	if requested == "" {
 		requested = reqCtx.originalModel
 	}
-	modelID := s.resolveFinalUpstreamModel(cfg, requested, string(reqCtx.clientProtocol))
+	selected := reqCtx.attemptModel
+	if selected.logicalModel == "" && requested != "" {
+		selected, _ = s.firstModelRow(cfg, requested)
+	}
+	modelID := s.resolveFinalUpstreamModel(cfg, selected, string(reqCtx.clientProtocol))
 	started := time.Now()
 	reqCtx.attemptStartTime = started
 	if s.activeRequests != nil {
@@ -221,9 +225,7 @@ func (s *Server) forwardCursorAgent(
 			}
 			duration := time.Since(started).Seconds()
 			s.logProxyResult(reqCtx, cfg, modelID, "cursor-oauth", status, duration, failed, err.Error())
-			if status != StatusClientClosedRequest {
-				s.updateTokenStatsForProxy(reqCtx, false, duration, failed, modelID)
-			}
+			s.updateTokenStatsForProxy(reqCtx, failureTokenStatsOutcome(status), duration, failed, modelID)
 		}
 		return result, nil
 	}
@@ -232,6 +234,10 @@ func (s *Server) forwardCursorAgent(
 	msgID := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	var responseTransformState any
 	var responseTransformErr error
+	if streaming && format == "responses" && s.protocolRegistry != nil {
+		_, responseTransformErr = s.protocolRegistry.TranslateResponseStream(ctx, protocol.OpenAI, protocol.Codex,
+			modelID, originalResponseBody, body, nil, &responseTransformState)
+	}
 	var out bytes.Buffer
 	full := ""
 	firstByte := time.Duration(0)
@@ -372,7 +378,11 @@ func (s *Server) forwardCursorAgent(
 		}
 		if streaming && wroteHeader && !clientDisconnected {
 			if format == "responses" {
-				_, _ = w.Write(cursorResponsesStreamError(runErr))
+				// Preserve the run failure; EOF validation would replace it with a
+				// missing-terminator error. Conversion failures were already emitted.
+				if protocol.ResponseToolInputError(responseTransformState) == nil {
+					_, _ = w.Write(cursorResponsesStreamError(runErr))
+				}
 			} else {
 				_, _ = w.Write([]byte("data: {\"error\":{\"message\":" + jsonString(runErr.Error()) + "}}\n\n"))
 			}
@@ -385,12 +395,11 @@ func (s *Server) forwardCursorAgent(
 		if !reqCtx.skipProxyLog && !replayed {
 			failed := &fwResult{
 				Status: status, Body: result.body, FirstByteTime: firstByte.Seconds(),
+				ResponseCommitted: wroteHeader,
 			}
 			applyCursorUsage(failed, billableUsage)
 			s.logProxyResult(reqCtx, cfg, modelID, "cursor-oauth", status, duration, failed, runErr.Error())
-			if status != StatusClientClosedRequest {
-				s.updateTokenStatsForProxy(reqCtx, false, duration, failed, modelID)
-			}
+			s.updateTokenStatsForProxy(reqCtx, failureTokenStatsOutcome(status), duration, failed, modelID)
 		}
 		result.proxyLogWritten = !reqCtx.skipProxyLog && !replayed
 		result.isClientCanceled = clientDisconnected
@@ -481,7 +490,7 @@ func (s *Server) forwardCursorAgent(
 	applyCursorUsage(forwarded, billableUsage)
 	if !reqCtx.skipProxyLog && !replayed {
 		s.logProxyResult(reqCtx, cfg, modelID, "cursor-oauth", http.StatusOK, duration, forwarded, "")
-		s.updateTokenStatsForProxy(reqCtx, true, duration, forwarded, modelID)
+		s.updateTokenStatsForProxy(reqCtx, model.TokenStatsSuccess, duration, forwarded, modelID)
 	}
 	return &proxyResult{
 		status: http.StatusOK, header: header, body: responseBody, channelID: &channelID,
@@ -908,9 +917,6 @@ func writeCursorResponsesStream(
 			event,
 			state,
 		)
-		if err != nil {
-			return err
-		}
 		for _, chunk := range chunks {
 			if len(chunk) == 0 {
 				continue
@@ -918,6 +924,9 @@ func writeCursorResponsesStream(
 			if _, err := w.Write(chunk); err != nil {
 				return fmt.Errorf("client disconnected: %w", err)
 			}
+		}
+		if err != nil {
+			return err
 		}
 	}
 	return nil

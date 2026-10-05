@@ -29,8 +29,9 @@ type ModelPricing struct {
 	// HasCacheWritePriceHigh 区分高上下文缓存创建价「未配置」与「显式为 0」。
 	HasCacheWritePriceHigh bool
 
-	// 缓存读取 token 是否参与高/低档选择。
-	// OpenAI context tiers、MiMo / Grok 等系列按「input + cache_read」总量分档，需置 true；
+	// 缓存 token（读与写）是否参与高/低档选择。
+	// Claude 长上下文按「input + cache_read + cache_creation」判定 200K；OpenAI context tiers、
+	// MiMo / Grok 等系列按「input + cache_read」总量分档（这些 usage 没有缓存写），均需置 true；
 	// Gemini 长上下文分档只看非缓存 prompt size，缓存读不得推高分档，保持 false。
 	CacheReadCountsTowardTier bool
 
@@ -130,6 +131,11 @@ var (
 		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
 		CacheReadCountsTowardTier: true,
 	}
+	grok47FastPricing = ModelPricing{
+		InputPrice: 4.00, OutputPrice: 12.00, CacheReadPrice: 1.00, HasCacheReadPrice: true,
+		InputPriceHigh: 6.00, OutputPriceHigh: 18.00, CacheReadPriceHigh: 1.50,
+		CacheReadCountsTowardTier: true,
+	}
 	grok420Pricing = ModelPricing{
 		InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true,
 		InputPriceHigh: 2.50, OutputPriceHigh: 5.00, CacheReadPriceHigh: 0.40,
@@ -149,15 +155,22 @@ var (
 // - Gemini: https://ai.google.dev/gemini-api/docs/pricing
 var basePricing = map[string]ModelPricing{
 	// ========== Claude 模型 ==========
+	"claude-sonnet-5-5": {
+		InputPrice: 2.00, OutputPrice: 10.00,
+		CacheReadPrice: 0.20, HasCacheReadPrice: true,
+		CacheWritePrice: 2.50, HasCacheWritePrice: true,
+	},
 	"claude-sonnet-5":   {InputPrice: 3.00, OutputPrice: 15.00}, // 同 claude-sonnet-4-6
 	"claude-sonnet-4-6": {InputPrice: 3.00, OutputPrice: 15.00}, // 全1M窗口统一价格
 	"claude-sonnet-4-5": {
 		InputPrice: 3.00, OutputPrice: 15.00,
 		InputPriceHigh: 6.00, OutputPriceHigh: 22.50, // >200k context
+		CacheReadCountsTowardTier: true,
 	},
 	"claude-sonnet-4-0": {
 		InputPrice: 3.00, OutputPrice: 15.00,
 		InputPriceHigh: 6.00, OutputPriceHigh: 22.50, // >200k context
+		CacheReadCountsTowardTier: true,
 	},
 	"claude-haiku-4-5": {InputPrice: 1.00, OutputPrice: 5.00},
 	"claude-opus-4-1":  {InputPrice: 15.00, OutputPrice: 75.00},
@@ -166,6 +179,11 @@ var basePricing = map[string]ModelPricing{
 	"claude-opus-4-7":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
 	"claude-opus-4-8":  {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
 	"claude-opus-5":    {InputPrice: 5.00, OutputPrice: 25.00}, // 全1M窗口统一价格
+	"claude-opus-5-5": {
+		InputPrice: 4.00, OutputPrice: 20.00,
+		CacheReadPrice: 0.20, HasCacheReadPrice: true,
+		CacheWritePrice: 5.00, HasCacheWritePrice: true,
+	},
 	"claude-fable-5-1": {
 		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 0.25, HasCacheReadPrice: true,
 	},
@@ -190,6 +208,23 @@ var basePricing = map[string]ModelPricing{
 	"gpt-6-astra": {
 		InputPrice: 10.00, OutputPrice: 50.00, CacheReadPrice: 1.00, HasCacheReadPrice: true,
 		InputPriceHigh: 20.00, OutputPriceHigh: 75.00, CacheReadPriceHigh: 2.00, // >272K context
+		CacheReadCountsTowardTier: true,
+	},
+	// GPT-6.1 Sol 官方价格：缓存读为输入价格的 5%，>272K 整段按高价计费。
+	"gpt-6.1-sol": {
+		InputPrice: 2.00, OutputPrice: 10.00, CacheReadPrice: 0.10, HasCacheReadPrice: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 15.00, CacheReadPriceHigh: 0.20, // >272K context
+		CacheReadCountsTowardTier: true,
+	},
+	// GPT-6 Sol/Luna 官方价格：缓存读为输入价格的 10%，缓存写按输入价格的 1.25×计费。
+	"gpt-6-sol": {
+		InputPrice: 2.00, OutputPrice: 10.00, CacheReadPrice: 0.20, HasCacheReadPrice: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 15.00, CacheReadPriceHigh: 0.40, // >272K context
+		CacheReadCountsTowardTier: true,
+	},
+	"gpt-6-luna": {
+		InputPrice: 0.10, OutputPrice: 0.50, CacheReadPrice: 0.01, HasCacheReadPrice: true,
+		InputPriceHigh: 0.20, OutputPriceHigh: 0.75, CacheReadPriceHigh: 0.02, // >272K context
 		CacheReadCountsTowardTier: true,
 	},
 	"gpt-5.6": {
@@ -585,6 +620,8 @@ var basePricing = map[string]ModelPricing{
 
 	// ========== xAI Grok 模型 ==========
 	// 来源: https://docs.x.ai/developers/pricing
+	"grok-4.7":                     grok46Pricing,
+	"grok-4.7-fast":                grok47FastPricing,
 	"grok-4.6":                     grok46Pricing,
 	"grok-4.5":                     grok45Pricing,
 	"grok-4.3":                     grok420Pricing,
@@ -670,6 +707,9 @@ var basePricing = map[string]ModelPricing{
 	"gpt-oss-120b":          {InputPrice: 0.039, OutputPrice: 0.18, CacheReadPrice: 0.055, HasCacheReadPrice: true},
 	"gpt-oss-120b:exacto":   {InputPrice: 0.039, OutputPrice: 0.19, CacheReadPrice: 0.04, HasCacheReadPrice: true},
 	"gpt-oss-safeguard-20b": {InputPrice: 0.075, OutputPrice: 0.30, CacheReadPrice: 0.037, HasCacheReadPrice: true},
+
+	// Typesafe Jev 1.13.0：仅输入 token 计费，输出 token 免费。
+	"jev-latest": {InputPrice: 0.042, OutputPrice: 0.00},
 }
 
 // modelAliases 模型别名映射（多对一）
@@ -1009,6 +1049,20 @@ func LookupSystemModelPricing(model string) (ModelPricing, bool) {
 		return withEffectiveSystemDefaults(model, pricing), true
 	}
 	return ModelPricing{}, false
+}
+
+// LookupEffectiveModelPricing 返回计费当前实际使用的模型价格（含全局自定义覆盖），
+// 用于渠道模型价格编辑器预填；隐式缓存价同样展开为可编辑的显式值。
+func LookupEffectiveModelPricing(model string) (ModelPricing, bool) {
+	model = strings.ToLower(strings.TrimSpace(model))
+	pricing, ok := getPricing(model)
+	if !ok {
+		pricing, ok = fuzzyMatchModel(model)
+	}
+	if !ok {
+		return ModelPricing{}, false
+	}
+	return withEffectiveSystemDefaults(model, pricing), true
 }
 
 func lookupModelPricingWithFallback(

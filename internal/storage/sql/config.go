@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"time"
 
 	"ccLoad/internal/model"
-	"ccLoad/internal/oauthcost"
+	"ccLoad/internal/util"
 )
 
 // ==================== Config CRUD 实现 ====================
@@ -387,41 +388,19 @@ func (s *SQLStore) CompareAndSwapOAuthCredential(
 	channelID int64,
 	expectedAuthType, expectedCredential, nextCredential string,
 ) (bool, error) {
-	updated, _, err := s.compareAndSwapOAuthCredential(ctx, channelID, expectedAuthType, expectedCredential, nextCredential, false)
-	return updated, err
-}
-
-// CompareAndSwapOAuthUsage persists a quota sample and its log-derived costs
-// under the same channel lock used by incremental log accounting.
-func (s *SQLStore) CompareAndSwapOAuthUsage(
-	ctx context.Context,
-	channelID int64,
-	expectedAuthType, expectedCredential, nextCredential string,
-) (bool, *oauthcost.Usage, error) {
-	return s.compareAndSwapOAuthCredential(ctx, channelID, expectedAuthType, expectedCredential, nextCredential, true)
-}
-
-func (s *SQLStore) compareAndSwapOAuthCredential(
-	ctx context.Context,
-	channelID int64,
-	expectedAuthType, expectedCredential, nextCredential string,
-	reconcileCosts bool,
-) (bool, *oauthcost.Usage, error) {
 	authType := model.NormalizeAuthType(expectedAuthType)
 	if authType == "" || authType == model.AuthTypeAPIKey {
-		return false, nil, errors.New("OAuth auth type is invalid")
+		return false, errors.New("OAuth auth type is invalid")
 	}
 	if strings.TrimSpace(expectedCredential) == "" {
-		return false, nil, errors.New("expected OAuth credential cannot be empty")
+		return false, errors.New("expected OAuth credential cannot be empty")
 	}
 	if strings.TrimSpace(nextCredential) == "" {
-		return false, nil, errors.New("next OAuth credential cannot be empty")
+		return false, errors.New("next OAuth credential cannot be empty")
 	}
 	matched := false
-	var costs *oauthcost.Usage
 	err := s.WithTransaction(ctx, func(tx *sql.Tx) error {
 		matched = false
-		costs = nil
 		currentAuthType, currentCredential, loadErr := s.loadOAuthCredentialForUpdate(ctx, tx, channelID)
 		if errors.Is(loadErr, sql.ErrNoRows) {
 			return nil
@@ -432,26 +411,33 @@ func (s *SQLStore) compareAndSwapOAuthCredential(
 		if currentAuthType != authType || currentCredential != expectedCredential {
 			return nil
 		}
-		payload := nextCredential
-		if reconcileCosts && model.TracksQuotaCost(authType) {
-			var err error
-			payload, costs, err = s.reconcileOAuthQuotaCostsTx(ctx, tx, channelID, nextCredential)
-			if err != nil {
-				return err
-			}
-		}
 		if _, updateErr := s.execTx(ctx, tx, `
 			UPDATE channels SET oauth_credential = ?, updated_at = ? WHERE id = ?
-		`, payload, timeToUnix(time.Now()), channelID); updateErr != nil {
+		`, nextCredential, timeToUnix(time.Now()), channelID); updateErr != nil {
 			return updateErr
 		}
 		matched = true
 		return nil
 	})
 	if err != nil {
-		return false, nil, fmt.Errorf("compare and swap OAuth credential: %w", err)
+		return false, fmt.Errorf("compare and swap OAuth credential: %w", err)
 	}
-	return matched, costs, nil
+	return matched, nil
+}
+
+// CompareAndSwapOAuthUsage persists a validated quota sample. Costs are summed
+// by readers, never inside this write transaction.
+func (s *SQLStore) CompareAndSwapOAuthUsage(
+	ctx context.Context,
+	channelID int64,
+	expectedAuthType, expectedCredential, nextCredential string,
+) (bool, error) {
+	if model.TracksQuotaCost(model.NormalizeAuthType(expectedAuthType)) {
+		if err := validateOAuthQuotaCostCredential(channelID, nextCredential); err != nil {
+			return false, err
+		}
+	}
+	return s.CompareAndSwapOAuthCredential(ctx, channelID, expectedAuthType, expectedCredential, nextCredential)
 }
 
 // CompareAndSwapChannelManagement replaces the private management envelope of
@@ -660,48 +646,91 @@ func (s *SQLStore) SyncOAuthConfigReplica(ctx context.Context, cfg *model.Config
 	return nil
 }
 
-// UpdateOAuthModelStateIfCredentialMatches conditionally commits model state
-// derived from one exact OAuth credential snapshot.
-func (s *SQLStore) UpdateOAuthModelStateIfCredentialMatches(
+// UpdateModelStateIfSnapshotMatches commits only model state, after checking
+// the credential and the complete model snapshot in one transaction.
+func (s *SQLStore) UpdateModelStateIfSnapshotMatches(
 	ctx context.Context,
-	channelID int64,
-	expectedAuthType, expectedCredential string,
+	expected *model.Config,
 	modelEntries []model.ModelEntry,
 	scheduledCheckModel string,
+	maxConcurrency *int,
 ) (bool, error) {
-	authType := model.NormalizeAuthType(expectedAuthType)
-	if authType == "" || authType == model.AuthTypeAPIKey {
-		return false, errors.New("OAuth auth type is invalid")
+	if expected == nil || expected.ID <= 0 {
+		return false, errors.New("expected model state is required")
 	}
-	if strings.TrimSpace(expectedCredential) == "" {
+	authType := expected.GetAuthType()
+	if authType != model.AuthTypeAPIKey && strings.TrimSpace(expected.OAuthCredential) == "" {
 		return false, errors.New("expected OAuth credential cannot be empty")
 	}
 	matched := false
 	err := s.WithTransaction(ctx, func(tx *sql.Tx) error {
 		matched = false
-		currentAuthType, currentCredential, loadErr := s.loadOAuthCredentialForUpdate(ctx, tx, channelID)
+		currentAuthType, currentCredential, loadErr := s.loadOAuthCredentialForUpdate(ctx, tx, expected.ID)
 		if errors.Is(loadErr, sql.ErrNoRows) {
 			return nil
 		}
 		if loadErr != nil {
 			return loadErr
 		}
-		if currentAuthType != authType || currentCredential != expectedCredential {
+		if model.NormalizeAuthType(currentAuthType) != authType || currentCredential != expected.OAuthCredential {
 			return nil
 		}
-		if err := s.saveModelEntriesTx(ctx, tx, channelID, modelEntries); err != nil {
-			return fmt.Errorf("save OAuth model state: %w", err)
+		var currentScheduledCheckModel string
+		if err := s.queryRowTx(ctx, tx, `SELECT scheduled_check_model FROM channels WHERE id = ?`, expected.ID).Scan(&currentScheduledCheckModel); err != nil {
+			return err
 		}
-		if _, updateErr := s.execTx(ctx, tx, `
-			UPDATE channels SET scheduled_check_model = ?, updated_at = ? WHERE id = ?
-		`, scheduledCheckModel, timeToUnix(time.Now()), channelID); updateErr != nil {
+		if currentScheduledCheckModel != expected.ScheduledCheckModel {
+			return nil
+		}
+		rows, err := s.queryTx(ctx, tx, `
+			SELECT model, redirect_model, disabled, pricing, model_variants
+			FROM channel_models WHERE channel_id = ? ORDER BY created_at ASC, model ASC
+		`, expected.ID)
+		if err != nil {
+			return fmt.Errorf("load current OAuth models: %w", err)
+		}
+		var currentEntries []model.ModelEntry
+		for rows.Next() {
+			entries, scanErr := scanModelEntry(rows, nil)
+			if scanErr != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan current OAuth models: %w", scanErr)
+			}
+			currentEntries = append(currentEntries, entries...)
+		}
+		readErr := rows.Err()
+		_ = rows.Close()
+		if readErr != nil {
+			return fmt.Errorf("read current OAuth models: %w", readErr)
+		}
+		if !modelEntrySlicesEqual(currentEntries, expected.ModelEntries) {
+			return nil
+		}
+		if err := s.saveModelEntriesTx(ctx, tx, expected.ID, modelEntries); err != nil {
+			return fmt.Errorf("save model state: %w", err)
+		}
+		updatedAt := timeToUnix(time.Now())
+		if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, expected.ID, modelEntries, updatedAt); err != nil {
+			return fmt.Errorf("prune API key model scopes: %w", err)
+		}
+		var updateErr error
+		if maxConcurrency == nil {
+			_, updateErr = s.execTx(ctx, tx, `
+				UPDATE channels SET scheduled_check_model = ?, updated_at = ? WHERE id = ?
+			`, scheduledCheckModel, updatedAt, expected.ID)
+		} else {
+			_, updateErr = s.execTx(ctx, tx, `
+				UPDATE channels SET scheduled_check_model = ?, max_concurrency = ?, updated_at = ? WHERE id = ?
+			`, scheduledCheckModel, *maxConcurrency, updatedAt, expected.ID)
+		}
+		if updateErr != nil {
 			return updateErr
 		}
 		matched = true
 		return nil
 	})
 	if err != nil {
-		return false, fmt.Errorf("update OAuth model state: %w", err)
+		return false, fmt.Errorf("update model state: %w", err)
 	}
 	return matched, nil
 }
@@ -803,7 +832,11 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 			modelsChanged := false
 			if patch.ModelImportMode != "" {
 				// Model imports are independent of the channel authentication type.
-				nextModels = importedModelEntries(state.modelEntries, patch.ModelEntries, patch.ModelImportMode)
+				var importErr error
+				nextModels, importErr = importedModelEntries(state.modelEntries, patch.ModelEntries, patch.ModelImportMode)
+				if importErr != nil {
+					return fmt.Errorf("channel %d: %w", channelID, importErr)
+				}
 				modelsChanged = !modelEntrySlicesEqual(state.modelEntries, nextModels)
 				nextScheduledCheckModel = reconciledScheduledCheckModel(nextScheduledCheckModel, nextModels)
 			}
@@ -858,6 +891,72 @@ func (s *SQLStore) BatchPatchConfigs(ctx context.Context, channelIDs []int64, pa
 	return result, nil
 }
 
+// BatchDeleteModels atomically removes selected models from multiple channels.
+func (s *SQLStore) BatchDeleteModels(ctx context.Context, operations []model.BatchModelDeleteOperation) (model.BatchModelDeleteResult, error) {
+	operations = normalizeBatchModelDeleteOperations(operations)
+	if len(operations) == 0 {
+		return model.BatchModelDeleteResult{}, nil
+	}
+
+	channelIDs := make([]int64, len(operations))
+	for i, operation := range operations {
+		channelIDs[i] = operation.ChannelID
+	}
+
+	result := model.BatchModelDeleteResult{}
+	err := s.WithTransaction(ctx, func(tx *sql.Tx) error {
+		states, err := s.loadBatchConfigPatchStates(ctx, tx, channelIDs, true, false)
+		if err != nil {
+			return err
+		}
+
+		for _, operation := range operations {
+			state, ok := states[operation.ChannelID]
+			if !ok {
+				result.NotFound = append(result.NotFound, operation.ChannelID)
+				continue
+			}
+
+			toDelete := make(map[string]struct{}, len(operation.Models))
+			for _, name := range operation.Models {
+				toDelete[strings.ToLower(name)] = struct{}{}
+			}
+			remaining := make([]model.ModelEntry, 0, len(state.modelEntries))
+			for _, entry := range state.modelEntries {
+				if _, remove := toDelete[strings.ToLower(entry.Model)]; !remove {
+					remaining = append(remaining, entry)
+				}
+			}
+			if len(remaining) == len(state.modelEntries) {
+				result.Unchanged++
+				continue
+			}
+
+			updatedAtUnix := timeToUnix(time.Now())
+			scheduledCheckModel := reconciledScheduledCheckModel(state.scheduledCheckModel, remaining)
+			if _, err := s.execTx(ctx, tx, `
+				UPDATE channels
+				SET scheduled_check_model = ?, updated_at = ?
+				WHERE id = ?
+			`, scheduledCheckModel, updatedAtUnix, operation.ChannelID); err != nil {
+				return fmt.Errorf("delete models from channel %d: %w", operation.ChannelID, err)
+			}
+			if err := s.saveModelEntriesTx(ctx, tx, operation.ChannelID, remaining); err != nil {
+				return fmt.Errorf("save models after deleting from channel %d: %w", operation.ChannelID, err)
+			}
+			if err := s.pruneAPIKeyAllowedModelsTx(ctx, tx, operation.ChannelID, remaining, updatedAtUnix); err != nil {
+				return fmt.Errorf("prune API key model scopes for channel %d: %w", operation.ChannelID, err)
+			}
+			result.Updated++
+		}
+		return nil
+	})
+	if err != nil {
+		return model.BatchModelDeleteResult{}, err
+	}
+	return result, nil
+}
+
 type batchConfigPatchState struct {
 	priority              int
 	costMultiplier        float64
@@ -883,6 +982,26 @@ func normalizeBatchPatchChannelIDs(channelIDs []int64) []int64 {
 		}
 		seen[channelID] = struct{}{}
 		result = append(result, channelID)
+	}
+	return result
+}
+
+func normalizeBatchModelDeleteOperations(operations []model.BatchModelDeleteOperation) []model.BatchModelDeleteOperation {
+	positions := make(map[int64]int, len(operations))
+	result := make([]model.BatchModelDeleteOperation, 0, len(operations))
+	for _, operation := range operations {
+		if operation.ChannelID <= 0 {
+			continue
+		}
+		if index, ok := positions[operation.ChannelID]; ok {
+			result[index].Models = append(result[index].Models, operation.Models...)
+			continue
+		}
+		positions[operation.ChannelID] = len(result)
+		result = append(result, model.BatchModelDeleteOperation{
+			ChannelID: operation.ChannelID,
+			Models:    append([]string(nil), operation.Models...),
+		})
 	}
 	return result
 }
@@ -931,7 +1050,7 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 	}
 
 	if withModels {
-		modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled
+		modelRows, err := tx.QueryContext(ctx, s.q(`SELECT channel_id, model, redirect_model, disabled, pricing, model_variants
 			FROM channel_models WHERE channel_id IN (`+strings.Join(placeholders, ",")+`)
 			ORDER BY channel_id, created_at ASC, model ASC`), normalizeSQLArgs(args)...)
 		if err != nil {
@@ -939,13 +1058,13 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 		}
 		for modelRows.Next() {
 			var channelID int64
-			var entry model.ModelEntry
-			if err := modelRows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
+			entries, err := scanModelEntry(modelRows, &channelID)
+			if err != nil {
 				_ = modelRows.Close()
 				return nil, fmt.Errorf("scan model for batch patch: %w", err)
 			}
 			if state := states[channelID]; state != nil {
-				state.modelEntries = append(state.modelEntries, entry)
+				state.modelEntries = append(state.modelEntries, entries...)
 			}
 		}
 		if err := modelRows.Err(); err != nil {
@@ -987,24 +1106,26 @@ func (s *SQLStore) loadBatchConfigPatchStates(ctx context.Context, tx *sql.Tx, c
 	return states, nil
 }
 
-func importedModelEntries(existing, imported []model.ModelEntry, mode string) []model.ModelEntry {
+func importedModelEntries(existing, imported []model.ModelEntry, mode string) ([]model.ModelEntry, error) {
 	if mode == model.ModelImportModeReplace {
-		return append([]model.ModelEntry(nil), imported...)
+		// 替换只重建模型列表：导入格式不表达价格，保留模型的渠道价格沿用原值。
+		return model.CarryModelPricing(existing, imported), nil
 	}
-	result := append([]model.ModelEntry(nil), existing...)
-	seen := make(map[string]struct{}, len(existing)+len(imported))
+	merged := append([]model.ModelEntry(nil), existing...)
+	seen := make(map[model.ModelEntryIdentity]struct{}, len(existing)+len(imported))
 	for _, entry := range existing {
-		seen[strings.ToLower(entry.Model)] = struct{}{}
+		seen[entry.Identity()] = struct{}{}
 	}
 	for _, entry := range imported {
-		key := strings.ToLower(entry.Model)
+		key := entry.Identity()
 		if _, ok := seen[key]; ok {
 			continue
 		}
 		seen[key] = struct{}{}
-		result = append(result, entry)
+		merged = append(merged, entry)
 	}
-	return result
+	// 大小写、多行、思考后缀全部交给同一条规则，与单渠道 HandleAddModels 一致。
+	return model.ValidateModelEntries(merged)
 }
 
 func modelEntrySlicesEqual(left, right []model.ModelEntry) bool {
@@ -1012,11 +1133,96 @@ func modelEntrySlicesEqual(left, right []model.ModelEntry) bool {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if !left[i].Equal(right[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+type modelEntryScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanModelEntry expands one channel_models record into its ordered model rows.
+// channelID 非 nil 时先读取前置的 channel_id 列。
+func scanModelEntry(row modelEntryScanner, channelID *int64) ([]model.ModelEntry, error) {
+	var entry model.ModelEntry
+	var pricing, variants sql.NullString
+	dest := []any{&entry.Model, &entry.RedirectModel, &entry.Disabled, &pricing, &variants}
+	if channelID != nil {
+		dest = append([]any{channelID}, dest...)
+	}
+	if err := row.Scan(dest...); err != nil {
+		return nil, err
+	}
+	if variants.Valid {
+		decoder := json.NewDecoder(strings.NewReader(variants.String))
+		decoder.DisallowUnknownFields()
+		var entries []model.ModelEntry
+		if err := decoder.Decode(&entries); err != nil {
+			return nil, fmt.Errorf("model %q: decode model_variants: %w", entry.Model, err)
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			return nil, fmt.Errorf("model %q: trailing model_variants data", entry.Model)
+		}
+		if len(entries) < 2 {
+			return nil, fmt.Errorf("model %q: model_variants must contain multiple rows", entry.Model)
+		}
+		normalized, err := model.ValidateModelEntries(entries)
+		if err != nil {
+			return nil, fmt.Errorf("model %q: invalid model_variants: %w", entry.Model, err)
+		}
+		for _, variant := range normalized {
+			if variant.Model != entry.Model {
+				return nil, fmt.Errorf("model %q: model_variants contains model %q", entry.Model, variant.Model)
+			}
+		}
+		return normalized, nil
+	}
+	decoded, err := decodeModelEntryPricing(pricing)
+	if err != nil {
+		return nil, fmt.Errorf("model %q: %w", entry.Model, err)
+	}
+	entry.Pricing = decoded
+	return []model.ModelEntry{entry}, nil
+}
+
+// modelEntryPricingValue 编码 channel_models.pricing；未配置价格写 NULL。
+func modelEntryPricingValue(pricing *util.CustomModelPrice) (any, error) {
+	if pricing.IsEmpty() {
+		return nil, nil
+	}
+	if _, err := pricing.ModelPricing(); err != nil {
+		return nil, fmt.Errorf("invalid pricing: %w", err)
+	}
+	encoded, err := json.Marshal(pricing)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pricing: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// decodeModelEntryPricing 解析 channel_models.pricing。损坏的价格直接报错，
+// 不能静默回退全局价格——那样渠道会在无人察觉时按另一套价格计费。
+func decodeModelEntryPricing(raw sql.NullString) (*util.CustomModelPrice, error) {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil, nil
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw.String))
+	decoder.DisallowUnknownFields()
+	var pricing util.CustomModelPrice
+	if err := decoder.Decode(&pricing); err != nil {
+		return nil, fmt.Errorf("decode pricing: %w", err)
+	}
+	if pricing.IsEmpty() {
+		return nil, nil
+	}
+	if _, err := pricing.ModelPricing(); err != nil {
+		return nil, fmt.Errorf("invalid pricing: %w", err)
+	}
+	return &pricing, nil
 }
 
 func reconciledScheduledCheckModel(current string, entries []model.ModelEntry) string {
@@ -1041,9 +1247,6 @@ func (s *SQLStore) pruneAPIKeyAllowedModelsTx(
 	configured := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(entry.Model)))
-		if name == "*" {
-			return nil
-		}
 		if name != "" {
 			configured[name] = struct{}{}
 		}
@@ -1089,7 +1292,8 @@ func (s *SQLStore) pruneAPIKeyAllowedModelsTx(
 		}
 		kept := make([]string, 0, len(allowedModels))
 		for _, allowedModel := range allowedModels {
-			if _, ok := configured[strings.ToLower(strings.TrimSpace(allowedModel))]; ok {
+			name := strings.ToLower(strings.TrimSpace(model.RoutingModelName(allowedModel)))
+			if _, ok := configured[name]; ok {
 				kept = append(kept, allowedModel)
 			}
 		}
@@ -1338,7 +1542,7 @@ func (s *SQLStore) loadConfigSnapshotForUpdate(
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, s.q(`
-		SELECT model, redirect_model, disabled
+		SELECT model, redirect_model, disabled, pricing, model_variants
 		FROM channel_models
 		WHERE channel_id = ?
 		ORDER BY created_at ASC, model ASC
@@ -1348,11 +1552,11 @@ func (s *SQLStore) loadConfigSnapshotForUpdate(
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var entry model.ModelEntry
-		if err := rows.Scan(&entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
+		entries, err := scanModelEntry(rows, nil)
+		if err != nil {
 			return nil, err
 		}
-		cfg.ModelEntries = append(cfg.ModelEntries, entry)
+		cfg.ModelEntries = append(cfg.ModelEntries, entries...)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1385,6 +1589,9 @@ func (s *SQLStore) deleteConfigRowsTx(
 	}
 	if _, err := s.execTx(ctx, tx, `DELETE FROM logs WHERE channel_id = ?`, id); err != nil {
 		return fmt.Errorf("delete channel logs: %w", err)
+	}
+	if _, err := s.execTx(ctx, tx, `DELETE FROM oauth_quota_cost_ledger WHERE channel_id = ?`, id); err != nil {
+		return fmt.Errorf("delete channel OAuth quota ledger: %w", err)
 	}
 	if _, err := s.execTx(ctx, tx, `DELETE FROM channels WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete channel: %w", err)
@@ -1554,7 +1761,7 @@ func (s *SQLStore) loadModelEntriesForConfigs(ctx context.Context, configs []*mo
 
 	//nolint:gosec // G201: placeholders 由内部构建的 "?" 占位符组成，安全可控
 	query := fmt.Sprintf(
-		`SELECT channel_id, model, redirect_model, disabled FROM channel_models WHERE channel_id IN (%s) ORDER BY channel_id, created_at ASC, model ASC`,
+		`SELECT channel_id, model, redirect_model, disabled, pricing, model_variants FROM channel_models WHERE channel_id IN (%s) ORDER BY channel_id, created_at ASC, model ASC`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -1566,12 +1773,12 @@ func (s *SQLStore) loadModelEntriesForConfigs(ctx context.Context, configs []*mo
 
 	for rows.Next() {
 		var channelID int64
-		var entry model.ModelEntry
-		if err := rows.Scan(&channelID, &entry.Model, &entry.RedirectModel, &entry.Disabled); err != nil {
+		entries, err := scanModelEntry(rows, &channelID)
+		if err != nil {
 			return fmt.Errorf("scan model entry: %w", err)
 		}
 		if cfg, ok := idToConfig[channelID]; ok {
-			cfg.ModelEntries = append(cfg.ModelEntries, entry)
+			cfg.ModelEntries = append(cfg.ModelEntries, entries...)
 		}
 	}
 
@@ -1589,35 +1796,66 @@ func (s *SQLStore) saveModelEntriesTx(ctx context.Context, tx *sql.Tx, channelID
 }
 
 // saveModelEntriesImpl 保存渠道模型数据的统一实现
-// 注意：调用方必须保证 entries 中没有重复的模型名，否则会因 PRIMARY KEY 冲突而失败（Fail-Fast）
 func (s *SQLStore) saveModelEntriesImpl(ctx context.Context, exec sqlExecutor, channelID int64, entries []model.ModelEntry) error {
+	normalized, err := model.ValidateModelEntries(entries)
+	if err != nil {
+		return err
+	}
+	groups := make(map[string][]model.ModelEntry, len(normalized))
+	order := make([]string, 0, len(normalized))
+	for _, entry := range normalized {
+		if _, ok := groups[entry.Model]; !ok {
+			order = append(order, entry.Model)
+		}
+		groups[entry.Model] = append(groups[entry.Model], entry)
+	}
 	// 先删除旧的记录（Postgres 需 rebind 占位符）
 	if _, err := s.execWith(ctx, exec, `DELETE FROM channel_models WHERE channel_id = ?`, channelID); err != nil {
 		return fmt.Errorf("delete old model entries: %w", err)
 	}
 
-	if len(entries) == 0 {
+	if len(order) == 0 {
 		return nil
 	}
 
-	// 多值 INSERT 分块提交：单批最多 200 行（800 占位符），兼容 SQLite 默认上限。
+	// 多值 INSERT 分块提交：单批最多 200 行（1200 占位符），兼容 SQLite 默认上限。
 	// created_at 使用递增值保留用户输入顺序，避免同秒写入时被 model 字典序打乱。
 	const batchSize = 200
 	baseCreatedAt := time.Now().UnixMilli()
 
-	for offset := 0; offset < len(entries); offset += batchSize {
-		end := min(offset+batchSize, len(entries))
-		chunk := entries[offset:end]
+	for offset := 0; offset < len(order); offset += batchSize {
+		end := min(offset+batchSize, len(order))
+		chunk := order[offset:end]
 
 		var b strings.Builder
-		b.WriteString(`INSERT INTO channel_models (channel_id, model, redirect_model, disabled, created_at) VALUES `)
-		args := make([]any, 0, len(chunk)*5)
-		for i, entry := range chunk {
+		b.WriteString(`INSERT INTO channel_models (channel_id, model, redirect_model, disabled, pricing, model_variants, created_at) VALUES `)
+		args := make([]any, 0, len(chunk)*7)
+		for i, name := range chunk {
 			if i > 0 {
 				b.WriteByte(',')
 			}
-			b.WriteString("(?, ?, ?, ?, ?)")
-			args = append(args, channelID, entry.Model, entry.RedirectModel, entry.Disabled, baseCreatedAt+int64(offset+i))
+			group := groups[name]
+			entry := group[0]
+			for _, candidate := range group {
+				if !candidate.Disabled {
+					entry = candidate
+					break
+				}
+			}
+			pricing, err := modelEntryPricingValue(entry.Pricing)
+			if err != nil {
+				return fmt.Errorf("model %q: %w", entry.Model, err)
+			}
+			var variants any
+			if len(group) > 1 {
+				encoded, err := json.Marshal(group)
+				if err != nil {
+					return fmt.Errorf("model %q: encode model_variants: %w", name, err)
+				}
+				variants = string(encoded)
+			}
+			b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+			args = append(args, channelID, name, entry.RedirectModel, entry.Disabled, pricing, variants, baseCreatedAt+int64(offset+i))
 		}
 		if _, err := s.execWith(ctx, exec, b.String(), args...); err != nil {
 			return fmt.Errorf("save model entries (offset %d): %w", offset, err)

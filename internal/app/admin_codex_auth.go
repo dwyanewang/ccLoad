@@ -17,7 +17,6 @@ import (
 	"ccLoad/internal/antigravityauth"
 	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
-	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +34,9 @@ const (
 // 导入凭证和模型获取必须共享这一份 Codex 模型目录，并按订阅计划过滤。
 var codexOAuthDefaultModels = []string{
 	"gpt-6-astra",
+	"gpt-6.1-sol",
+	"gpt-6-sol",
+	"gpt-6-luna",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
@@ -50,6 +52,8 @@ var codexOAuthDefaultModels = []string{
 var codexOAuthExcludedModelsByPlan = map[string]map[string]struct{}{
 	"free": {
 		"gpt-6-astra": {},
+		"gpt-6.1-sol": {},
+		"gpt-6-sol":   {},
 		"gpt-5.6-sol": {},
 	},
 }
@@ -671,25 +675,11 @@ func updateExistingCodexChannel(
 			return nil, false, err
 		}
 		next := cloneCodexCredential(credential)
-		// Quota snapshots are channel runtime state. Reauthorization replaces
-		// secrets, but must neither erase that state nor lose the new credential
-		// when a concurrent quota sample wins the first CAS.
-		//
-		// Plan tier change (e.g. team→free) invalidates accumulated cost: the
-		// old cost was counted against a different upstream limit, and keeping
-		// it produces nonsensical estimates. Clear all quota state so the next
-		// upstream sample bootstraps fresh windows under the new plan.
-		planTierChanged := codexOAuthPlanTier(current.PlanType) != codexOAuthPlanTier(credential.PlanType) &&
-			credential.PlanType != ""
-		if planTierChanged {
-			next.PassiveUsage = nil
-			next.OAuthUsage = nil
-			next.QuotaCostUsage = nil
-		} else {
-			next.PassiveUsage = codexauth.ClonePassiveUsage(current.PassiveUsage)
-			next.OAuthUsage = append([]byte(nil), current.OAuthUsage...)
-			next.QuotaCostUsage = oauthcost.Clone(current.QuotaCostUsage)
-		}
+		// 先继承当前运行态，再观察新凭证；poll 去重不能吞掉独立的账号切换。
+		next.PassiveUsage = codexauth.ClonePassiveUsage(current.PassiveUsage)
+		next.OAuthUsage = append([]byte(nil), current.OAuthUsage...)
+		next.InheritQuotaState(current)
+		next.ObserveQuotaIdentity(credential.AccountID, credential.PlanType, time.Now().UTC())
 		if next.Email == "" {
 			next.Email = current.Email
 		}
@@ -779,27 +769,14 @@ func newCodexOAuthChannel(name, credentialJSON, planType string) *model.Config {
 	}
 }
 
-func codexOAuthPlanTier(planType string) string {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "free":
-		return "free"
-	case "team", "business", "go", "self_serve_business_prolite":
-		return "team"
-	case "plus":
-		return "plus"
-	case "pro":
-		return "pro"
-	default:
-		return "pro"
-	}
-}
-
 func codexOAuthModelAllowed(name, planType string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" || name == "*" {
 		return false
 	}
-	excluded := codexOAuthExcludedModelsByPlan[codexOAuthPlanTier(planType)]
+	// Only explicitly restricted plans alter the fallback catalog. Preserve SKU
+	// identity: an unknown or newly introduced plan is not a Pro subscription.
+	excluded := codexOAuthExcludedModelsByPlan[strings.ToLower(strings.TrimSpace(planType))]
 	for _, supported := range codexOAuthDefaultModels {
 		if name == supported {
 			_, blocked := excluded[name]

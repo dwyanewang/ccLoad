@@ -13,6 +13,7 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func TestHandleProxyRequest_UnknownPathReturns404(t *testing.T) {
@@ -74,6 +75,8 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 		expectModel  string
 		expectStream bool
 		expectError  bool
+		// expectBody 非空时断言转发给上游的 body 模型名
+		expectBody string
 	}{
 		{
 			name:         "有效JSON-claude模型",
@@ -161,6 +164,27 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 			expectStream: false,
 			expectError:  false,
 		},
+		{
+			name:        "Claude Code 上下文后缀-Messages 入口归一",
+			body:        `{"model":"claude-opus-4-6[1m][1M]","messages":[]}`,
+			path:        "/v1/messages",
+			expectModel: "claude-opus-4-6",
+			expectBody:  "claude-opus-4-6",
+		},
+		{
+			name:        "Claude Code 上下文后缀-count_tokens 入口归一",
+			body:        `{"model":"claude-sonnet-4-6[1m]","messages":[]}`,
+			path:        "/v1/messages/count_tokens",
+			expectModel: "claude-sonnet-4-6",
+			expectBody:  "claude-sonnet-4-6",
+		},
+		{
+			name:        "Claude Code 上下文后缀-非 Anthropic 入口不改",
+			body:        `{"model":"deepseek-flash[1m]","messages":[]}`,
+			path:        "/v1/chat/completions",
+			expectModel: "deepseek-flash[1m]",
+			expectBody:  "deepseek-flash[1m]",
+		},
 	}
 
 	for _, tt := range tests {
@@ -191,6 +215,11 @@ func TestParseIncomingRequest_ValidJSON(t *testing.T) {
 			}
 			if incoming.isStreaming != tt.expectStream {
 				t.Errorf("流式标志错误: 期望%v, 实际%v", tt.expectStream, incoming.isStreaming)
+			}
+			if tt.expectBody != "" {
+				if got := gjson.GetBytes(incoming.body, "model").String(); got != tt.expectBody {
+					t.Errorf("body 模型名错误: 期望%s, 实际%s", tt.expectBody, got)
+				}
 			}
 		})
 	}
@@ -411,22 +440,19 @@ func TestHandleSpecialRoutes_GeminiModels(t *testing.T) {
 	}
 }
 
-// TestHandleSpecialRoutes_CountTokens 测试 POST /v1/messages/count_tokens 路由匹配
-func TestHandleSpecialRoutes_CountTokens(t *testing.T) {
+// TestHandleSpecialRoutes_CountTokensFallsThrough verifies that token counting
+// now enters the regular upstream routing path.
+func TestHandleSpecialRoutes_CountTokensFallsThrough(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	body := `{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hello"}]}`
 	req := newRequest(http.MethodPost, "/v1/messages/count_tokens", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
-	c, w := newTestContext(t, req)
+	c, _ := newTestContext(t, req)
 
 	handled := srv.handleSpecialRoutes(c)
-	if !handled {
-		t.Fatal("POST /v1/messages/count_tokens 应被 handleSpecialRoutes 处理")
-	}
-	// count_tokens 返回 200（成功解析）或 400（解析失败），都是被处理了
-	if w.Code != http.StatusOK {
-		t.Logf("count_tokens 返回非 200 (code=%d)，但路由已匹配", w.Code)
+	if handled {
+		t.Fatal("POST /v1/messages/count_tokens 应进入代理选路")
 	}
 }
 

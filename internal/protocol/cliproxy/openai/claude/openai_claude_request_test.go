@@ -1211,3 +1211,346 @@ func TestConvertClaudeRequestToOpenAI_ToolResultUnknownIDNoName(t *testing.T) {
 		t.Errorf("expected no name for unknown tool_use_id, got %q", toolMsg.Get("name").String())
 	}
 }
+
+func TestConvertClaudeRequestToOpenAI_ToolCallPairingByID(t *testing.T) {
+	inputJSON := `{
+		"model": "deepseek-v4.1-flash",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Run analysis"}]},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_1", "name": "fetch_data", "input": {"id": 123}},
+					{"type": "tool_use", "id": "call_2", "name": "calc_metric", "input": {"scale": 1.5}}
+				]
+			},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "text", "text": "Waiting for results to continue"},
+					{"type": "thinking", "thinking": "Thinking about next steps", "signature": "sig_abc"}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Reminder: keep timeout short"}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_2", "content": "metric_ok"},
+					{"type": "tool_result", "tool_use_id": "call_1", "content": "data_ok"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("deepseek-v4.1-flash", []byte(inputJSON), false)
+	messages := gjson.GetBytes(result, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Tool results must be paired immediately following the assistant tool_calls message.
+	// Expected:
+	// messages[0]: user ("Run analysis")
+	// messages[1]: assistant (tool_calls [call_1, call_2])
+	// messages[2]: tool (tool_call_id: call_2 or call_1)
+	// messages[3]: tool (tool_call_id: call_1 or call_2)
+	// messages[4]: assistant (content: "Waiting for results to continue", reasoning_content: ...)
+	// messages[5]: user ("Reminder: keep timeout short")
+	if len(messages) != 6 {
+		t.Fatalf("expected 6 messages, got %d: %s", len(messages), result)
+	}
+	if roles[1] != "assistant" || !messages[1].Get("tool_calls").Exists() {
+		t.Fatalf("messages[1] must be assistant with tool_calls, got %s", roles[1])
+	}
+	if roles[2] != "tool" || roles[3] != "tool" {
+		t.Fatalf("messages[2] and messages[3] must be tool messages immediately following assistant tool_calls, got roles: %v", roles)
+	}
+	toolIDs := []string{messages[2].Get("tool_call_id").String(), messages[3].Get("tool_call_id").String()}
+	if toolIDs[0] != "call_2" || toolIDs[1] != "call_1" {
+		t.Fatalf("expected tool messages to strictly preserve input relative order [call_2, call_1], got: %v", toolIDs)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolCallPairing_OrphanAndIncompletePreserved(t *testing.T) {
+	// Orphan tool results and incomplete histories must not be rearranged or guessed
+	inputJSON := `{
+		"model": "deepseek-v4.1-flash",
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "Start"}]},
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "tool_use", "id": "call_alpha", "name": "do_a", "input": {}},
+					{"type": "tool_use", "id": "call_beta", "name": "do_b", "input": {}}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "text", "text": "Waiting on results"}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{"type": "tool_result", "tool_use_id": "call_unmatched", "content": "orphan_result"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("deepseek-v4.1-flash", []byte(inputJSON), false)
+	messages := gjson.GetBytes(result, "messages").Array()
+
+	// Incomplete history (call_alpha and call_beta are unanswered) and orphan result
+	// (call_unmatched has no matching assistant tool_calls) must remain untouched.
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+	// messages[0]: user
+	// messages[1]: assistant (tool_calls [call_alpha, call_beta])
+	// messages[2]: user ("Waiting on results")
+	// messages[3]: tool (tool_call_id: call_unmatched)
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), result)
+	}
+	if roles[1] != "assistant" || roles[2] != "user" || roles[3] != "tool" {
+		t.Fatalf("expected untouched order [user, assistant, user, tool], got: %v", roles)
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_ToolChoice(t *testing.T) {
+	t.Run("none does not become auto", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5.4",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "Answer without calling tools."}],
+			"tool_choice": {"type": "none"},
+			"tools": [
+				{"name": "tool_a", "description": "test", "input_schema": {"type": "object", "properties": {}}},
+				{"name": "tool_b", "description": "test", "input_schema": {"type": "object", "properties": {}}}
+			]
+		}`
+		result := ConvertClaudeRequestToOpenAI("gpt-5.4", []byte(inputJSON), false)
+		gotToolChoice := gjson.GetBytes(result, "tool_choice").String()
+		if gotToolChoice != "none" {
+			t.Fatalf("expected tool_choice to be 'none', got %q. Output: %s", gotToolChoice, result)
+		}
+	})
+
+	t.Run("disable_parallel_tool_use maps to parallel_tool_calls false", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5.4",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "test"}],
+			"tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+			"tools": [
+				{"name": "tool_a", "description": "test", "input_schema": {"type": "object", "properties": {}}}
+			]
+		}`
+		result := ConvertClaudeRequestToOpenAI("gpt-5.4", []byte(inputJSON), false)
+		parallel := gjson.GetBytes(result, "parallel_tool_calls")
+		if !parallel.Exists() || parallel.Bool() {
+			t.Fatalf("expected parallel_tool_calls to be false, got %v. Output: %s", parallel.Value(), result)
+		}
+	})
+
+	t.Run("unknown tool_choice type fails closed to none", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5.4",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "test"}],
+			"tool_choice": {"type": "unknown_future_restriction"},
+			"tools": [
+				{"name": "tool_a", "description": "test", "input_schema": {"type": "object", "properties": {}}}
+			]
+		}`
+		result := ConvertClaudeRequestToOpenAI("gpt-5.4", []byte(inputJSON), false)
+		gotToolChoice := gjson.GetBytes(result, "tool_choice").String()
+		if gotToolChoice != "none" {
+			t.Fatalf("expected tool_choice to fail closed to 'none', got %q. Output: %s", gotToolChoice, result)
+		}
+	})
+
+	t.Run("tool choice with empty name fails closed to none", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5.4",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "test"}],
+			"tool_choice": {"type": "tool", "name": ""},
+			"tools": [
+				{"name": "tool_a", "description": "test", "input_schema": {"type": "object", "properties": {}}}
+			]
+		}`
+		result := ConvertClaudeRequestToOpenAI("gpt-5.4", []byte(inputJSON), false)
+		gotToolChoice := gjson.GetBytes(result, "tool_choice").String()
+		if gotToolChoice != "none" {
+			t.Fatalf("expected tool_choice to fail closed to 'none', got %q. Output: %s", gotToolChoice, result)
+		}
+	})
+
+	t.Run("tool_choice null does not set tool_choice", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5.4",
+			"max_tokens": 64,
+			"messages": [{"role": "user", "content": "test"}],
+			"tool_choice": null,
+			"tools": [
+				{"name": "tool_a", "description": "test", "input_schema": {"type": "object", "properties": {}}}
+			]
+		}`
+		result := ConvertClaudeRequestToOpenAI("gpt-5.4", []byte(inputJSON), false)
+		if gjson.GetBytes(result, "tool_choice").Exists() {
+			t.Fatalf("expected tool_choice not to be set when tool_choice is null, got: %s", result)
+		}
+	})
+}
+
+func TestConvertClaudeRequestToOpenAI_EnabledThinkingEffort(t *testing.T) {
+	tests := []struct {
+		name       string
+		inputJSON  string
+		wantEffort string
+	}{
+		{
+			name:       "explicit output_config effort is preserved without budget",
+			inputJSON:  `{"thinking":{"type":"enabled"},"output_config":{"effort":"high"}}`,
+			wantEffort: "high",
+		},
+		{
+			name:       "legacy budget remains authoritative when both are present",
+			inputJSON:  `{"thinking":{"type":"enabled","budget_tokens":8192},"output_config":{"effort":"high"}}`,
+			wantEffort: "medium",
+		},
+		{
+			name:       "enabled without budget or effort keeps auto default",
+			inputJSON:  `{"thinking":{"type":"enabled"}}`,
+			wantEffort: "auto",
+		},
+		{
+			name:       "enabled with empty effort string falls back to auto",
+			inputJSON:  `{"thinking":{"type":"enabled"},"output_config":{"effort":""}}`,
+			wantEffort: "auto",
+		},
+		{
+			name:       "enabled with whitespace-only effort falls back to auto",
+			inputJSON:  `{"thinking":{"type":"enabled"},"output_config":{"effort":"   "}}`,
+			wantEffort: "auto",
+		},
+		{
+			name:       "enabled with non-string effort falls back to auto",
+			inputJSON:  `{"thinking":{"type":"enabled"},"output_config":{"effort":123}}`,
+			wantEffort: "auto",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := ConvertClaudeRequestToOpenAI("test-model", []byte(tt.inputJSON), false)
+			if got := gjson.GetBytes(out, "reasoning_effort").String(); got != tt.wantEffort {
+				t.Fatalf("reasoning_effort = %q, want %q; body=%s", got, tt.wantEffort, out)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToOpenAI_NormalizesBooleanSubschemas(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-3-opus",
+		"tools": [
+			{
+				"name": "patch_tool",
+				"description": "Applies a JSON patch",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"patch": {"type": "array", "items": true},
+						"anything": true,
+						"disabled": false,
+						"enabled_flag": {"type": "boolean", "default": true, "enum": [true, false]},
+						"either": {"anyOf": [true, {"type": "string"}]},
+						"nested_obj": {
+							"type": "object",
+							"properties": {"foo": {"type": "string"}},
+							"additionalProperties": true
+						}
+					},
+					"additionalProperties": false,
+					"$defs": {
+						"wildcard": true
+					}
+				}
+			}
+		],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`)
+
+	output := ConvertClaudeRequestToOpenAI("test-model", inputJSON, false)
+	outputJSON := gjson.ParseBytes(output)
+
+	params := outputJSON.Get("tools.0.function.parameters")
+	if !params.Exists() {
+		t.Fatalf("parameters missing: %s", outputJSON.Raw)
+	}
+
+	// items: true -> items: {}
+	patchItems := params.Get("properties.patch.items")
+	if !patchItems.Exists() || patchItems.Type == gjson.True || patchItems.Raw == "true" {
+		t.Fatalf("array items boolean subschema not normalized: %s", params.Get("properties.patch").Raw)
+	}
+	if !patchItems.IsObject() || patchItems.Raw != "{}" {
+		t.Fatalf("array items boolean subschema should be empty object {}: %s", patchItems.Raw)
+	}
+
+	// anything: true -> anything: {}
+	anything := params.Get("properties.anything")
+	if !anything.Exists() || !anything.IsObject() || anything.Raw != "{}" {
+		t.Fatalf("boolean property subschema not normalized to empty object {}: %s", anything.Raw)
+	}
+
+	// either.anyOf.0: true -> {}
+	eitherBranch := params.Get("properties.either.anyOf.0")
+	if !eitherBranch.Exists() || !eitherBranch.IsObject() || eitherBranch.Raw != "{}" {
+		t.Fatalf("boolean anyOf branch not normalized to empty object {}: %s", eitherBranch.Raw)
+	}
+
+	// $defs.wildcard: true -> {}
+	wildcard := params.Get("$defs.wildcard")
+	if !wildcard.Exists() || !wildcard.IsObject() || wildcard.Raw != "{}" {
+		t.Fatalf("boolean $defs subschema not normalized to empty object {}: %s", wildcard.Raw)
+	}
+
+	// additionalProperties: false must remain boolean false
+	if addProps := params.Get("additionalProperties"); !addProps.Exists() || addProps.Type != gjson.False {
+		t.Fatalf("additionalProperties: false must be preserved as boolean false, got: %s", addProps.Raw)
+	}
+
+	// nested_obj.additionalProperties: true must remain boolean true
+	if nestedAddProps := params.Get("properties.nested_obj.additionalProperties"); !nestedAddProps.Exists() || nestedAddProps.Type != gjson.True {
+		t.Fatalf("nested additionalProperties: true must be preserved as boolean true, got: %s", nestedAddProps.Raw)
+	}
+
+	// disabled: false must remain boolean false
+	if disabled := params.Get("properties.disabled"); !disabled.Exists() || disabled.Type != gjson.False {
+		t.Fatalf("disabled: false must be preserved as boolean false, got: %s", disabled.Raw)
+	}
+
+	// enabled_flag data values default: true and enum: [true, false] must remain boolean data values
+	if defVal := params.Get("properties.enabled_flag.default"); !defVal.Exists() || defVal.Type != gjson.True {
+		t.Fatalf("enabled_flag.default should remain boolean true, got: %s", defVal.Raw)
+	}
+	if enum0 := params.Get("properties.enabled_flag.enum.0"); !enum0.Exists() || enum0.Type != gjson.True {
+		t.Fatalf("enabled_flag.enum.0 should remain boolean true, got: %s", enum0.Raw)
+	}
+	if enum1 := params.Get("properties.enabled_flag.enum.1"); !enum1.Exists() || enum1.Type != gjson.False {
+		t.Fatalf("enabled_flag.enum.1 should remain boolean false, got: %s", enum1.Raw)
+	}
+}

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"encoding/json"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -599,6 +601,49 @@ data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"cache_
 	}
 }
 
+// web_search 按 $10/1K 次计费；server_tool_use 是累计快照，message_stop 的 0 占位不能抹掉它。
+func TestUsageParser_AnthropicWebSearchRequestsBilledPerCall(t *testing.T) {
+	const sseData = `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":42,"server_tool_use":{"web_search_requests":2}}}
+
+event: message_stop
+data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0}}}
+
+`
+	tests := []struct {
+		name   string
+		parser usageParser
+		body   string
+		want   float64
+	}{
+		{name: "stream", parser: newSSEUsageParser("anthropic"), body: sseData, want: 0.02},
+		{
+			name:   "non-stream",
+			parser: newJSONUsageParser("anthropic"),
+			body:   `{"type":"message","usage":{"input_tokens":10,"output_tokens":42,"server_tool_use":{"web_search_requests":3}}}`,
+			want:   0.03,
+		},
+		// text/plain 回退：JSON 解析器自身扫描与 SSE 回退各见到一次同一快照，只能计一次。
+		{name: "text/plain SSE fallback", parser: newJSONUsageParser("anthropic"), body: sseData, want: 0.02},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.parser.Feed([]byte(tt.body)); err != nil {
+				t.Fatalf("Feed: %v", err)
+			}
+			if in, out, _, _ := tt.parser.GetUsage(); in != 10 || out != 42 {
+				t.Fatalf("usage=%d/%d, want 10/42", in, out)
+			}
+			if got := tt.parser.GetToolCostUSD(); math.Abs(got-tt.want) > 1e-9 {
+				t.Fatalf("tool cost=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSSEUsageParser_AnthropicOutputZeroThenPositive(t *testing.T) {
 	sseData := `event: message_start
 data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}
@@ -679,6 +724,20 @@ data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"cache_
 			wantAggregate: 0,
 			want5m:        0,
 			want1h:        0,
+		},
+		{
+			// 真实 Anthropic 帧形状：message_delta 只重发 aggregate，不带 cache_creation
+			name: "aggregate-only delta matching known split keeps 1h",
+			sseData: `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":4,"cache_creation_input_tokens":10117,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10117}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":4,"cache_creation_input_tokens":10117,"cache_read_input_tokens":0,"output_tokens":4}}
+
+`,
+			wantAggregate: 10117,
+			want5m:        0,
+			want1h:        10117,
 		},
 		{
 			name: "aggregate-only falls back to 5m and clears 1h",
@@ -2033,5 +2092,47 @@ func TestSSEJSONObjectMapErrorCarriesOffset(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "offset 38") {
 		t.Fatalf("error = %q, want it to locate the offending byte", err)
+	}
+}
+
+func TestCodexCreditsUsageProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		name, credits      string
+		primary, secondary any
+		allowed, want      bool
+	}{
+		{"purchased_with_window_available", `{"has_credits":true,"balance":null}`, 22, 19, true, false},
+		{"primary_exhausted", `{"has_credits":true,"balance":null}`, 100, 19, false, true},
+		{"secondary_exhausted", `{"has_credits":true}`, 22, 100, true, true},
+		{"both_exhausted", `{"has_credits":true}`, 100, 100, false, true},
+		{"below_boundary", `{"has_credits":true}`, 99.99, 99.99, false, false},
+		{"above_boundary", `{"has_credits":true}`, 101, 19, true, true},
+		{"missing_windows", `{"has_credits":true}`, nil, nil, false, false},
+		{"invalid_percentage", `{"has_credits":true}`, "100", nil, false, false},
+		{"no_purchased_credits", `{"has_credits":false}`, 100, 100, false, false},
+		{"missing_credits", `null`, 100, 100, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]any{"type": "codex.rate_limits", "credits": json.RawMessage(tc.credits), "rate_limits": map[string]any{"allowed": tc.allowed, "limit_reached": !tc.allowed,
+				"primary": map[string]any{"used_percent": tc.primary}, "secondary": map[string]any{"used_percent": tc.secondary}},
+				"code_review_rate_limits": map[string]any{"primary": map[string]any{"used_percent": 100}},
+				"additional_rate_limits":  map[string]any{"other": map[string]any{"primary": map[string]any{"used_percent": 100}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := "data: " + string(payload) + "\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}}\n\n"
+			for _, parser := range []usageParser{newSSEUsageParser("codex"), newJSONUsageParser("codex")} {
+				for i := 0; i < len(body); i += 7 {
+					if err := parser.Feed([]byte(body[i:min(i+7, len(body))])); err != nil {
+						t.Fatal(err)
+					}
+				}
+				input, output, _, _ := parser.GetUsage()
+				if input != 100 || output != 20 || parser.GetCodexHasCredits() != tc.want {
+					t.Fatalf("usage=%d/%d credit=%t, want 100/20 credit=%t", input, output, parser.GetCodexHasCredits(), tc.want)
+				}
+			}
+		})
 	}
 }

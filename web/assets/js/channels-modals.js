@@ -92,10 +92,16 @@ function setScheduledCheckModelHint(i18nKey) {
 let scheduledCheckModelCombobox = null;
 
 function getScheduledCheckModelNames() {
+  const seen = new Set();
   return redirectTableData
     .filter(entry => entry && !entry.disabled)
     .map(entry => (entry.model ? entry.model.trim() : ''))
-    .filter(Boolean);
+    .filter(name => {
+      const key = name.toLowerCase();
+      if (!name || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 }
 
 function getScheduledCheckModelDefaultLabel() {
@@ -572,16 +578,18 @@ async function editChannel(id) {
   const modelCooldowns = new Map(
     (channel.model_cooldowns || []).map(cooldown => [cooldown.model, cooldown])
   );
-  redirectTableData = (channel.models || []).map(m => {
+  const configuredModels = channel.models || [];
+  redirectTableData = configuredModels.map(m => {
     const modelName = m.model || '';
     const redirectModel = m.redirect_model || '';
-    const actualModel = redirectModel || modelName;
+    const actualModel = resolveEditorActualModel(configuredModels, m);
     const cooldown = modelCooldowns.get(actualModel);
     const stats = modelStats?.get(normalizeModelStatsKey(modelName));
     return {
       model: modelName,
       redirect_model: redirectModel,
       disabled: !!m.disabled,
+      ...rowPricingField(m.pricing),
       cooldown_until: cooldown?.cooldown_until || '',
       cooldown_remaining_ms: cooldown?.cooldown_remaining_ms || 0,
       model_stats: stats || null,
@@ -752,14 +760,32 @@ function setChannelSavePending(pending) {
   saveBtn.disabled = Boolean(pending);
 }
 
+function normalizeRowPricing(pricing) {
+  const api = typeof window !== 'undefined' ? window.ChannelModelPricing : undefined;
+  if (api) return api.normalizeChannelModelPricing(pricing);
+  // 价格脚本未加载时原样保留，避免保存渠道时静默丢掉已配置的价格；后端负责校验。
+  return pricing && typeof pricing === 'object' ? pricing : null;
+}
+
+// 仅在配置了渠道价格时携带 pricing 键，未配置的行保持原有形状。
+function rowPricingField(pricing) {
+  const normalized = normalizeRowPricing(pricing);
+  return normalized ? { pricing: normalized } : {};
+}
+
 function collectModelsForSubmit(rows) {
   return (rows || [])
     .filter(r => r.model && r.model.trim())
-    .map(r => ({
-      model: r.model.trim(),
-      redirect_model: (r.redirect_model || '').trim(),
-      disabled: !!r.disabled
-    }));
+    .map(r => {
+      const entry = {
+        model: r.model.trim(),
+        redirect_model: (r.redirect_model || '').trim(),
+        disabled: !!r.disabled
+      };
+      const pricing = normalizeRowPricing(r.pricing);
+      if (pricing) entry.pricing = pricing;
+      return entry;
+    });
 }
 
 function validateChannelScheduledCheckSchedule() {
@@ -827,26 +853,6 @@ async function saveChannel(event) {
 
   // 构建模型配置（新格式：models 数组）
   const models = collectModelsForSubmit(redirectTableData);
-  const seenModels = new Set();
-  const duplicateModels = [];
-  for (const entry of models) {
-    const modelKey = entry.model.toLowerCase();
-    if (seenModels.has(modelKey)) {
-      duplicateModels.push(entry.model);
-      continue;
-    }
-    seenModels.add(modelKey);
-  }
-  if (duplicateModels.length > 0) {
-    const uniqueDuplicates = [...new Set(duplicateModels)];
-    const msg = window.t('channels.duplicateModelsNotAllowed', { models: uniqueDuplicates.join(', ') });
-    if (window.showError) {
-      window.showError(msg);
-    } else {
-      alert(msg);
-    }
-    return;
-  }
 
 
   const formData = {
@@ -858,6 +864,7 @@ async function saveChannel(event) {
       api_key: row.api_key,
       note: row.note || '',
       allowed_models: Array.isArray(row.allowed_models) ? [...row.allowed_models] : [],
+      detected_models: Array.isArray(row.detected_models) ? [...row.detected_models] : [],
       model_scope_empty: row.model_scope_empty === true,
       cost_multiplier: row.cost_multiplier,
       priority: row.priority
@@ -1951,7 +1958,8 @@ async function copyChannel(id, name) {
   redirectTableData = (channel.models || []).map(m => ({
     model: m.model || '',
     redirect_model: m.redirect_model || '',
-    disabled: !!m.disabled
+    disabled: !!m.disabled,
+    ...rowPricingField(m.pricing)
   }));
   selectedModelIndices.clear();
   currentModelFilter = '';
@@ -2257,21 +2265,22 @@ async function confirmModelImport() {
     return;
   }
 
-  // 获取现有模型名称用于去重（忽略大小写）
+  // 同名不同目标是独立配置行；只跳过完全相同的行。
   const existingModels = new Set(
     redirectTableData
-      .map(r => (r.model || '').trim().toLowerCase())
+      .map(r => `${(r.model || '').trim().toLowerCase()}\u0000${(r.redirect_model || r.model || '').trim().toLowerCase()}`)
       .filter(Boolean)
   );
   let addedCount = 0;
 
   newModels.forEach(entry => {
-    const modelKey = entry.model.toLowerCase();
+    const modelKey = `${entry.model.toLowerCase()}\u0000${(entry.redirect_model || entry.model).toLowerCase()}`;
     if (!existingModels.has(modelKey)) {
       redirectTableData.push({
         model: entry.model,
         redirect_model: entry.redirect_model,
-        disabled: !!entry.disabled
+        disabled: !!entry.disabled,
+        ...(entry.pricing ? { pricing: entry.pricing } : {})
       });
       existingModels.add(modelKey);
       addedCount++;
@@ -2363,15 +2372,14 @@ function updateRedirectRow(index, field, value) {
       redirectTableData[index].model_stats_unavailable = false;
     }
 
-    // 当模型名称变化时，更新重定向目标的 placeholder
-    const tbody = document.getElementById('redirectTableBody');
-    const row = tbody?.children[index];
-    if (field === 'model' && row) {
-      const toInput = row.querySelector('.redirect-to-input');
-      if (toInput) {
-        toInput.placeholder = nextValue || window.t('channels.leaveEmptyNoRedirect');
-      }
+    if (field === 'model') {
+      markChannelFormDirty();
+      renderRedirectTable();
+      return;
     }
+
+    const tbody = document.getElementById('redirectTableBody');
+    const row = tbody?.querySelector(`.redirect-from-input[data-index="${index}"]`)?.closest('tr');
     if (row) {
       const statusCell = row.querySelector('.redirect-col-status');
       if (statusCell) {
@@ -2409,11 +2417,6 @@ async function testRedirectModel(index, button) {
     if (window.showWarning) window.showWarning(window.t('channels.saveBeforeModelTest'));
     return false;
   }
-  if (redirect.disabled) {
-    if (window.showWarning) window.showWarning(window.t('channels.enableBeforeModelTest'));
-    return false;
-  }
-
   if (button) {
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
@@ -2423,7 +2426,7 @@ async function testRedirectModel(index, button) {
       id: editingChannelId,
       name: document.getElementById('channelName').value,
       models: redirectTableData
-    }, modelName);
+    }, modelName, String(redirect.redirect_model || modelName).trim());
     if (!opened) return false;
     await runChannelTest();
     return true;
@@ -2436,7 +2439,7 @@ async function testRedirectModel(index, button) {
   } finally {
     if (button?.isConnected) {
       const currentRedirect = redirectTableData[index];
-      button.disabled = Boolean(currentRedirect?.disabled) || !String(currentRedirect?.model || '').trim();
+      button.disabled = !String(currentRedirect?.model || '').trim();
       button.removeAttribute('aria-busy');
     }
   }
@@ -2445,14 +2448,15 @@ async function testRedirectModel(index, button) {
 /**
  * 使用模板引擎创建重定向行元素
  * @param {Object} redirect - 重定向数据
- * @param {number} index - 索引
+ * @param {number} index - 配置数组索引
+ * @param {number} displayIndex - 当前表格行号
  * @returns {HTMLElement|null} 表格行元素
  */
-function createRedirectRow(redirect, index) {
+function createRedirectRow(redirect, index, displayIndex) {
   const modelName = redirect.model || '';
   const rowData = {
     index: index,
-    displayIndex: index + 1,
+    displayIndex: displayIndex,
     from: modelName,
     to: redirect.redirect_model || '',
     toPlaceholder: modelName || window.t('channels.leaveEmptyNoRedirect'),
@@ -2490,9 +2494,29 @@ function renderRedirectModelStatus(statusCell, redirect) {
   } else {
     renderActiveRedirectModelStatus(statusCell, redirect);
   }
+  const pricingSummary = window.ChannelModelPricing?.formatChannelModelPricingSummary(redirect.pricing);
+  if (pricingSummary) {
+    appendRedirectModelStatus(statusCell, 'pricing', [pricingSummary]);
+  }
+}
+
+function configureRedirectModelPriceAction(row, redirect, index) {
+  const priceButton = row.querySelector('.redirect-model-price-btn');
+  if (!priceButton) return;
+  const modelName = String(redirect.model || '').trim();
+  const summary = window.ChannelModelPricing?.formatChannelModelPricingSummary(redirect.pricing) || '';
+  const title = modelName === '*'
+    ? window.t('channels.modelPricing.wildcardUnsupported')
+    : summary || window.t('channels.modelPricing.setPrice');
+  priceButton.dataset.index = String(index);
+  priceButton.title = title;
+  priceButton.setAttribute('aria-label', title);
+  priceButton.disabled = !modelName || modelName === '*';
+  priceButton.classList.toggle('is-active', Boolean(summary));
 }
 
 function configureRedirectModelActions(row, redirect, index) {
+  configureRedirectModelPriceAction(row, redirect, index);
   const toggleButton = row.querySelector('.redirect-model-toggle-btn');
   if (!toggleButton) return;
   toggleButton.dataset.index = String(index);
@@ -2508,15 +2532,13 @@ function configureRedirectModelActions(row, redirect, index) {
   const testButton = row.querySelector('.redirect-model-test-btn');
   if (!testButton) return;
   const modelName = String(redirect.model || '').trim();
-  const testTitle = redirect.disabled
-    ? window.t('channels.enableBeforeModelTest')
-    : modelName
-      ? window.t('channels.testThisModel')
-      : window.t('channels.modelNameRequiredForTest');
+  const testTitle = modelName
+    ? window.t('channels.testThisModel')
+    : window.t('channels.modelNameRequiredForTest');
   testButton.dataset.index = String(index);
   testButton.title = testTitle;
   testButton.setAttribute('aria-label', testTitle);
-  testButton.disabled = redirect.disabled || !modelName;
+  testButton.disabled = !modelName;
 }
 
 function renderActiveRedirectModelStatus(statusCell, redirect) {
@@ -2675,6 +2697,13 @@ function initRedirectTableEventDelegation() {
       return;
     }
 
+    const priceBtn = e.target.closest('.redirect-model-price-btn');
+    if (priceBtn) {
+      const index = parseInt(priceBtn.dataset.index, 10);
+      window.openChannelModelPricingModal?.(index, priceBtn);
+      return;
+    }
+
     const testBtn = e.target.closest('.redirect-model-test-btn');
     if (testBtn) {
       const index = parseInt(testBtn.dataset.index, 10);
@@ -2704,15 +2733,13 @@ function initRedirectTableEventDelegation() {
 }
 
 /**
- * 获取筛选后的模型索引列表
+ * 按请求模型名称排序显示，保留原数组索引用于编辑和批量操作。
  */
 function getVisibleModelIndices() {
-  if (!currentModelFilter) {
-    return redirectTableData.map((_, index) => index);
-  }
   const keyword = currentModelFilter.toLowerCase();
   return redirectTableData
     .map((item, index) => {
+      if (!keyword) return index;
       const model = (item.model || '').toLowerCase();
       const redirect = (item.redirect_model || '').toLowerCase();
       if (model.includes(keyword) || redirect.includes(keyword)) {
@@ -2720,7 +2747,9 @@ function getVisibleModelIndices() {
       }
       return null;
     })
-    .filter(index => index !== null);
+    .filter(index => index !== null)
+    .sort((left, right) =>
+      (redirectTableData[left].model || '').localeCompare(redirectTableData[right].model || '') || left - right);
 }
 
 /**
@@ -2771,8 +2800,8 @@ function renderRedirectTable() {
 
   // 使用DocumentFragment优化批量DOM操作
   const fragment = document.createDocumentFragment();
-  visibleIndices.forEach(index => {
-    const row = createRedirectRow(redirectTableData[index], index);
+  visibleIndices.forEach((index, position) => {
+    const row = createRedirectRow(redirectTableData[index], index, position + 1);
     if (row) fragment.appendChild(row);
   });
 
@@ -2952,20 +2981,23 @@ function batchDeleteSelectedModels() {
 function mergeModelRowsWithFetchedModels(currentRows, fetchedModels) {
   const existingModelKeys = new Set();
   const occupiedModelKeys = new Set();
+  const fetchedIdentities = new Set();
   const rows = [];
   (currentRows || []).forEach(row => {
     const model = (row?.model || '').trim();
     if (!model) return;
-    const modelKey = model.toLowerCase();
-    if (existingModelKeys.has(modelKey)) return;
-    existingModelKeys.add(modelKey);
-    occupiedModelKeys.add(modelKey);
     const redirectModel = (row?.redirect_model || '').trim();
+    const modelKey = model.toLowerCase();
+    const identity = `${modelKey}\u0000${(redirectModel || model).toLowerCase()}`;
+    if (existingModelKeys.has(identity)) return;
+    existingModelKeys.add(identity);
+    occupiedModelKeys.add(modelKey);
     if (redirectModel) occupiedModelKeys.add(redirectModel.toLowerCase());
     rows.push({
       model,
       redirect_model: redirectModel,
-      disabled: !!row?.disabled
+      disabled: !!row?.disabled,
+      ...rowPricingField(row?.pricing)
     });
   });
 
@@ -2979,9 +3011,10 @@ function mergeModelRowsWithFetchedModels(currentRows, fetchedModels) {
       ? String(entry.redirect_model).trim()
       : modelName;
     const redirectKey = fetchedRedirect.toLowerCase();
-    if (occupiedModelKeys.has(modelKey) || occupiedModelKeys.has(redirectKey)) continue;
-    occupiedModelKeys.add(modelKey);
-    occupiedModelKeys.add(redirectKey);
+    const identity = `${modelKey}\u0000${redirectKey}`;
+    if (occupiedModelKeys.has(modelKey) || occupiedModelKeys.has(redirectKey) ||
+        existingModelKeys.has(identity) || fetchedIdentities.has(identity)) continue;
+    fetchedIdentities.add(identity);
     rows.push({
       model: modelName,
       redirect_model: fetchedRedirect,
@@ -3001,7 +3034,8 @@ function areModelRowsEqual(left, right) {
     const other = right[index] || {};
     return (row.model || '') === (other.model || '') &&
       (row.redirect_model || '') === (other.redirect_model || '') &&
-      !!row.disabled === !!other.disabled;
+      !!row.disabled === !!other.disabled &&
+      JSON.stringify(normalizeRowPricing(row.pricing)) === JSON.stringify(normalizeRowPricing(other.pricing));
   });
 }
 
@@ -3020,32 +3054,63 @@ function normalizeDetectedModelNames(entries) {
   return names;
 }
 
-function detectedChannelModels(modelRows, entries) {
+function routingModelNameForEditor(value) {
+  const name = String(value || '').trim();
+  const match = name.match(/^(.*?)\(([^()]*)\)$/);
+  if (!match) return name;
+  const suffix = match[2].trim().toLowerCase();
+  if (!['none', 'auto', '-1', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(suffix) &&
+      !/^\d+$/.test(suffix)) return name;
+  return match[1].trim() || name;
+}
+
+function resolveEditorActualModel(modelRows, row) {
+  const redirect = String(row?.redirect_model || '').trim();
+  let target = redirect || String(row?.model || '').trim();
+  if (redirect) {
+    const enabled = (Array.isArray(modelRows) ? modelRows : []).filter(entry => !entry?.disabled);
+    const next = enabled.find(entry => entry.model === target) ||
+      enabled.find(entry => routingModelNameForEditor(entry.model) === target);
+    if (next?.redirect_model) target = String(next.redirect_model).trim();
+  }
+  return routingModelNameForEditor(target);
+}
+
+function detectedChannelModelScope(modelRows, entries) {
   const detectedNames = normalizeDetectedModelNames(entries);
-  const detected = new Set(detectedNames.map(name => name.toLowerCase()));
+  const detected = new Set(detectedNames.map(name => routingModelNameForEditor(name).toLowerCase()));
   const matched = [];
   const seen = new Set();
+  const actualModels = [];
+  const seenActual = new Set();
   for (const row of Array.isArray(modelRows) ? modelRows : []) {
     const logicalModel = String(row?.model || '').trim();
     if (!logicalModel || logicalModel === '*') continue;
-    const upstreamModel = String(row?.redirect_model || logicalModel).trim();
-    if (!detected.has(logicalModel.toLowerCase()) && !detected.has(upstreamModel.toLowerCase())) continue;
+    const actualModel = resolveEditorActualModel(modelRows, row);
+    if (!detected.has(actualModel.toLowerCase())) continue;
+    if (!seenActual.has(actualModel.toLowerCase())) {
+      seenActual.add(actualModel.toLowerCase());
+      actualModels.push(actualModel);
+    }
     const key = logicalModel.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
     matched.push(logicalModel);
   }
-  const wildcard = (Array.isArray(modelRows) ? modelRows : [])
-    .some(row => String(row?.model || '').trim() === '*');
-  return matched.length > 0 || !wildcard ? matched : detectedNames;
+  return { allowedModels: matched, detectedModels: actualModels };
 }
 
 function proposeFetchedKeyModelScopes(keyRows, modelRows, keyModels, requestEntries) {
   const originalRows = (Array.isArray(keyRows) ? keyRows : []).map(row => ({
     ...row,
-    allowed_models: Array.isArray(row?.allowed_models) ? [...row.allowed_models] : []
+    allowed_models: Array.isArray(row?.allowed_models) ? [...row.allowed_models] : [],
+    ...(Array.isArray(row?.detected_models) && row.detected_models.length > 0
+      ? { detected_models: [...row.detected_models] } : {})
   }));
-  const rows = originalRows.map(row => ({ ...row, allowed_models: [...row.allowed_models] }));
+  const rows = originalRows.map(row => ({
+    ...row, allowed_models: [...row.allowed_models],
+    ...(row.detected_models ? { detected_models: [...row.detected_models] } : {})
+  }));
   const results = new Map(
     (Array.isArray(keyModels) ? keyModels : [])
       .filter(Boolean)
@@ -3055,40 +3120,50 @@ function proposeFetchedKeyModelScopes(keyRows, modelRows, keyModels, requestEntr
   let matchedCount = 0;
   let unmatchedCount = 0;
   let failedCount = 0;
-  for (const requestEntry of (Array.isArray(requestEntries) ? requestEntries : [])) {
+  for (const [requestIndex, requestEntry] of (Array.isArray(requestEntries) ? requestEntries : []).entries()) {
     const rowIndex = Number(requestEntry?.keyIndex);
     const row = rows[rowIndex];
     if (!row || String(row.api_key || '').trim() !== String(requestEntry?.apiKey || '').trim()) continue;
 
-    const result = results.get(rowIndex);
-    const setScope = (allowedModels, scopeEmpty) => {
+    const result = results.get(requestIndex);
+    const setScope = (allowedModels, scopeEmpty, detectedModels) => {
       const current = (row.allowed_models || []).map(name => String(name).toLowerCase());
       const next = allowedModels.map(name => name.toLowerCase());
+      const currentDetected = (row.detected_models || []).map(name => String(name).toLowerCase());
+      const nextDetected = detectedModels.map(name => name.toLowerCase());
       const currentEmpty = row.model_scope_empty === true;
       if (current.length === next.length && current.every((name, index) => name === next[index]) &&
-          currentEmpty === scopeEmpty) {
+          currentDetected.length === nextDetected.length &&
+          currentDetected.every((name, index) => name === nextDetected[index]) && currentEmpty === scopeEmpty) {
         return;
       }
       row.allowed_models = allowedModels;
+      if (detectedModels.length > 0) row.detected_models = detectedModels;
+      else delete row.detected_models;
       if (scopeEmpty) row.model_scope_empty = true;
       else delete row.model_scope_empty;
       changedCount++;
     };
 
-    if (!result || result.error || !Array.isArray(result.models) || result.models.length === 0) {
+    // 探测失败（429、超时等）不代表模型范围变化，与后端一致保持原范围。
+    if (!result || result.error) {
       failedCount++;
-      setScope([], true);
+      continue;
+    }
+    if (!Array.isArray(result.models) || result.models.length === 0) {
+      unmatchedCount++;
+      setScope([], true, []);
       continue;
     }
 
-    const allowedModels = detectedChannelModels(modelRows, result.models);
+    const { allowedModels, detectedModels } = detectedChannelModelScope(modelRows, result.models);
     if (allowedModels.length === 0) {
       unmatchedCount++;
-      setScope([], true);
+      setScope([], true, detectedModels);
       continue;
     }
     matchedCount++;
-    setScope(allowedModels, false);
+    setScope(allowedModels, false, detectedModels);
   }
   const complete = matchedCount === (Array.isArray(requestEntries) ? requestEntries.length : 0);
   return {
@@ -3276,7 +3351,8 @@ function applyQuickAddChannelSetup(setup) {
   redirectTableData = setup.models.map(row => ({
     model: row.model || '',
     redirect_model: row.redirect_model || '',
-    disabled: !!row.disabled
+    disabled: !!row.disabled,
+    ...rowPricingField(row.pricing)
   }));
   selectedModelIndices.clear();
   updateModelBatchDeleteButton();
@@ -3479,13 +3555,15 @@ async function fetchModelsFromAPI() {
     }
 
     endpoint = '/admin/channels/models/fetch';
+    const proxyURL = String(document.getElementById?.('channelProxyURL')?.value || '').trim();
     fetchOptions = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         urls,
         api_keys: availableKeys,
-        per_key: true
+        per_key: true,
+        ...(proxyURL ? { proxy_url: proxyURL } : {})
       })
     };
   }
@@ -3506,7 +3584,8 @@ async function fetchModelsFromAPI() {
     const previousRows = redirectTableData.map(row => ({
       model: row.model || '',
       redirect_model: row.redirect_model || '',
-      disabled: !!row.disabled
+      disabled: !!row.disabled,
+      ...rowPricingField(row.pricing)
     }));
     const replacement = mergeModelRowsWithFetchedModels(redirectTableData, data.models);
     if (replacement.rows.length === 0) {
@@ -3677,17 +3756,20 @@ const COMMON_MODELS = {
     'claude-haiku-4-5-20251001',
     'claude-opus-4-8',
     'claude-opus-5',
-    'claude-fable-5',
+    'claude-opus-5-5',
+    'claude-fable-5-1',
+    'claude-sonnet-5-5',
     'claude-sonnet-5',
     'claude-sonnet-4-6',
   ],
   codex: [
+    'gpt-6.1-sol',
+    'gpt-6-astra',
+    'gpt-6-luna',
     'gpt-5.5',
     'gpt-5.6-sol',
     'gpt-5.6-luna',
-    'gpt-5.6-terra',
-    'gpt-5.3-codex-spark',
-    'codex-auto-review'
+    'gpt-5.6-terra'
   ],
   gemini: [
     'gemini-3.6-flash',
@@ -3868,6 +3950,7 @@ if (typeof module !== 'undefined' && module.exports) {
     getModelsForExport,
     initModelNormalizationOptions,
     mergeModelRowsWithFetchedModels,
+    areModelRowsEqual,
     openBatchModelImportModal,
     parseQuickAddChannelInfo,
     proposeFetchedKeyModelScopes,

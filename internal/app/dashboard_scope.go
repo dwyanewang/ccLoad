@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
@@ -23,8 +24,8 @@ type tokenLogChannelMetadata struct {
 type tokenLogEntry struct {
 	ID                       int64                       `json:"id"`
 	Time                     model.JSONTime              `json:"time"`
-	ChannelID                int64                       `json:"channel_id"`
-	ChannelName              string                      `json:"channel_name"`
+	ChannelID                int64                       `json:"channel_id,omitempty"`
+	ChannelName              string                      `json:"channel_name,omitempty"`
 	ClientProtocol           string                      `json:"client_protocol,omitempty"`
 	UpstreamProtocol         string                      `json:"upstream_protocol,omitempty"`
 	LogSource                string                      `json:"log_source"`
@@ -56,9 +57,75 @@ type dashboardLogEntry struct {
 	CostBreakdown *util.StandardCostBreakdown `json:"cost_breakdown,omitempty"`
 }
 
-func buildLogCostBreakdown(entry *model.LogEntry) *util.StandardCostBreakdown {
+// logModelPriceFunc 返回当前可确定的渠道价格；无法辨别选中行时不展示重算明细。
+type logModelPriceFunc func(entry *model.LogEntry) (*util.CustomModelPrice, bool)
+
+// logModelPrices 为一页日志预加载渠道配置，按渠道当前的模型价格重算成本明细。
+// 渠道已删除或读取失败时明细回退全局价格——明细只用于展示，日志成本已在写入时定格。
+func (s *Server) logModelPrices(ctx context.Context, logs []*model.LogEntry) logModelPriceFunc {
+	configs := make(map[int64]*model.Config)
+	for _, entry := range logs {
+		if entry == nil || entry.ChannelID <= 0 || entry.Cost <= 0 {
+			continue
+		}
+		if _, loaded := configs[entry.ChannelID]; loaded {
+			continue
+		}
+		cfg, err := s.GetConfig(ctx, entry.ChannelID)
+		if err != nil {
+			cfg = nil
+		}
+		configs[entry.ChannelID] = cfg
+	}
+	return func(entry *model.LogEntry) (*util.CustomModelPrice, bool) {
+		cfg := configs[entry.ChannelID]
+		if cfg == nil {
+			return nil, true
+		}
+		actual := entry.ActualModel
+		if actual == "" {
+			actual = model.RoutingModelName(entry.Model)
+		}
+		logical := s.resolveChannelRoutingModel(cfg, entry.Model)
+		var matched *util.CustomModelPrice
+		matches := 0
+		for _, row := range cfg.ModelEntries {
+			if !strings.EqualFold(model.RoutingModelName(row.Model), logical) {
+				continue
+			}
+			selected := modelRoutingSelection{
+				logicalModel: logical,
+				entry:        row,
+				fuzzyMatched: !strings.EqualFold(model.RoutingModelName(entry.Model), logical),
+			}
+			if strings.EqualFold(s.resolveFinalUpstreamModel(cfg, selected, entry.UpstreamProtocol), actual) {
+				if matches > 0 && !matched.Equal(row.Pricing) {
+					return nil, false
+				}
+				matched = row.Pricing
+				matches++
+			}
+		}
+		if matches == 0 && cfg.UsesAntigravityOAuth() && strings.EqualFold(actual, antigravityWebSearchFallbackModel) {
+			// Web Search replaces the routed model after row selection. Its log retains
+			// the selected row's price, which cannot be recovered from this model name.
+			return nil, false
+		}
+		return matched, true
+	}
+}
+
+func buildLogCostBreakdown(entry *model.LogEntry, modelPrice logModelPriceFunc) *util.StandardCostBreakdown {
 	if entry == nil || entry.Cost <= 0 {
 		return nil
+	}
+	var price *util.CustomModelPrice
+	if modelPrice != nil {
+		var identifiable bool
+		price, identifiable = modelPrice(entry)
+		if !identifiable {
+			return nil
+		}
 	}
 	billingModel := util.ResolveBillingModel(entry.ActualModel, entry.Model)
 	cache5mTokens := entry.Cache5mInputTokens
@@ -67,9 +134,10 @@ func buildLogCostBreakdown(entry *model.LogEntry) *util.StandardCostBreakdown {
 		// 旧日志只有缓存创建总量；历史计费语义等同 5m 缓存创建。
 		cache5mTokens = entry.CacheCreationInputTokens
 	}
-	breakdown := util.CalculateStandardCostBreakdown(
+	breakdown := util.CalculateStandardCostBreakdownWithPrice(
 		billingModel,
 		entry.ServiceTier,
+		price,
 		entry.InputTokens,
 		entry.OutputTokens,
 		entry.CacheReadInputTokens,
@@ -79,7 +147,7 @@ func buildLogCostBreakdown(entry *model.LogEntry) *util.StandardCostBreakdown {
 	return &breakdown
 }
 
-func projectDashboardLogs(logs []*model.LogEntry) []dashboardLogEntry {
+func projectDashboardLogs(logs []*model.LogEntry, modelPrice logModelPriceFunc) []dashboardLogEntry {
 	projected := make([]dashboardLogEntry, 0, len(logs))
 	for _, entry := range logs {
 		if entry == nil {
@@ -87,13 +155,13 @@ func projectDashboardLogs(logs []*model.LogEntry) []dashboardLogEntry {
 		}
 		projected = append(projected, dashboardLogEntry{
 			LogEntry:      entry,
-			CostBreakdown: buildLogCostBreakdown(entry),
+			CostBreakdown: buildLogCostBreakdown(entry, modelPrice),
 		})
 	}
 	return projected
 }
 
-func projectTokenLogs(logs []*model.LogEntry, channels map[int64]tokenLogChannelMetadata) []tokenLogEntry {
+func projectTokenLogs(logs []*model.LogEntry, channels map[int64]tokenLogChannelMetadata, modelPrice logModelPriceFunc) []tokenLogEntry {
 	projected := make([]tokenLogEntry, 0, len(logs))
 	for _, entry := range logs {
 		if entry == nil {
@@ -140,7 +208,7 @@ func projectTokenLogs(logs []*model.LogEntry, channels map[int64]tokenLogChannel
 			Cache1hInputTokens:       entry.Cache1hInputTokens,
 			Cost:                     entry.Cost,
 			EffectiveCost:            entry.Cost * multiplier,
-			CostBreakdown:            buildLogCostBreakdown(entry),
+			CostBreakdown:            buildLogCostBreakdown(entry, modelPrice),
 		})
 	}
 	return projected
@@ -182,6 +250,17 @@ func ApplyWebIdentityScope(c *gin.Context, filter *model.LogFilter) {
 		tokenID = 1<<63 - 1
 	}
 	filter.AuthTokenID = &tokenID
+	filter.LogSource = model.LogSourceProxy
+	if identity.HideChannels {
+		filter.ChannelID = nil
+		filter.ChannelName = ""
+		filter.ChannelNameLike = ""
+	}
+}
+
+func hideTokenChannels(c *gin.Context) bool {
+	identity, ok := WebIdentityFromContext(c)
+	return ok && identity.Role == model.WebRoleAPIToken && identity.HideChannels
 }
 
 func isAPITokenWebRequest(c *gin.Context) bool {

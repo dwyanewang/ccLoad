@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 	antigravitygemini "ccLoad/internal/protocol/cliproxy/providers/antigravity/gemini"
 	antigravitychat "ccLoad/internal/protocol/cliproxy/providers/antigravity/openai/chat-completions"
 	antigravityresponses "ccLoad/internal/protocol/cliproxy/providers/antigravity/openai/responses"
+	cliproxyregistry "ccLoad/internal/protocol/cliproxy/registry"
 	cliproxyutil "ccLoad/internal/protocol/cliproxy/util"
 	"ccLoad/internal/util"
 
@@ -115,6 +117,9 @@ func translateAntigravityResponseNonStream(
 	default:
 		return nil, fmt.Errorf("unsupported Antigravity client protocol %q", clientProtocol)
 	}
+	if err := protocol.ResponseToolInputError(state); err != nil {
+		return translated, err
+	}
 	if !gjson.ValidBytes(translated) {
 		return nil, fmt.Errorf("antigravity %s response adapter produced invalid JSON", clientProtocol)
 	}
@@ -128,6 +133,10 @@ func translateAntigravityResponseStream(
 	originalRequest, translatedRequest, response []byte,
 	state *any,
 ) ([][]byte, error) {
+	if state == nil {
+		var local any
+		state = &local
+	}
 	var chunks [][]byte
 	switch clientProtocol {
 	case protocol.Anthropic:
@@ -145,7 +154,7 @@ func translateAntigravityResponseStream(
 	default:
 		return nil, fmt.Errorf("unsupported Antigravity client protocol %q", clientProtocol)
 	}
-	return frameAntigravityStreamChunks(chunks), nil
+	return frameAntigravityStreamChunks(chunks), protocol.ResponseToolInputError(*state)
 }
 
 func frameAntigravityStreamChunks(chunks [][]byte) [][]byte {
@@ -170,19 +179,59 @@ func frameAntigravityStreamChunks(chunks [][]byte) [][]byte {
 	return framed
 }
 
-func antigravitySSEData(event []byte) ([]byte, error) {
+// antigravityEventPayload returns the JSON payload of one Antigravity stream
+// event, or nil for events without one. Data lines join per SSE; the backend
+// may also append a bare, pretty-printed JSON error object after the frames.
+func antigravityEventPayload(event []byte) []byte {
 	normalized := bytes.ReplaceAll(event, []byte("\r\n"), []byte("\n"))
+	var dataLines, bareLines [][]byte
 	for _, line := range bytes.Split(normalized, []byte("\n")) {
 		trimmed := bytes.TrimSpace(line)
-		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
+			dataLines = append(dataLines, bytes.TrimSpace(data))
 			continue
 		}
-		data := bytes.TrimSpace(trimmed[len("data:"):])
-		if len(data) > 0 {
-			return data, nil
+		if len(trimmed) == 0 || trimmed[0] == ':' || bytes.HasPrefix(trimmed, []byte("event:")) ||
+			bytes.HasPrefix(trimmed, []byte("id:")) || bytes.HasPrefix(trimmed, []byte("retry:")) {
+			continue
+		}
+		bareLines = append(bareLines, trimmed)
+	}
+	if len(dataLines) == 0 {
+		dataLines = bareLines
+	}
+	payload := bytes.TrimSpace(bytes.Join(dataLines, []byte("\n")))
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return payload
+	}
+	// A frame split mid-object stays undecodable; dropping it keeps the
+	// truncation visible as an incomplete stream.
+	if !gjson.ValidBytes(payload) {
+		return nil
+	}
+	if bytes.IndexByte(payload, '\n') >= 0 {
+		var compact bytes.Buffer
+		if json.Compact(&compact, payload) == nil {
+			payload = compact.Bytes()
 		}
 	}
-	return nil, errors.New("stream: Antigravity SSE event is missing data")
+	return payload
+}
+
+// isAntigravityErrorPayload reports a backend error object sent in place of a
+// response chunk.
+func isAntigravityErrorPayload(payload []byte) bool {
+	return gjson.GetBytes(payload, "error").IsObject() && !gjson.GetBytes(payload, "response").Exists()
+}
+
+// antigravitySSEData returns the payload handed to the stream converters; nil
+// skips the event. Backend errors reach the usage parser instead.
+func antigravitySSEData(event []byte) []byte {
+	payload := antigravityEventPayload(event)
+	if len(payload) == 0 || isAntigravityErrorPayload(payload) {
+		return nil
+	}
+	return payload
 }
 
 func prepareAntigravityRequestBody(
@@ -225,7 +274,14 @@ func prepareAntigravityRequestBody(
 	request = restoreAntigravityAnthropicToolIDs(request, sourceBody)
 	request = normalizeAntigravitySchemas(request, modelName)
 	request = normalizeAntigravityThinkingLevel(request)
-	if strings.Contains(strings.ToLower(modelName), "claude") {
+	lookupID := strings.ToLower(strings.TrimSpace(modelName))
+	if strings.Contains(lookupID, "claude") {
+		// The translator preserves client limits; cap them for the actual upstream model.
+		if maxOut, ok := jsonIntegerValue(gjson.GetBytes(request, "generationConfig.maxOutputTokens")); ok {
+			if info := cliproxyregistry.LookupModelInfo(lookupID, "antigravity"); info != nil && info.MaxCompletionTokens > 0 && maxOut > int64(info.MaxCompletionTokens) {
+				request = setJSONValue(request, "generationConfig.maxOutputTokens", info.MaxCompletionTokens)
+			}
+		}
 		request = normalizeAntigravityClaudeToolResultOrder(request)
 		request = ensureAntigravityValidatedToolMode(request)
 	} else {
@@ -830,6 +886,14 @@ func isAntigravityModelCapacityExhausted(statusCode int, body []byte) bool {
 	return false
 }
 
+// isAntigravityModelNotFound 判断 Antigravity 的 404 是否为模型级失败。
+// 端点与 wire 协议由系统内置、模型在请求体里：base URL 回退后仍是 Google 的
+// 404 NOT_FOUND（"Requested entity was not found."），即该账号不可用此模型，
+// 既不是协议能力缺失，也不是渠道故障。
+func isAntigravityModelNotFound(cfg *model.Config, statusCode int) bool {
+	return cfg != nil && cfg.UsesAntigravityOAuth() && statusCode == http.StatusNotFound
+}
+
 func shouldFallbackAntigravityBaseURL(statusCode int, body []byte) bool {
 	switch statusCode {
 	case http.StatusNotFound, http.StatusTooManyRequests:
@@ -878,36 +942,30 @@ func unwrapAntigravityRequest(raw []byte) ([]byte, error) {
 	return envelope.Request, nil
 }
 
+// terminateAntigravitySSE dispatches a trailing event the backend closes
+// without a blank line, such as an appended bare JSON error. Read errors still
+// surface unchanged; only a clean EOF gets the terminator.
+func terminateAntigravitySSE(body io.ReadCloser) io.ReadCloser {
+	return readerWithCloser{Reader: io.MultiReader(body, strings.NewReader("\n\n")), Closer: body}
+}
+
+// unwrapAntigravitySSEEvent renders one event for the usage parser; nil means
+// the event carries no payload. Backend errors stay intact so the parser
+// records them as the stream error.
 func unwrapAntigravitySSEEvent(event []byte) ([]byte, error) {
-	normalized := bytes.ReplaceAll(event, []byte("\r\n"), []byte("\n"))
-	lines := bytes.Split(normalized, []byte("\n"))
-	var output bytes.Buffer
-	foundData := false
-	for _, line := range lines {
-		trimmed := bytes.TrimSpace(line)
-		if !bytes.HasPrefix(trimmed, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(trimmed[len("data:"):])
-		if len(data) == 0 {
-			continue
-		}
-		if bytes.Equal(data, []byte("[DONE]")) {
-			output.WriteString("data: [DONE]\n\n")
-			foundData = true
-			continue
-		}
-		inner, err := unwrapAntigravityResponse(data)
+	payload := antigravityEventPayload(event)
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	if !bytes.Equal(payload, []byte("[DONE]")) && !isAntigravityErrorPayload(payload) {
+		inner, err := unwrapAntigravityResponse(payload)
 		if err != nil {
 			return nil, err
 		}
-		output.WriteString("data: ")
-		output.Write(bytes.TrimSpace(inner))
-		output.WriteString("\n\n")
-		foundData = true
+		payload = bytes.TrimSpace(inner)
 	}
-	if !foundData {
-		return nil, errors.New("stream: Antigravity SSE event is missing data")
-	}
-	return output.Bytes(), nil
+	output := make([]byte, 0, len(payload)+8)
+	output = append(output, "data: "...)
+	output = append(output, payload...)
+	return append(output, '\n', '\n'), nil
 }

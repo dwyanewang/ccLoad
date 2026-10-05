@@ -2,11 +2,392 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/util"
 )
+
+func TestProxyGemini_CodexModelsManifest(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	allowed, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "codex-manifest-allowed", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-5.5"}, {Model: "gpt-6-sol"}, {Model: "gpt-4o"}, {Model: "claude-opus-5"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.CreateConfig(context.Background(), &model.Config{
+		Name: "codex-manifest-denied", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-secret"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server.authService = newTestAuthService(t)
+	tokenHash := model.HashToken("codex-manifest-token")
+	otherTokenHash := model.HashToken("other-codex-manifest-token")
+	restriction := mustChannelRestriction(t, model.ChannelRestrictionModeAllow, allowed.ID)
+	server.authService.authTokensMux.Lock()
+	server.authService.authTokenModels[tokenHash] = []string{"gpt-5.5", "gpt-6-sol", "claude-opus-5", "gpt-secret"}
+	server.authService.authTokenChannels[tokenHash] = restriction
+	server.authService.authTokenModels[otherTokenHash] = []string{"gpt-4o"}
+	server.authService.authTokensMux.Unlock()
+
+	requestModels := func(hash, ifNoneMatch string) *httptest.ResponseRecorder {
+		req := newRequest(http.MethodGet, "/v1/models?client_version=0.155.0", nil)
+		req.Header.Set("User-Agent", "codex-cli/0.155.0")
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		client, response := newTestContext(t, req)
+		client.Set("token_hash", hash)
+		server.handleListOpenAIModels(client)
+		return response
+	}
+
+	response := requestModels(tokenHash, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Models []struct {
+			Slug                  string   `json:"slug"`
+			DefaultReasoningLevel string   `json:"default_reasoning_level"`
+			Visibility            string   `json:"visibility"`
+			SupportedInAPI        bool     `json:"supported_in_api"`
+			ContextWindow         int64    `json:"context_window"`
+			MaxContextWindow      *int64   `json:"max_context_window"`
+			MultiAgentVersion     string   `json:"multi_agent_version"`
+			InputModalities       []string `json:"input_modalities"`
+			ModelMessages         struct {
+				InstructionsTemplate string `json:"instructions_template"`
+			} `json:"model_messages"`
+			SupportedReasoningLevels []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
+		} `json:"models"`
+		Data json.RawMessage `json:"data"`
+	}
+	mustUnmarshalJSON(t, response.Body.Bytes(), &payload)
+	if len(payload.Models) != 3 || len(payload.Data) != 0 {
+		t.Fatalf("unexpected manifest: %+v", payload)
+	}
+	for index, expected := range []struct {
+		slug          string
+		contextWindow int64
+		defaultEffort string
+	}{
+		{slug: "claude-opus-5", contextWindow: 1000000, defaultEffort: "none"},
+		{slug: "gpt-5.5", contextWindow: 272000, defaultEffort: "medium"},
+		{slug: "gpt-6-sol", contextWindow: 272000, defaultEffort: "medium"},
+	} {
+		entry := payload.Models[index]
+		if entry.Slug != expected.slug || entry.Visibility != "list" || !entry.SupportedInAPI || entry.ContextWindow != expected.contextWindow || entry.MaxContextWindow != nil || entry.ModelMessages.InstructionsTemplate == "" || entry.MultiAgentVersion != "v2" || !slices.Contains(entry.InputModalities, "image") {
+			t.Fatalf("incomplete Codex model: %+v", entry)
+		}
+		if entry.DefaultReasoningLevel != expected.defaultEffort || len(entry.SupportedReasoningLevels) == 0 {
+			t.Fatalf("incorrect reasoning metadata: %+v", entry)
+		}
+	}
+
+	etag := response.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("missing manifest ETag")
+	}
+	if cached := requestModels(tokenHash, etag); cached.Code != http.StatusNotModified || cached.Body.Len() != 0 {
+		t.Fatalf("conditional request: status=%d, body=%s", cached.Code, cached.Body.String())
+	}
+	if cached := requestModels(tokenHash, `"old", W/`+etag); cached.Code != http.StatusNotModified {
+		t.Fatalf("weak conditional request: status=%d, body=%s", cached.Code, cached.Body.String())
+	}
+	if other := requestModels(otherTokenHash, etag); other.Code != http.StatusOK {
+		t.Fatalf("different visible models reused ETag: status=%d, body=%s", other.Code, other.Body.String())
+	} else {
+		var visible struct {
+			Models []struct {
+				Slug            string   `json:"slug"`
+				InputModalities []string `json:"input_modalities"`
+			} `json:"models"`
+		}
+		mustUnmarshalJSON(t, other.Body.Bytes(), &visible)
+		if len(visible.Models) != 1 || visible.Models[0].Slug != "gpt-4o" || !slices.Contains(visible.Models[0].InputModalities, "image") {
+			t.Fatalf("other token models=%+v", visible.Models)
+		}
+	}
+
+	client, ordinary := newTestContext(t, newRequest(http.MethodGet, "/v1/models?client_version=", nil))
+	client.Set("token_hash", tokenHash)
+	server.handleListOpenAIModels(client)
+	var ordinaryList struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, ordinary.Body.Bytes(), &ordinaryList)
+	if ordinary.Code != http.StatusOK || ordinaryList.Object != "list" || len(ordinaryList.Data) != 3 {
+		t.Fatalf("empty client_version changed ordinary list: status=%d, body=%s", ordinary.Code, ordinary.Body.String())
+	}
+}
+
+func TestProxyGemini_CodexModelsAstraServiceTiers(t *testing.T) {
+	const declared = `[{"id":"ultrafast","name":"Ultrafast","description":"Lowest latency; 6x Standard token pricing."}]`
+	for _, scenario := range []struct {
+		name         string
+		url          string
+		protocols    []string
+		mode         string
+		modelID      string
+		target       string
+		extraTarget  string
+		extraURL     string
+		denyExtra    bool
+		disableExtra bool
+		oauth        bool
+		manifest     string
+		oldSource    bool
+		oldAccount   bool
+		want         string
+	}{
+		{name: "official API", want: "priority,ultrafast"},
+		{name: "official dated snapshot", modelID: "gpt-6-astra-2026-09-24", want: "priority,ultrafast"},
+		{name: "API alias", modelID: "coding-alias", target: "gpt-6-astra", want: "priority,ultrafast"},
+		{name: "different alias targets", modelID: "coding-alias", target: "gpt-6-astra", extraTarget: "gpt-6-sol", want: "null"},
+		{name: "multiple identical routes", extraURL: "https://api.openai.com", want: "priority,ultrafast"},
+		{name: "official Chat route", protocols: []string{"openai"}, want: "null"},
+		{name: "official Chat local fallback", protocols: []string{"codex", "openai"}, mode: model.ProtocolTransformModeLocal, want: "null"},
+		{name: "official Chat auto fallback unused", protocols: []string{"codex", "openai"}, want: "priority,ultrafast"},
+		{name: "proxy route", url: "https://relay.example.com", want: "null"},
+		{name: "proxy fallback", extraURL: "https://relay.example.com", want: "null"},
+		{name: "denied proxy route", extraURL: "https://relay.example.com", denyExtra: true, want: "priority,ultrafast"},
+		{name: "disabled proxy route", extraURL: "https://relay.example.com", disableExtra: true, want: "priority,ultrafast"},
+		{name: "HTTP official host", url: "http://api.openai.com", want: "null"},
+		{name: "unofficial port", url: "https://api.openai.com:444", want: "null"},
+		{name: "host suffix", url: "https://api.openai.com.example.com", want: "null"},
+		{name: "unsupported Astra variant", modelID: "gpt-6-astra-pro", want: "null"},
+		{name: "OAuth manifest", oauth: true, manifest: declared, want: "ultrafast"},
+		{name: "OAuth alias manifest", oauth: true, modelID: "coding-alias", target: "gpt-6-astra", manifest: declared, want: "ultrafast"},
+		{name: "OAuth without manifest even promax", oauth: true, want: "null"},
+		{name: "OAuth unknown tiers", oauth: true, manifest: "null", want: "null"},
+		{name: "OAuth explicit no tiers", oauth: true, manifest: "[]", want: ""},
+		{name: "OAuth changed endpoint", oauth: true, manifest: declared, oldSource: true, want: "null"},
+		{name: "OAuth changed account", oauth: true, manifest: declared, oldAccount: true, want: "null"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			server, store, cleanup := setupAdminTestServer(t)
+			defer cleanup()
+			server.urlSelector = NewURLSelector()
+			modelID := scenario.modelID
+			if modelID == "" {
+				modelID = "gpt-6-astra"
+			}
+			target := scenario.target
+			if target == "" {
+				target = modelID
+			}
+			baseURL := scenario.url
+			if baseURL == "" {
+				baseURL = "https://api.openai.com"
+			}
+			protocols := scenario.protocols
+			if protocols == nil {
+				protocols = []string{"codex"}
+			}
+			cfg := &model.Config{
+				Name: "primary", Enabled: true,
+				URLs:                  model.ChannelURLs{{URL: baseURL, Protocols: protocols}},
+				ProtocolTransformMode: scenario.mode,
+				ModelEntries:          []model.ModelEntry{{Model: modelID, RedirectModel: target}},
+			}
+			if scenario.extraTarget != "" {
+				cfg.ModelEntries = append(cfg.ModelEntries, model.ModelEntry{Model: modelID, RedirectModel: scenario.extraTarget})
+			}
+			if scenario.oauth {
+				cfg.AuthType = model.AuthTypeCodexOAuth
+				cfg.URLs[0] = model.ChannelURL{URL: codexUpstreamURL, Exact: true, Protocols: []string{"codex"}}
+				credential := &codexauth.Credential{AccessToken: "access", RefreshToken: "refresh", Type: codexauth.ChannelType,
+					AccountID: "account", ChatGPTUserID: "user", PlanType: "promax", Expired: time.Now().Add(time.Hour).Format(time.RFC3339)}
+				if scenario.manifest != "" {
+					endpoint, err := codexauth.ModelsEndpoint(cfg.URLs[0].URL)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if scenario.oldSource {
+						endpoint = "https://relay.example.com/models"
+					}
+					credential.ModelManifest = &codexauth.ModelManifest{AccountID: "account", UserID: "user", PlanType: "promax", Endpoint: endpoint,
+						SampledAt: time.Now().UnixNano(), Models: []codexauth.ManifestModel{{Slug: target, ServiceTiers: json.RawMessage(scenario.manifest)}}}
+					if scenario.oldAccount {
+						credential.ModelManifest.AccountID = "old-account"
+					}
+				}
+				var err error
+				cfg.OAuthCredential, err = credential.JSON()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			primary, err := store.CreateConfig(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario.extraURL != "" {
+				extraModel := modelID
+				extra, err := store.CreateConfig(context.Background(), &model.Config{Name: "extra", Enabled: true,
+					URLs: model.ChannelURLs{{URL: scenario.extraURL, Protocols: []string{"codex"}}}, ModelEntries: []model.ModelEntry{{Model: extraModel}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario.disableExtra {
+					server.urlSelector.DisableURL(extra.ID, extra.URLs[0].RuntimeURL())
+				}
+			}
+			server.authService = newTestAuthService(t)
+			tokenHash := model.HashToken("astra-models")
+			server.authService.authTokensMux.Lock()
+			server.authService.authTokenModels[tokenHash] = []string{modelID}
+			if scenario.denyExtra {
+				server.authService.authTokenChannels[tokenHash] = mustChannelRestriction(t, model.ChannelRestrictionModeAllow, primary.ID)
+			}
+			server.authService.authTokensMux.Unlock()
+			request := newRequest(http.MethodGet, "/v1/models?client_version=0.159.2", nil)
+			request.Header.Set("User-Agent", "codex-cli/0.159.2")
+			client, response := newTestContext(t, request)
+			client.Set("token_hash", tokenHash)
+			server.handleListOpenAIModels(client)
+			var payload struct {
+				Models []struct {
+					Slug         string          `json:"slug"`
+					ServiceTiers json.RawMessage `json:"service_tiers"`
+				} `json:"models"`
+			}
+			mustUnmarshalJSON(t, response.Body.Bytes(), &payload)
+			if response.Code != http.StatusOK || len(payload.Models) != 1 || payload.Models[0].Slug != modelID {
+				t.Fatalf("status=%d, payload=%s", response.Code, response.Body.String())
+			}
+			if scenario.want == "null" {
+				if string(payload.Models[0].ServiceTiers) != "null" {
+					t.Fatalf("service_tiers=%s, want unknown", payload.Models[0].ServiceTiers)
+				}
+				return
+			}
+			var tiers []codexauth.ServiceTier
+			mustUnmarshalJSON(t, payload.Models[0].ServiceTiers, &tiers)
+			ids := make([]string, len(tiers))
+			for i, tier := range tiers {
+				ids[i] = tier.ID
+			}
+			if strings.Join(ids, ",") != scenario.want || string(payload.Models[0].ServiceTiers) == "null" {
+				t.Fatalf("service_tiers=%s, want IDs %q", payload.Models[0].ServiceTiers, scenario.want)
+			}
+		})
+	}
+}
+
+func TestProxyGemini_CodexModelsOnlyResponsesCapable(t *testing.T) {
+	util.RestoreEmbeddedModelCatalog()
+	t.Cleanup(util.RestoreEmbeddedModelCatalog)
+	if err := util.InstallModelCatalog(&util.ModelCatalogSnapshot{
+		Version: util.ModelCatalogSchemaVersion,
+		Models: []util.ModelCatalogEntry{
+			{ID: "gpt-5.5", Provider: "openai", OutputModalities: []string{"text"}},
+			{ID: "text-embedding-3-large", Provider: "openai", Family: "text-embedding", OutputModalities: []string{"text"}},
+		},
+	}, "models.dev"); err != nil {
+		t.Fatal(err)
+	}
+
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.urlSelector = NewURLSelector()
+	ctx := context.Background()
+	compatible, err := store.CreateConfig(ctx, &model.Config{
+		Name: "codex-responses-compatible", Enabled: true,
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		URLs:                  model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"anthropic"}}},
+		ModelEntries: []model.ModelEntry{
+			{Model: "gpt-5.5"},
+			{Model: "claude-opus-5"},
+			{Model: "coding-alias", RedirectModel: "claude-opus-5"},
+			{Model: "gpt-image-2.5"},
+			{Model: "image-alias", RedirectModel: "gpt-image-2.5"},
+			{Model: "text-embedding-3-large"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	incompatible, err := store.CreateConfig(ctx, &model.Config{
+		Name: "codex-responses-incompatible", Enabled: true,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		URLs:                  model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"openai"}}},
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-unroutable"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := store.CreateConfig(ctx, &model.Config{
+		Name: "codex-responses-disabled-url", Enabled: true,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		URLs: model.ChannelURLs{
+			{URL: "https://codex.example.com", Protocols: []string{"codex"}},
+			{URL: "https://openai.example.com", Protocols: []string{"openai"}},
+		},
+		ModelEntries: []model.ModelEntry{{Model: "gpt-disabled-route"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.urlSelector.DisableURL(disabled.ID, disabled.URLs[0].RuntimeURL())
+	_, err = store.CreateConfig(ctx, &model.Config{
+		Name: "codex-responses-denied", Enabled: true,
+		ProtocolTransformMode: model.ProtocolTransformModeLocal,
+		URLs:                  model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"anthropic"}}},
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-unroutable"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server.authService = newTestAuthService(t)
+	tokenHash := model.HashToken("codex-responses-model-token")
+	server.authService.authTokensMux.Lock()
+	server.authService.authTokenChannels[tokenHash] = mustChannelRestriction(t, model.ChannelRestrictionModeAllow, compatible.ID, incompatible.ID, disabled.ID)
+	server.authService.authTokensMux.Unlock()
+
+	req := newRequest(http.MethodGet, "/v1/models?client_version=0.155.0", nil)
+	req.Header.Set("User-Agent", "codex-cli/0.155.0")
+	client, response := newTestContext(t, req)
+	client.Set("token_hash", tokenHash)
+	server.handleListOpenAIModels(client)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+	}
+	mustUnmarshalJSON(t, response.Body.Bytes(), &payload)
+	slugs := make([]string, 0, len(payload.Models))
+	for _, entry := range payload.Models {
+		slugs = append(slugs, entry.Slug)
+	}
+	if want := []string{"claude-opus-5", "coding-alias", "gpt-5.5"}; !slices.Equal(slugs, want) {
+		t.Fatalf("Codex Responses models = %v, want %v", slugs, want)
+	}
+}
 
 func TestProxyGemini_ListModelsHandlers(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)

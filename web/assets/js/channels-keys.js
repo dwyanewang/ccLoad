@@ -62,6 +62,9 @@ function normalizeInlineKeyRow(row) {
       cost_multiplier: normalizeKeyCostMultiplier(row.cost_multiplier),
       priority: Number(row.priority ?? 0)
     };
+    if (Array.isArray(row.detected_models) && row.detected_models.length > 0) {
+      normalized.detected_models = normalizeKeyAllowedModels(row.detected_models);
+    }
     if (row.model_scope_empty === true) normalized.model_scope_empty = true;
     return normalized;
   }
@@ -80,13 +83,8 @@ function pruneKeyAllowedModels(rows, configuredModels) {
       .map(entry => routingKeyModelName(typeof entry === 'string' ? entry : entry?.model).toLowerCase())
       .filter(Boolean)
   );
-  const unrestrictedCatalog = configured.has('*');
-
   return (Array.isArray(rows) ? rows : []).map(row => {
     const normalized = normalizeInlineKeyRow(row);
-    if (unrestrictedCatalog) {
-      return normalized;
-    }
     if (normalized.allowed_models.length === 0) return normalized;
     normalized.allowed_models = normalized.allowed_models.filter(model => configured.has(model.toLowerCase()));
     if (normalized.allowed_models.length === 0) normalized.model_scope_empty = true;
@@ -196,16 +194,13 @@ function selectFirstEnabledInlineKey(rows, states) {
 function selectModelsForInlineKeyTest(row, modelRows) {
   const keyRow = normalizeInlineKeyRow(row);
   const allowedModels = new Set(keyRow.allowed_models.map(name => name.toLowerCase()));
-  const configuredModels = (Array.isArray(modelRows) ? modelRows : [])
-    .filter(modelRow => modelRow && !modelRow.disabled)
-    .map(modelRow => routingKeyModelName(modelRow.model))
-    .filter(Boolean);
-  if (allowedModels.size > 0 && configuredModels.includes('*')) {
-    return [...keyRow.allowed_models];
-  }
-  return configuredModels.filter(modelName =>
-    allowedModels.size === 0 || allowedModels.has(modelName.toLowerCase())
-  );
+  const rows = (Array.isArray(modelRows) ? modelRows : []).filter(modelRow => {
+    const name = routingKeyModelName(modelRow?.model);
+    return name && (allowedModels.size === 0 || allowedModels.has(name.toLowerCase()));
+  });
+  const enabledRows = rows.filter(modelRow => !modelRow.disabled);
+  return (enabledRows.length > 0 ? enabledRows : rows)
+    .map(modelRow => routingKeyModelName(modelRow.model));
 }
 
 function updateInlineKeyHiddenInput() {
@@ -222,6 +217,7 @@ function setInlineKeyTableDataFromAPI(apiKeys) {
         api_key: item.api_key || '',
         note: item.note || '',
         allowed_models: item.allowed_models || [],
+        detected_models: item.detected_models || [],
         model_scope_empty: item.model_scope_empty === true,
         cost_multiplier: item.cost_multiplier,
         priority: item.priority
@@ -237,37 +233,51 @@ function setInlineKeyTableDataFromAPI(apiKeys) {
 let keyModelScopeEditingIndex = -1;
 let keyModelScopeTrigger = null;
 let keyModelScopeDetectionGeneration = 0;
+let keyModelScopeOpenedGeneration = 0;
 let keyModelScopeExtraModels = [];
+let keyModelScopeDetectedModels = [];
+
+function resolveKeyScopeTarget(rows, row) {
+  const redirect = String(row?.redirect_model || '').trim();
+  let target = redirect || String(row?.model || '').trim();
+  if (redirect) {
+    const enabled = rows.filter(entry => !entry?.disabled);
+    const next = enabled.find(entry => String(entry.model || '').trim() === target) ||
+      enabled.find(entry => routingKeyModelName(entry.model) === target);
+    if (next?.redirect_model) target = String(next.redirect_model).trim();
+  }
+  return routingKeyModelName(target);
+}
 
 function configuredKeyModelScopeOptions() {
   const options = [];
-  const seen = new Set();
+  const byModel = new Map();
   const rows = typeof redirectTableData !== 'undefined' && Array.isArray(redirectTableData)
     ? redirectTableData
     : [];
   for (const row of rows) {
     const modelName = routingKeyModelName(row?.model);
     const key = modelName.toLowerCase();
-    if (!modelName || modelName === '*' || seen.has(key)) continue;
-    seen.add(key);
-    options.push({
-      model: modelName,
-      upstreamModel: routingKeyModelName(row?.redirect_model || modelName),
-      disabled: Boolean(row?.disabled)
-    });
+    if (!modelName || modelName === '*') continue;
+    let option = byModel.get(key);
+    if (!option) {
+      option = { model: modelName, upstreamModels: [], disabled: true };
+      byModel.set(key, option);
+      options.push(option);
+    }
+    const upstream = resolveKeyScopeTarget(rows, row);
+    if (!option.upstreamModels.some(name => name.toLowerCase() === upstream.toLowerCase())) {
+      option.upstreamModels.push(upstream);
+    }
+    option.disabled = option.disabled && Boolean(row?.disabled);
   }
   for (const modelName of normalizeKeyAllowedModels(keyModelScopeExtraModels)) {
     const key = modelName.toLowerCase();
-    if (modelName === '*' || seen.has(key)) continue;
-    seen.add(key);
-    options.push({ model: modelName, upstreamModel: modelName, disabled: false });
+    if (modelName === '*' || byModel.has(key)) continue;
+    byModel.set(key, { model: modelName, upstreamModels: [modelName], disabled: false });
+    options.push(byModel.get(key));
   }
   return options;
-}
-
-function channelUsesWildcardModel() {
-  return typeof redirectTableData !== 'undefined' && Array.isArray(redirectTableData) &&
-    redirectTableData.some(row => String(row?.model || '').trim() === '*');
 }
 
 function setKeyModelScopeStatus(message = '', isError = false) {
@@ -337,13 +347,12 @@ function renderKeyModelScopeOptions(allowedModels, selectNone = false) {
   for (const option of configuredKeyModelScopeOptions()) {
     const label = document.createElement('label');
     label.className = 'key-model-scope-option';
-    label.dataset.searchText = `${option.model} ${option.upstreamModel}`.toLowerCase();
+    label.dataset.searchText = `${option.model} ${option.upstreamModels.join(' ')}`.toLowerCase();
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.name = 'keyAllowedModel';
     checkbox.value = option.model;
-    checkbox.dataset.upstreamModel = option.upstreamModel;
     checkbox.checked = !selectNone && (unrestricted || allowed.has(option.model.toLowerCase()));
 
     const name = document.createElement('span');
@@ -368,8 +377,9 @@ function openKeyModelScopeModal(index, trigger) {
   if (!modal || !row) return false;
 
   keyModelScopeEditingIndex = index;
-  keyModelScopeDetectionGeneration++;
+  keyModelScopeOpenedGeneration = ++keyModelScopeDetectionGeneration;
   keyModelScopeExtraModels = normalizeKeyAllowedModels(row.allowed_models);
+  keyModelScopeDetectedModels = normalizeKeyAllowedModels(row.detected_models);
   keyModelScopeTrigger = trigger || document.activeElement;
   const scopeWasEmptied = row.model_scope_empty === true;
   renderKeyModelScopeOptions(row.allowed_models, scopeWasEmptied);
@@ -406,6 +416,7 @@ function closeKeyModelScopeModal(restoreFocus = true) {
   keyModelScopeEditingIndex = -1;
   keyModelScopeDetectionGeneration++;
   keyModelScopeExtraModels = [];
+  keyModelScopeDetectedModels = [];
   keyModelScopeTrigger = null;
 }
 
@@ -424,6 +435,9 @@ function confirmKeyModelScope() {
   const index = keyModelScopeEditingIndex;
   const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
   row.allowed_models = normalizeKeyAllowedModels(allowedModels);
+  if (keyModelScopeDetectionGeneration > keyModelScopeOpenedGeneration && keyModelScopeDetectedModels.length > 0) {
+    row.detected_models = [...keyModelScopeDetectedModels];
+  }
   delete row.model_scope_empty;
   inlineKeyTableData[index] = row;
   markChannelFormDirty();
@@ -463,10 +477,16 @@ async function detectKeyModelScope() {
   }
   setKeyModelScopeStatus(window.t('channels.keyModelsDetecting'));
   try {
+    const proxyURL = String(document.getElementById?.('channelProxyURL')?.value || '').trim();
     const response = await fetchAPIWithAuth('/admin/channels/models/fetch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls, api_keys: [row.api_key], per_key: true })
+      body: JSON.stringify({
+        urls,
+        api_keys: [row.api_key],
+        per_key: true,
+        ...(proxyURL ? { proxy_url: proxyURL } : {})
+      })
     });
     if (!isCurrentDetection()) return;
     if (!response.success) throw new Error(response.error || window.t('channels.fetchModelsFailed', { error: '' }));
@@ -474,27 +494,33 @@ async function detectKeyModelScope() {
     const keyResult = Array.isArray(data.key_models) ? data.key_models[0] : null;
     if (keyResult?.error) throw new Error(keyResult.error);
     const fetchedEntries = Array.isArray(keyResult?.models) ? keyResult.models : data.models || [];
-    const fetched = new Set(fetchedEntries
+    const detectedTargets = normalizeKeyAllowedModels(fetchedEntries
       .flatMap(entry => [entry?.model, entry?.redirect_model])
-      .map(name => String(name || '').trim().toLowerCase())
-      .filter(Boolean));
+      .map(routingKeyModelName));
+    const fetched = new Set(detectedTargets.map(name => name.toLowerCase()));
 
     let matched = 0;
-    if (channelUsesWildcardModel()) {
-      const detectedModels = normalizeKeyAllowedModels(fetchedEntries.map(entry => entry?.model || entry?.redirect_model));
-      if (detectedModels.length === 0) throw new Error(window.t('channels.keyModelsDetectNoMatch'));
-      keyModelScopeExtraModels = normalizeKeyAllowedModels([...keyModelScopeExtraModels, ...detectedModels]);
-      renderKeyModelScopeOptions(detectedModels);
-      matched = detectedModels.length;
-    } else {
-      for (const checkbox of getKeyModelScopeCheckboxes()) {
-        const logical = checkbox.value.toLowerCase();
-        const upstream = String(checkbox.dataset.upstreamModel || '').toLowerCase();
-        checkbox.checked = fetched.has(logical) || fetched.has(upstream);
-        if (checkbox.checked) matched++;
+    const matchedTargets = [];
+    const checks = [];
+    const targetsByModel = new Map(configuredKeyModelScopeOptions().map(option =>
+      [option.model.toLowerCase(), option.upstreamModels]));
+    for (const checkbox of getKeyModelScopeCheckboxes()) {
+      const logical = checkbox.value.toLowerCase();
+      const upstreamModels = targetsByModel.get(logical) || [];
+      const hit = upstreamModels.some(name => fetched.has(name.toLowerCase()));
+      checks.push({ checkbox, hit });
+      if (hit) {
+        matched++;
+        matchedTargets.push(...upstreamModels.filter(name => fetched.has(name.toLowerCase())));
       }
     }
     if (matched === 0) throw new Error(window.t('channels.keyModelsDetectNoMatch'));
+    const storedTargets = normalizeKeyAllowedModels(matchedTargets);
+    if (JSON.stringify(storedTargets).length > 8000) {
+      throw new Error(window.t('channels.keyModelsDetectTooLong'));
+    }
+    for (const item of checks) item.checkbox.checked = item.hit;
+    keyModelScopeDetectedModels = storedTargets;
     const allowAll = document.getElementById('keyModelScopeAll');
     if (allowAll) allowAll.checked = false;
     syncKeyModelScopeControls();
@@ -1244,6 +1270,7 @@ function updateInlineKey(index, value) {
   if (row.api_key === nextValue) return;
 
   row.api_key = nextValue;
+  delete row.detected_models;
   inlineKeyTableData[index] = row;
   markChannelFormDirty();
   updateInlineKeyHiddenInput();
@@ -1797,6 +1824,7 @@ if (typeof module !== 'undefined' && module.exports) {
     selectModelsForInlineKeyTest,
     openKeyModelScopeModal,
     closeKeyModelScopeModal,
+    confirmKeyModelScope,
     detectKeyModelScope,
     initKeyModelScopeModalEvents,
     setVisibleKeyModelScopeChecked,

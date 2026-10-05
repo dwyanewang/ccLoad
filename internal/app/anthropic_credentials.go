@@ -142,7 +142,7 @@ func (m *anthropicCredentialManager) credentialForRejectedAccessToken(
 					return cloneAnthropicCredential(winnerCredential), nil
 				}
 			}
-			return nil, fmt.Errorf("refresh Anthropic credential for channel %d: %w", currentCfg.ID, refreshErr)
+			return nil, newCodexCredentialRefreshError(currentCfg, fmt.Errorf("refresh Anthropic credential for channel %d: %w", currentCfg.ID, refreshErr))
 		}
 		return m.persistRefreshResult(refreshCtx, currentCfg, current, refreshed)
 	})
@@ -322,6 +322,10 @@ func cloneAnthropicCredential(credential *anthropicauth.Credential) *anthropicau
 		return nil
 	}
 	clone := *credential
+	if credential.Fingerprint != nil {
+		fingerprint := *credential.Fingerprint
+		clone.Fingerprint = &fingerprint
+	}
 	clone.PassiveUsage = anthropicauth.ClonePassiveUsage(credential.PassiveUsage)
 	clone.OAuthUsage = append([]byte(nil), credential.OAuthUsage...)
 	clone.QuotaCostUsage = oauthcost.Clone(credential.QuotaCostUsage)
@@ -392,7 +396,7 @@ func (m *anthropicCredentialManager) updatePassiveUsage(
 		if err != nil {
 			return false, err
 		}
-		updated, _, err := m.store.CompareAndSwapOAuthUsage(
+		updated, err := m.store.CompareAndSwapOAuthUsage(
 			ctx, currentCfg.ID, model.AuthTypeAnthropicOAuth, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {

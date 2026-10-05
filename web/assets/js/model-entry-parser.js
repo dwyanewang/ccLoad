@@ -19,13 +19,13 @@
       const separatorIndex = entry.search(/[|｜]/);
       const model = (separatorIndex < 0 ? entry : entry.slice(0, separatorIndex)).trim();
       if (!model) continue;
-
-      const key = model.toLowerCase();
-      if (seen.has(key)) continue;
+      if (model === '*') throw modelEntryParseError('invalid_model');
 
       const redirectModel = separatorIndex < 0
         ? ''
         : entry.slice(separatorIndex + 1).trim();
+      const key = `${model.toLowerCase()}\u0000${(redirectModel || model).toLowerCase()}`;
+      if (seen.has(key)) continue;
       seen.add(key);
       result.push({ model, redirect_model: redirectModel });
     }
@@ -90,7 +90,7 @@
       if (!model) {
         throw modelEntryParseError('model_required', index);
       }
-      if (/\x00|[\r\n]/.test(model)) {
+      if (model === '*' || /\x00|[\r\n]/.test(model)) {
         throw modelEntryParseError('invalid_model', index);
       }
 
@@ -101,14 +101,15 @@
         throw modelEntryParseError('invalid_redirect_model', index);
       }
 
-      const key = model.toLowerCase();
+      const key = `${model.toLowerCase()}\u0000${(redirectModel || model).toLowerCase()}`;
       if (seen.has(key)) return;
 
       seen.add(key);
       result.push({
         model,
         redirect_model: redirectModel,
-        disabled: isObject && !isGatewayEntry && item.disabled === true
+        disabled: isObject && !isGatewayEntry && item.disabled === true,
+        ...(isObject && !isGatewayEntry && item.pricing ? { pricing: item.pricing } : {})
       });
     });
 
@@ -159,6 +160,7 @@
 
   function normalizeModelEntries(entries, options = {}) {
     const seen = new Map();
+    const spelling = new Map();
     const candidates = [];
     const result = [];
 
@@ -166,7 +168,13 @@
       const candidate = normalizedModelCandidate(entry, options);
       if (!candidate) continue;
 
-      const key = candidate.entry.model.toLowerCase();
+      const group = candidate.entry.model.toLowerCase();
+      if (!spelling.has(group)) spelling.set(group, candidate.entry.model);
+      candidate.entry.model = spelling.get(group);
+      candidate.entry.redirect_model = candidate.upstreamModel === candidate.entry.model ? '' : candidate.upstreamModel;
+      candidate.exactAliasMatch = candidate.upstreamModel === candidate.entry.model;
+
+      const key = `${candidate.entry.model.toLowerCase()}\u0000${candidate.upstreamModel.toLowerCase()}`;
       if (seen.has(key)) {
         const index = seen.get(key);
         if (preferNormalizedCandidate(candidate, candidates[index])) {

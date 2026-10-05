@@ -13,6 +13,7 @@ import (
 	"ccLoad/internal/anthropicauth"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/storage"
 	"ccLoad/internal/util"
 	"ccLoad/internal/xaiauth"
@@ -202,12 +203,20 @@ func TestOAuthChannelUpdateAcceptsStaleSyntheticKeyRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	capabilityKey := protocolCapabilityKey{
+		channelID: created.ID, baseURL: created.URLs[0].URL,
+		clientProtocol: protocol.OpenAI, requestFamily: protocol.RequestFamilyChatCompletions,
+		upstreamModel: created.ModelEntries[0].Model,
+	}
+	server.protocolCapabilities.set(capabilityKey, protocol.Codex)
+
 	// 编辑器打开后台自动刷新轮换了 AT，表单里仍是轮换前的掩码值。
 	// 合成行的 api_key 永不落库，保存必须成功且保留渠道倍率。
 	path := fmt.Sprintf("/admin/channels/%d", created.ID)
 	update := map[string]any{
 		"name": created.Name, "auth_type": model.AuthTypeXAIOAuth,
-		"urls": created.URLs, "models": created.ModelEntries, "enabled": true,
+		"protocol_transform_mode": created.ProtocolTransformMode,
+		"urls":                    created.URLs, "models": created.ModelEntries, "enabled": true,
 		"api_keys": []map[string]any{{
 			"api_key": util.MaskAPIKey("xai-access-before-rotation"), "cost_multiplier": 0.5,
 		}},
@@ -228,6 +237,9 @@ func TestOAuthChannelUpdateAcceptsStaleSyntheticKeyRow(t *testing.T) {
 	}
 	if persisted.CostMultiplier != 0.5 {
 		t.Fatalf("cost multiplier=%v, want 0.5", persisted.CostMultiplier)
+	}
+	if got, known := server.protocolCapabilities.get(capabilityKey); !known || got != protocol.Codex {
+		t.Fatalf("capability=%q known=%v after synthetic key submission, want codex", got, known)
 	}
 	storedKeys, err := store.GetAPIKeys(context.Background(), created.ID)
 	if err != nil {
@@ -517,6 +529,102 @@ func TestHandleAddAndDeleteModels(t *testing.T) {
 		}
 		if slices.ContainsFunc(available, func(key *model.APIKey) bool { return key.KeyIndex == 3 }) {
 			t.Fatalf("manually disabled key must stay excluded: %#v", available)
+		}
+	})
+}
+
+func TestHandleBatchDeleteModels(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	createChannel := func(name string, entries []model.ModelEntry) *model.Config {
+		t.Helper()
+		cfg, err := store.CreateConfig(ctx, &model.Config{
+			Name: name, URLs: model.ChannelURLs{{URL: "https://example.com"}},
+			ModelEntries: entries, Enabled: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", name, err)
+		}
+		return cfg
+	}
+
+	c1 := createChannel("batch-delete-1", []model.ModelEntry{{Model: "m1"}, {Model: "m2"}})
+	c2 := createChannel("batch-delete-2", []model.ModelEntry{{Model: "m2"}, {Model: "m3"}})
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: c1.ID, KeyIndex: 0, APIKey: "batch-delete-key", AllowedModels: []string{"m1", "m2"}},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	t.Run("invalid request", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/channels/models/batch-delete", []byte(`{"operations":[]}`)))
+		server.HandleBatchDeleteModels(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("invalid operation", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/batch-delete", map[string]any{
+			"operations": []map[string]any{{"channel_id": c1.ID}},
+		}))
+		server.HandleBatchDeleteModels(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("success with not found channel", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/models/batch-delete", map[string]any{
+			"operations": []map[string]any{
+				{"channel_id": c1.ID, "models": []string{"M1"}},
+				{"channel_id": c2.ID, "models": []string{"m3"}},
+				{"channel_id": 999999, "models": []string{"missing"}},
+			},
+		}))
+		server.HandleBatchDeleteModels(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		var resp struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Total         int     `json:"total"`
+				Updated       int     `json:"updated"`
+				Unchanged     int     `json:"unchanged"`
+				NotFound      []int64 `json:"not_found"`
+				NotFoundCount int     `json:"not_found_count"`
+			} `json:"data"`
+		}
+		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
+		if !resp.Success || resp.Data.Total != 3 || resp.Data.Updated != 2 || resp.Data.Unchanged != 0 ||
+			resp.Data.NotFoundCount != 1 || len(resp.Data.NotFound) != 1 || resp.Data.NotFound[0] != 999999 {
+			t.Fatalf("unexpected response: %+v", resp)
+		}
+
+		updated1, err := store.GetConfig(ctx, c1.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updated1.ModelEntries) != 1 || updated1.ModelEntries[0].Model != "m2" {
+			t.Fatalf("c1 models=%+v, want m2", updated1.ModelEntries)
+		}
+		updated2, err := store.GetConfig(ctx, c2.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(updated2.ModelEntries) != 1 || updated2.ModelEntries[0].Model != "m2" {
+			t.Fatalf("c2 models=%+v, want m2", updated2.ModelEntries)
+		}
+		keys, err := store.GetAPIKeys(ctx, c1.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != 1 || !slices.Equal(keys[0].AllowedModels, []string{"m2"}) {
+			t.Fatalf("c1 key scopes=%+v, want [m2]", keys)
 		}
 	})
 }
@@ -1044,7 +1152,7 @@ func TestHandleBatchPatchChannels(t *testing.T) {
 				t.Fatalf("channel %d limits=(%v, %d, %d), want (12.5, 60, 3)",
 					channelID, cfg.DailyCostLimit, cfg.RPMLimit, cfg.MaxConcurrency)
 			}
-			if len(cfg.ModelEntries) != 2 || cfg.ModelEntries[1].Model != "new-model" || cfg.ModelEntries[1].RedirectModel != "upstream-model" {
+			if len(cfg.ModelEntries) != 3 || cfg.ModelEntries[1].Model != "m" || cfg.ModelEntries[1].RedirectModel != "ignored-duplicate" || cfg.ModelEntries[2].Model != "new-model" || cfg.ModelEntries[2].RedirectModel != "upstream-model" {
 				t.Fatalf("channel %d models=%+v", channelID, cfg.ModelEntries)
 			}
 		}
@@ -1121,6 +1229,38 @@ func TestHandleBatchPatchChannels(t *testing.T) {
 			t.Fatalf("OAuth identity changed: auth_type=%q credential=%q", persistedOAuth.GetAuthType(), persistedOAuth.OAuthCredential)
 		}
 	})
+}
+
+func TestHandleBatchPatchChannelsRejectsSecondThinkingSuffixTarget(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name: "suffix-group", URLs: model.ChannelURLs{{URL: "https://suffix.example.com"}},
+		Enabled: true, Priority: 3,
+		ModelEntries: []model.ModelEntry{{Model: "foo(max)", RedirectModel: "up-a"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority := 9
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels/batch-advanced", map[string]any{
+		"channel_ids":       []int64{cfg.ID},
+		"priority":          priority,
+		"model_import_mode": model.ModelImportModeAppend,
+		"models":            []model.ModelEntry{{Model: "foo(max)", RedirectModel: "up-b"}},
+	}))
+	server.HandleBatchPatchChannels(c)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "cannot have multiple rows") {
+		t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+	got, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Priority != 3 || len(got.ModelEntries) != 1 || got.ModelEntries[0].RedirectModel != "up-a" {
+		t.Fatalf("rejected append changed channel: priority=%d models=%+v", got.Priority, got.ModelEntries)
+	}
 }
 
 func TestHandleBatchDeleteChannels(t *testing.T) {

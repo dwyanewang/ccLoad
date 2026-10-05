@@ -597,6 +597,21 @@ function isChannelDynamicPriorityVisible(ch) {
   return ch && ch.effective_priority !== undefined && ch.effective_priority !== null;
 }
 
+// 健康度动态排序开启时（存在 effective_priority）按动态优先级排序，否则按静态优先级。
+function getModelTestChannelSortPriority(ch) {
+  const value = Number(isChannelDynamicPriorityVisible(ch) ? ch.effective_priority : ch?.priority);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareModelTestChannels(a, b) {
+  return getModelTestChannelSortPriority(b) - getModelTestChannelSortPriority(a) ||
+    String(a.name || '').localeCompare(String(b.name || ''));
+}
+
+function findModelTestChannel(channelId) {
+  return channelsList.find(ch => Number(ch.id) === Number(channelId));
+}
+
 // 按模型测试行在静态优先级下方叠加显示渠道动态优先级(P_eff = priority - 失败惩罚 - TTFB 惩罚)，
 // 与渠道页 ch-priority-stack 的健康度行同一语义：健康度模式关闭(无 effective_priority)或与静态优先级
 // 一致(无惩罚)时不显示，避免叠加一个相同的数字造成噪音。
@@ -706,6 +721,7 @@ async function saveModelTestInlinePriority(input) {
     input.classList.remove('is-dirty');
     updateLocalModelTestChannelPriority(channelId, nextPriority);
     syncModelTestRowDynamicPriority(input);
+    reorderModelTestRowsByChannelPriority();
   } catch (error) {
     console.error('Update channel priority failed:', error);
     input.dataset.originalPriority = String(originalPriority);
@@ -714,6 +730,20 @@ async function saveModelTestInlinePriority(input) {
   } finally {
     input.disabled = false;
   }
+}
+
+// 优先级变更后按新的（动态）优先级重排已有行，保留测试结果与勾选状态；用户的表头排序仍优先生效。
+function reorderModelTestRowsByChannelPriority() {
+  if (testMode !== TEST_MODE_MODEL || !tbody) return;
+  const dataRows = Array.from(tbody.querySelectorAll('tr')).filter(row => !row.querySelector('td[colspan]'));
+  if (dataRows.length === 0) return;
+  dataRows
+    .map(row => ({ row, channel: findModelTestChannel(row.dataset.channelId), order: Number(row.dataset.baseOrder || 0) }))
+    .sort((a, b) => (a.channel && b.channel ? compareModelTestChannels(a.channel, b.channel) : 0) || a.order - b.order)
+    .forEach(({ row }, index) => {
+      row.dataset.baseOrder = String(index);
+    });
+  applyCurrentSort();
 }
 
 function queueModelTestPrioritySave(input, delay = 1000) {
@@ -1275,6 +1305,10 @@ function getRowSortValue(row, key) {
     case 'name':
       return row.children[1]?.textContent?.trim() || '';
     case 'priority': {
+      const channel = findModelTestChannel(row.dataset.channelId);
+      if (testMode === TEST_MODE_MODEL && isChannelDynamicPriorityVisible(channel)) {
+        return getModelTestChannelSortPriority(channel);
+      }
       const priorityInput = row.querySelector('.ch-priority-input');
       return parseNumericCellValue(priorityInput ? priorityInput.value : row.querySelector('.channel-priority')?.textContent);
     }
@@ -1565,7 +1599,7 @@ function isModelSupported(channel, modelName) {
 function getChannelsSupportingModel(modelName) {
   return channelsList
     .filter(ch => isModelSupported(ch, modelName))
-    .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name));
+    .sort(compareModelTestChannels);
 }
 
 function isExactModel(modelName) {
@@ -1579,8 +1613,8 @@ function getChannelModelPairsMatching(keyword) {
   const trimmed = String(keyword || '').trim().toLowerCase();
   if (!trimmed) return [];
   const pairs = [];
-  channelsList
-    .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
+  [...channelsList]
+    .sort(compareModelTestChannels)
     .forEach(ch => {
       (ch.models || []).forEach(entry => {
         const name = getModelName(entry);
@@ -1718,7 +1752,9 @@ function renderChannelModeRows() {
 
   const fragment = document.createDocumentFragment();
   const channelEnabled = isModelTestChannelEnabled(selectedChannel);
-  models.forEach(entry => {
+  // 默认顺序（baseOrder）按模型名称，表头排序取消后也回到名称顺序。
+  const sortedModels = [...models].sort((a, b) => compareSortValues(getModelName(a), getModelName(b)));
+  sortedModels.forEach(entry => {
     const modelName = getModelName(entry);
     if (!modelName) return;
     const modelEnabled = entry?.disabled !== true;
@@ -2481,9 +2517,7 @@ function showDeletePreviewModal(previewText, onConfirmAsync) {
 
 async function executeDeletePlan(deletePlan, progress = null) {
   const failed = [];
-  let successCount = 0;
   const totalChannelCount = deletePlan.size;
-  let completed = 0;
 
   const notifyProgress = (text) => {
     if (progress && typeof progress.setProgress === 'function') {
@@ -2503,75 +2537,99 @@ async function executeDeletePlan(deletePlan, progress = null) {
     { completed: 0, total: totalChannelCount }
   ));
 
-  for (const [channelId, modelSet] of deletePlan.entries()) {
-    const models = Array.from(modelSet);
-    if (models.length === 0) continue;
-
-    const channel = channelsList.find(ch => ch.id === channelId);
-    const channelName = channel ? channel.name : i18nText('common.unknown', '未知渠道');
-    appendLog(i18nText('modelTest.deleteProgressChannelStart', `开始处理 ${channelName}(#${channelId})`, {
-      channel_name: channelName,
-      channel_id: channelId
+  const operations = Array.from(deletePlan.entries())
+    .filter(([, modelSet]) => modelSet.size > 0)
+    .map(([channelId, modelSet]) => ({
+      channel_id: channelId,
+      models: Array.from(modelSet)
     }));
-
-    try {
-      const resp = await fetchAPIWithAuth(`/admin/channels/${channelId}/models`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ models })
-      });
-
-      if (!resp.success) {
-        failed.push({ channelId, error: resp.error || i18nText('common.deleteFailed', '删除失败') });
-        appendLog(i18nText('modelTest.deleteProgressChannelFailed', `${channelName}(#${channelId}) 删除失败`, {
-          channel_name: channelName,
-          channel_id: channelId,
-          error: resp.error || i18nText('common.deleteFailed', '删除失败')
-        }));
-        completed++;
-        notifyProgress(i18nText(
-          'modelTest.deleteProgressRunning',
-          `删除中 ${completed}/${totalChannelCount}`,
-          { completed, total: totalChannelCount }
-        ));
-        continue;
-      }
-
-      successCount++;
-      if (channel) {
-        channel.models = (channel.models || []).filter(entry => !modelSet.has(getModelName(entry)));
-      }
-      if (selectedChannel && selectedChannel.id === channelId && channel) {
-        selectedChannel = channel;
-      }
-      appendLog(i18nText('modelTest.deleteProgressChannelDone', `${channelName}(#${channelId}) 删除完成`, {
-        channel_name: channelName,
-        channel_id: channelId
-      }));
-    } catch (e) {
-      failed.push({ channelId, error: e.message || i18nText('common.deleteFailed', '删除失败') });
-      appendLog(i18nText('modelTest.deleteProgressChannelFailed', `${channelName}(#${channelId}) 删除失败`, {
-        channel_name: channelName,
-        channel_id: channelId,
-        error: e.message || i18nText('common.deleteFailed', '删除失败')
-      }));
-    }
-
-    completed++;
+  if (operations.length === 0) {
     notifyProgress(i18nText(
-      'modelTest.deleteProgressRunning',
-      `删除中 ${completed}/${totalChannelCount}`,
-      { completed, total: totalChannelCount }
+      'modelTest.deleteProgressDone',
+      `删除完成 ${totalChannelCount}/${totalChannelCount}`,
+      { completed: totalChannelCount, total: totalChannelCount }
     ));
+    return { failed, successCount: 0, totalChannelCount };
   }
 
+  appendLog(i18nText(
+    'modelTest.deleteProgressBatchStart',
+    `正在批量处理 ${operations.length} 个渠道`,
+    { total: operations.length }
+  ));
+
+  let resp;
+  try {
+    // 每个渠道的模型集合不同，使用按渠道分组的批量接口，避免串行发起 N 次 DELETE 请求。
+    resp = await fetchAPIWithAuth('/admin/channels/models/batch-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operations })
+    });
+  } catch (error) {
+    const message = error?.message || i18nText('common.deleteFailed', '删除失败');
+    operations.forEach(operation => failed.push({ channelId: operation.channel_id, error: message }));
+    appendLog(message);
+    notifyProgress(i18nText(
+      'modelTest.deleteProgressDone',
+      `删除完成 ${totalChannelCount}/${totalChannelCount}`,
+      { completed: totalChannelCount, total: totalChannelCount }
+    ));
+    return { failed, successCount: 0, totalChannelCount };
+  }
+
+  if (!resp.success) {
+    const message = resp.error || i18nText('common.deleteFailed', '删除失败');
+    operations.forEach(operation => failed.push({ channelId: operation.channel_id, error: message }));
+    appendLog(message);
+    notifyProgress(i18nText(
+      'modelTest.deleteProgressDone',
+      `删除完成 ${totalChannelCount}/${totalChannelCount}`,
+      { completed: totalChannelCount, total: totalChannelCount }
+    ));
+    return { failed, successCount: 0, totalChannelCount };
+  }
+
+  const notFoundIDs = new Set((resp.data?.not_found || []).map(channelId => Number(channelId)));
+  operations.forEach(operation => {
+    const channelId = operation.channel_id;
+    if (notFoundIDs.has(channelId)) {
+      failed.push({
+        channelId,
+        error: i18nText('channels.test.channelNotFound', '渠道不存在')
+      });
+      return;
+    }
+
+    const channel = channelsList.find(item => item.id === channelId);
+    if (!channel) return;
+    const modelSet = new Set(operation.models.map(modelName => modelName.toLowerCase()));
+    channel.models = (channel.models || []).filter(entry => {
+      const modelName = getModelName(entry);
+      return !modelName || !modelSet.has(modelName.toLowerCase());
+    });
+    if (selectedChannel && selectedChannel.id === channelId) {
+      selectedChannel = channel;
+    }
+  });
+
+  notFoundIDs.forEach(channelId => appendLog(i18nText(
+    'modelTest.deleteProgressChannelFailed',
+    `渠道 #${channelId} 删除失败`,
+    { channel_id: channelId, error: i18nText('channels.test.channelNotFound', '渠道不存在') }
+  )));
+  notifyProgress(i18nText(
+    'modelTest.deleteProgressRunning',
+    `删除中 ${totalChannelCount}/${totalChannelCount}`,
+    { completed: totalChannelCount, total: totalChannelCount }
+  ));
   notifyProgress(i18nText(
     'modelTest.deleteProgressDone',
     `删除完成 ${totalChannelCount}/${totalChannelCount}`,
     { completed: totalChannelCount, total: totalChannelCount }
   ));
 
-  return { failed, successCount, totalChannelCount };
+  return { failed, successCount: operations.length - failed.length, totalChannelCount };
 }
 
 function appendModelsToChannelCache(channel, modelEntries) {
@@ -2606,21 +2664,24 @@ function appendModelsToChannelCache(channel, modelEntries) {
 function getVisibleChannelTargetsForAdd() {
   if (testMode !== TEST_MODE_MODEL) return [];
 
-  return Array.from(document.querySelectorAll('#model-test-tbody tr[data-channel-id][data-model]'))
+  const targets = new Map();
+  Array.from(document.querySelectorAll('#model-test-tbody tr[data-channel-id][data-model]'))
     .filter(row => isDataRowVisible(row))
-    .map(row => {
+    .forEach(row => {
       const checkbox = row.querySelector('.row-checkbox');
-      if (!checkbox || !checkbox.checked) return null;
+      if (!checkbox || !checkbox.checked) return;
 
       const channelId = parseInt(row.dataset.channelId, 10);
-      if (!Number.isFinite(channelId)) return null;
+      if (!Number.isFinite(channelId) || targets.has(channelId)) return;
 
       const channel = channelsList.find(ch => ch.id === channelId);
-      if (!channel) return null;
+      if (!channel) return;
 
-      return { channelId, channel, row };
-    })
-    .filter(Boolean);
+      // 模型模式下同一渠道可能因模糊匹配出现多行；一次批量添加只需要提交一次渠道。
+      targets.set(channelId, { channelId, channel, row });
+    });
+
+  return Array.from(targets.values());
 }
 
 function formatAddFailDetails(failed, maxItems = 5) {
@@ -2629,38 +2690,63 @@ function formatAddFailDetails(failed, maxItems = 5) {
 
 async function executeAddModelsToChannels(modelEntries, targets) {
   const failed = [];
-  let successCount = 0;
-  let addedModelCount = 0;
+  if (targets.length === 0) {
+    return { failed, successCount: 0, addedModelCount: 0, totalChannelCount: 0 };
+  }
 
-  for (const target of targets) {
-    try {
-      const resp = await fetchAPIWithAuth(`/admin/channels/${target.channelId}/models`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ models: modelEntries })
-      });
+  const channelIDs = targets.map(target => target.channelId);
+  let resp;
+  try {
+    // 后端批量接口在一个事务中读取并更新所有渠道，避免 500 个渠道产生 500 次串行请求。
+    resp = await fetchAPIWithAuth('/admin/channels/batch-advanced', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel_ids: channelIDs,
+        model_import_mode: 'append',
+        models: modelEntries
+      })
+    });
+  } catch (error) {
+    const message = error?.message || i18nText('modelTest.saveModelsFailed', '保存模型失败');
+    return {
+      failed: targets.map(target => ({ channelId: target.channelId, error: message })),
+      successCount: 0,
+      addedModelCount: 0,
+      totalChannelCount: targets.length
+    };
+  }
 
-      if (!resp.success) {
-        failed.push({
-          channelId: target.channelId,
-          error: resp.error || i18nText('modelTest.saveModelsFailed', '保存模型失败')
-        });
-        continue;
-      }
+  if (!resp.success) {
+    const message = resp.error || i18nText('modelTest.saveModelsFailed', '保存模型失败');
+    return {
+      failed: targets.map(target => ({ channelId: target.channelId, error: message })),
+      successCount: 0,
+      addedModelCount: 0,
+      totalChannelCount: targets.length
+    };
+  }
 
-      successCount++;
-      addedModelCount += appendModelsToChannelCache(target.channel, modelEntries);
-    } catch (error) {
+  const notFoundIDs = new Set((resp.data?.not_found || []).map(channelID => Number(channelID)));
+  targets.forEach(target => {
+    if (notFoundIDs.has(target.channelId)) {
       failed.push({
         channelId: target.channelId,
-        error: error?.message || i18nText('modelTest.saveModelsFailed', '保存模型失败')
+        error: i18nText('channels.test.channelNotFound', '渠道不存在')
       });
     }
-  }
+  });
+
+  let addedModelCount = 0;
+  targets.forEach(target => {
+    if (!notFoundIDs.has(target.channelId)) {
+      addedModelCount += appendModelsToChannelCache(target.channel, modelEntries);
+    }
+  });
 
   return {
     failed,
-    successCount,
+    successCount: targets.length - failed.length,
     addedModelCount,
     totalChannelCount: targets.length
   };

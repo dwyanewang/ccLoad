@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ccLoad/internal/util"
 )
 
 // Channel authentication mechanisms and protocol transformation modes.
@@ -74,6 +76,13 @@ func TracksQuotaCost(authType string) bool {
 	default:
 		return false
 	}
+}
+
+// CountsTowardQuotaWindows 判断日志的标准成本是否进入周期额度账本。
+func CountsTowardQuotaWindows(authType, logSource string, cost float64, codexHasCredits bool) bool {
+	normalized := NormalizeAuthType(authType)
+	return TracksQuotaCost(normalized) && cost > 0 && logSource != LogSourceJev &&
+		(!codexHasCredits || normalized != AuthTypeCodexOAuth)
 }
 
 // UsesCodeBuddyOAuth reports whether this channel uses CodeBuddy credentials.
@@ -246,6 +255,99 @@ type ModelEntry struct {
 	Model         string `json:"model"`                    // 模型名称
 	RedirectModel string `json:"redirect_model,omitempty"` // 重定向目标模型（空表示不重定向）
 	Disabled      bool   `json:"disabled,omitempty"`       // 是否停用该渠道的此模型
+	// Pricing 是该渠道此模型的价格，整份替换系统目录与全局自定义价格；nil 表示沿用全局价格。
+	Pricing *util.CustomModelPrice `json:"pricing,omitempty"`
+}
+
+// ModelEntryIdentity identifies one configured upstream target within a request-model group.
+type ModelEntryIdentity struct {
+	Model  string
+	Target string
+}
+
+// Identity normalizes the request model and effective upstream target for deduplication.
+func (e ModelEntry) Identity() ModelEntryIdentity {
+	target := e.RedirectModel
+	if target == "" {
+		target = e.Model
+	}
+	return ModelEntryIdentity{Model: strings.ToLower(e.Model), Target: strings.ToLower(RoutingModelName(target))}
+}
+
+// ErrInvalidModelEntries 标记模型行校验失败，管理接口据此返回 400 而非 500。
+var ErrInvalidModelEntries = errors.New("invalid model entries")
+
+// ValidateModelEntries validates one channel's complete model list and returns
+// normalized copies. A request model may have several distinct upstream targets.
+func ValidateModelEntries(entries []ModelEntry) ([]ModelEntry, error) {
+	result := CloneModelEntries(entries)
+	spelling := make(map[string]string, len(result))
+	targets := make(map[string]map[string]struct{}, len(result))
+	for i := range result {
+		entry := &result[i]
+		if err := entry.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: models[%d]: %w", ErrInvalidModelEntries, i, err)
+		}
+		group := strings.ToLower(entry.Model)
+		if original, ok := spelling[group]; ok && original != entry.Model {
+			return nil, fmt.Errorf("%w: models[%d]: duplicate model %q differs in case from %q", ErrInvalidModelEntries, i, entry.Model, original)
+		}
+		spelling[group] = entry.Model
+		if entry.RedirectModel == entry.Model {
+			entry.RedirectModel = ""
+		}
+		identity := entry.Identity()
+		if targets[group] == nil {
+			targets[group] = make(map[string]struct{})
+		}
+		if _, exists := targets[group][identity.Target]; exists {
+			return nil, fmt.Errorf("%w: models[%d]: duplicate model target %q for %q", ErrInvalidModelEntries, i, entry.RedirectModel, entry.Model)
+		}
+		if len(targets[group]) > 0 && RoutingModelName(entry.Model) != entry.Model {
+			return nil, fmt.Errorf("%w: models[%d]: model %q cannot have multiple rows", ErrInvalidModelEntries, i, entry.Model)
+		}
+		targets[group][identity.Target] = struct{}{}
+	}
+	return result, nil
+}
+
+// Equal compares every persisted field, including pricing values.
+func (e ModelEntry) Equal(other ModelEntry) bool {
+	return e.Model == other.Model &&
+		e.RedirectModel == other.RedirectModel &&
+		e.Disabled == other.Disabled &&
+		e.Pricing.Equal(other.Pricing)
+}
+
+// CarryModelPricing 返回 next 的副本，未携带价格的条目沿用 previous 中同身份行的价格。
+// 用于模型列表整体替换（批量导入、上游刷新），这些入口不表达价格，不能顺手清掉已配置的渠道价格。
+func CarryModelPricing(previous, next []ModelEntry) []ModelEntry {
+	pricingByModel := make(map[ModelEntryIdentity]*util.CustomModelPrice, len(previous))
+	for _, entry := range previous {
+		if entry.Pricing != nil {
+			pricingByModel[entry.Identity()] = entry.Pricing
+		}
+	}
+	result := append([]ModelEntry(nil), next...)
+	for i := range result {
+		if result[i].Pricing == nil {
+			result[i].Pricing = pricingByModel[result[i].Identity()]
+		}
+	}
+	return result
+}
+
+// CloneModelEntries returns a deep copy, including pricing pointers.
+func CloneModelEntries(entries []ModelEntry) []ModelEntry {
+	if entries == nil {
+		return nil
+	}
+	cloned := make([]ModelEntry, len(entries))
+	for i, entry := range entries {
+		entry.Pricing = entry.Pricing.Clone()
+		cloned[i] = entry
+	}
+	return cloned
 }
 
 const (
@@ -270,6 +372,19 @@ type BatchConfigPatch struct {
 
 // BatchConfigPatchResult 汇总一次原子批量更新的结果。
 type BatchConfigPatchResult struct {
+	Updated   int
+	Unchanged int
+	NotFound  []int64
+}
+
+// BatchModelDeleteOperation 描述一个渠道需要删除的模型集合。
+type BatchModelDeleteOperation struct {
+	ChannelID int64
+	Models    []string
+}
+
+// BatchModelDeleteResult 汇总一次批量模型删除的结果。
+type BatchModelDeleteResult struct {
 	Updated   int
 	Unchanged int
 	NotFound  []int64
@@ -336,21 +451,9 @@ func (p BatchConfigPatch) Normalize() (BatchConfigPatch, error) {
 		return BatchConfigPatch{}, errors.New("models cannot be empty")
 	}
 
-	seenModels := make(map[string]struct{}, len(p.ModelEntries))
-	normalizedModels := make([]ModelEntry, len(p.ModelEntries))
-	for i, entry := range p.ModelEntries {
-		if err := entry.Validate(); err != nil {
-			return BatchConfigPatch{}, fmt.Errorf("models[%d]: %w", i, err)
-		}
-		if entry.RedirectModel == entry.Model {
-			entry.RedirectModel = ""
-		}
-		key := strings.ToLower(entry.Model)
-		if _, ok := seenModels[key]; ok {
-			return BatchConfigPatch{}, fmt.Errorf("duplicate model %q", entry.Model)
-		}
-		seenModels[key] = struct{}{}
-		normalizedModels[i] = entry
+	normalizedModels, err := ValidateModelEntries(p.ModelEntries)
+	if err != nil {
+		return BatchConfigPatch{}, err
 	}
 	p.ModelEntries = normalizedModels
 	return p, nil
@@ -364,6 +467,9 @@ func (e *ModelEntry) Validate() error {
 	if e.Model == "" {
 		return errors.New("model cannot be empty")
 	}
+	if e.Model == "*" {
+		return errors.New("wildcard model is not supported")
+	}
 	if strings.ContainsAny(e.Model, "\x00\r\n") {
 		return errors.New("model contains illegal characters")
 	}
@@ -371,6 +477,13 @@ func (e *ModelEntry) Validate() error {
 	e.RedirectModel = strings.TrimSpace(e.RedirectModel)
 	if strings.ContainsAny(e.RedirectModel, "\x00\r\n") {
 		return errors.New("redirect_model contains illegal characters")
+	}
+	if e.Pricing.IsEmpty() {
+		e.Pricing = nil
+		return nil
+	}
+	if _, err := e.Pricing.ModelPricing(); err != nil {
+		return fmt.Errorf("pricing: %w", err)
 	}
 	return nil
 }
@@ -554,12 +667,14 @@ type Config struct {
 
 	// OAuthCredential is the private CLIProxy-compatible OAuth JSON stored in
 	// the channels table. It must never be serialized by an API response.
-	OAuthCredential        string `json:"-"`
-	CodexAccessToken       string `json:"-"`
-	CodexAccountID         string `json:"-"`
-	CodexAccountFedRAMP    bool   `json:"-"`
-	AntigravityAccessToken string `json:"-"`
-	AntigravityProjectID   string `json:"-"`
+	OAuthCredential        string    `json:"-"`
+	CodexAccessToken       string    `json:"-"`
+	CodexAccountID         string    `json:"-"`
+	CodexUserID            string    `json:"-"`
+	CodexQuotaEpochAt      time.Time `json:"-"`
+	CodexAccountFedRAMP    bool      `json:"-"`
+	AntigravityAccessToken string    `json:"-"`
+	AntigravityProjectID   string    `json:"-"`
 	// ZAIDeviceID is the ZCode device fingerprint reported in metadata.user_id.
 	ZAIDeviceID string `json:"-"`
 
@@ -573,8 +688,8 @@ type Config struct {
 	CooldownFallback bool `json:"-"`
 
 	// 模型查找索引（懒加载，不序列化）
-	modelIndex map[string]*ModelEntry `json:"-"`
-	indexMu    sync.RWMutex           `json:"-"` // 保护索引的并发访问
+	modelIndex map[string][]*ModelEntry `json:"-"`
+	indexMu    sync.RWMutex             `json:"-"` // 保护索引的并发访问
 }
 
 // Clone 返回 Config 的深拷贝。
@@ -613,6 +728,8 @@ func (c *Config) Clone() *Config {
 		OAuthCredential:               c.OAuthCredential,
 		CodexAccessToken:              c.CodexAccessToken,
 		CodexAccountID:                c.CodexAccountID,
+		CodexUserID:                   c.CodexUserID,
+		CodexQuotaEpochAt:             c.CodexQuotaEpochAt,
 		CodexAccountFedRAMP:           c.CodexAccountFedRAMP,
 		AntigravityAccessToken:        c.AntigravityAccessToken,
 		AntigravityProjectID:          c.AntigravityProjectID,
@@ -622,10 +739,7 @@ func (c *Config) Clone() *Config {
 		KeyCount:                      c.KeyCount,
 		CooldownFallback:              c.CooldownFallback,
 	}
-	if c.ModelEntries != nil {
-		dst.ModelEntries = make([]ModelEntry, len(c.ModelEntries))
-		copy(dst.ModelEntries, c.ModelEntries)
-	}
+	dst.ModelEntries = CloneModelEntries(c.ModelEntries)
 	return dst
 }
 
@@ -787,12 +901,13 @@ func (c *Config) buildIndexIfNeeded() {
 	if c.modelIndex != nil {
 		return
 	}
-	c.modelIndex = make(map[string]*ModelEntry, len(c.ModelEntries))
+	c.modelIndex = make(map[string][]*ModelEntry, len(c.ModelEntries))
 	for i := range c.ModelEntries {
 		if c.ModelEntries[i].Disabled {
 			continue
 		}
-		c.modelIndex[c.ModelEntries[i].Model] = &c.ModelEntries[i]
+		name := c.ModelEntries[i].Model
+		c.modelIndex[name] = append(c.modelIndex[name], &c.ModelEntries[i])
 	}
 	// 条目字面写成 gpt-5.6-luna(max) 时，选路用的基名也必须命中它，否则模型列表里
 	// 看得到却路由不到。显式配置的基名条目优先，不被别名覆盖。
@@ -805,19 +920,39 @@ func (c *Config) buildIndexIfNeeded() {
 			continue
 		}
 		if _, exists := c.modelIndex[base]; !exists {
-			c.modelIndex[base] = &c.ModelEntries[i]
+			c.modelIndex[base] = []*ModelEntry{&c.ModelEntries[i]}
 		}
 	}
 }
 
-// GetRedirectModel 获取模型的重定向目标
-// 返回 (目标模型, 是否有重定向)
-func (c *Config) GetRedirectModel(model string) (string, bool) {
+// EnabledModelEntries returns the enabled rows for an exact model or its
+// thinking-suffix alias, preserving the channel's configured order.
+func (c *Config) EnabledModelEntries(name string) []ModelEntry {
+	if c == nil {
+		return nil
+	}
 	c.buildIndexIfNeeded()
 	c.indexMu.RLock()
 	defer c.indexMu.RUnlock()
-	if entry, exists := c.modelIndex[model]; exists && entry.RedirectModel != "" {
-		return entry.RedirectModel, true
+	indexed := c.modelIndex[name]
+	entries := make([]ModelEntry, len(indexed))
+	for i, entry := range indexed {
+		entries[i] = *entry
+	}
+	return entries
+}
+
+// GetRedirectModel returns the first enabled row's redirect for a model name.
+// Chained routing uses one additional lookup without advancing that model group's cursor.
+func (c *Config) GetRedirectModel(name string) (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.buildIndexIfNeeded()
+	c.indexMu.RLock()
+	defer c.indexMu.RUnlock()
+	if entries := c.modelIndex[name]; len(entries) > 0 && entries[0].RedirectModel != "" {
+		return entries[0].RedirectModel, true
 	}
 	return "", false
 }
@@ -827,11 +962,8 @@ func (c *Config) SupportsModel(model string) bool {
 	c.buildIndexIfNeeded()
 	c.indexMu.RLock()
 	defer c.indexMu.RUnlock()
-	if _, exists := c.modelIndex[model]; exists {
-		return true
-	}
-	_, wildcard := c.modelIndex["*"]
-	return wildcard
+	_, exists := c.modelIndex[model]
+	return exists
 }
 
 // IsCoolingDown 检查渠道是否处于冷却状态
@@ -858,6 +990,7 @@ type APIKey struct {
 	APIKey          string   `json:"api_key"`
 	Note            string   `json:"note"`
 	AllowedModels   []string `json:"allowed_models,omitempty"`    // 空表示该 Key 不限制模型
+	DetectedModels  []string `json:"detected_models,omitempty"`   // 最近一次模型探测确认的上游模型；空表示尚未探测
 	ModelScopeEmpty bool     `json:"model_scope_empty,omitempty"` // true 表示该 Key 当前不允许任何模型
 
 	Priority    int    `json:"priority"`     // 数值越大越优先，仅在渠道内比较
@@ -879,6 +1012,7 @@ type APIKey struct {
 // APIKeyModelScope is the persisted model authorization state for one API key.
 type APIKeyModelScope struct {
 	AllowedModels   []string
+	DetectedModels  []string
 	ModelScopeEmpty bool
 	Disabled        bool
 }
@@ -900,6 +1034,24 @@ func (k *APIKey) AllowsModel(modelName string) bool {
 	}
 	for _, allowed := range k.AllowedModels {
 		if strings.EqualFold(RoutingModelName(allowed), modelName) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowsUpstreamModel applies the last successful model discovery to the
+// selected row's final upstream model. Keys without discovery data stay usable.
+func (k *APIKey) AllowsUpstreamModel(actual string) bool {
+	if k == nil {
+		return false
+	}
+	actual = RoutingModelName(actual)
+	if len(k.DetectedModels) == 0 || actual == "" || actual == "*" {
+		return true
+	}
+	for _, detected := range k.DetectedModels {
+		if strings.EqualFold(RoutingModelName(detected), RoutingModelName(actual)) {
 			return true
 		}
 	}

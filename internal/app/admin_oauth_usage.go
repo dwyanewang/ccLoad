@@ -196,7 +196,12 @@ type oauthUsageWindow struct {
 }
 
 type oauthUsageSummary struct {
-	Credits *antigravityauth.Credits `json:"credits,omitempty"`
+	// 请求元数据来自实际使用的凭证，不持久化，也不暴露给客户端。
+	codexAccountID   string
+	codexRequestedAt time.Time
+	// UpstreamPlanType 是上游原始套餐，持久化用于比较，也随管理 API 响应返回。
+	UpstreamPlanType string                   `json:"upstream_plan_type,omitempty"`
+	Credits          *antigravityauth.Credits `json:"credits,omitempty"`
 	// CodeBuddyCredits is the absolute remaining balance returned by the
 	// billing meter. CodeBuddy does not expose a percentage window like the
 	// other OAuth providers, so retain the provider-native value.
@@ -209,12 +214,13 @@ type oauthUsageSummary struct {
 	EntitlementStatus     string                  `json:"entitlement_status,omitempty"`
 	Windows               []oauthUsageWindow      `json:"windows"`
 	RateLimitResetCredits *codexQuotaResetCredits `json:"rate_limit_reset_credits,omitempty"`
+	AnthropicResetCredits *anthropicResetCredits  `json:"anthropic_reset_credits,omitempty"`
 	Warnings              []string                `json:"warnings,omitempty"`
 	// DisplayMessage 是上游账单状态文案（例如 Cursor 的额度用尽提示），
 	// 不是采样失败。前端单独渲染，不得塞进 Warnings。
-	DisplayMessage string             `json:"display_message,omitempty"`
-	XAIBilling     *xaiBillingSummary `json:"xai_billing,omitempty"`
-	QuotaCostUsage *oauthcost.Usage   `json:"quota_cost_usage,omitempty"`
+	DisplayMessage string              `json:"display_message,omitempty"`
+	XAIBilling     *xaiBillingSummary  `json:"xai_billing,omitempty"`
+	QuotaCostUsage *oauthcost.CostView `json:"quota_cost_usage,omitempty"`
 }
 
 type codeBuddyCredits = codebuddyauth.ResourceUsage
@@ -444,9 +450,10 @@ func normalizeCodexUsage(payload *codexUsagePayload, fallbackPlanType string) (*
 		return nil, errors.New("usage: Codex response is invalid")
 	}
 	summary := &oauthUsageSummary{
-		Provider: codexauth.ChannelType,
-		PlanType: strings.TrimSpace(payload.PlanType),
-		Windows:  make([]oauthUsageWindow, 0, 2+2*len(payload.AdditionalRateLimits)),
+		Provider:         codexauth.ChannelType,
+		PlanType:         strings.TrimSpace(payload.PlanType),
+		UpstreamPlanType: strings.TrimSpace(payload.PlanType),
+		Windows:          make([]oauthUsageWindow, 0, 2+2*len(payload.AdditionalRateLimits)),
 	}
 	if summary.PlanType == "" {
 		summary.PlanType = strings.TrimSpace(fallbackPlanType)
@@ -688,6 +695,7 @@ func requestCodexUsage(ctx context.Context, client *http.Client, credential *cod
 		return nil, errors.New("usage: Codex request is unavailable")
 	}
 
+	requestedAt := time.Now().UTC()
 	body, err := executeOAuthUsageRequest(client, req, "Codex")
 	if err != nil {
 		return nil, err
@@ -700,6 +708,7 @@ func requestCodexUsage(ctx context.Context, client *http.Client, credential *cod
 	if err != nil {
 		return nil, err
 	}
+	summary.codexAccountID, summary.codexRequestedAt = credential.AccountID, requestedAt
 	usageSampledAt := time.Now().UTC()
 	for i := range summary.Windows {
 		summary.Windows[i].SampledAt = usageSampledAt
@@ -760,10 +769,17 @@ func requestAnthropicUsage(
 		baseURL = anthropicauth.DefaultUpstreamURL
 	}
 	usageURL := buildUpstreamURL(baseURL, "/api/oauth/usage", "")
+	queryResetCredits := anthropicResetHasProfileScope(credential.Scope)
+	if queryResetCredits {
+		usageURL += "?cedar_ember=1"
+	}
 	profileURL := buildUpstreamURL(baseURL, "/api/oauth/profile", "")
 	usageRequest, err := newAnthropicOAuthMetadataRequest(ctx, usageURL, credential.AccessToken, true)
 	if err != nil {
 		return nil, anthropicCredentialMetadata{}, errors.New("usage: Anthropic request is unavailable")
+	}
+	if queryResetCredits {
+		setAnthropicResetHeaders(usageRequest)
 	}
 	usageBody, err := executeOAuthUsageRequest(client, usageRequest, "Anthropic")
 	if err != nil {
@@ -778,6 +794,14 @@ func requestAnthropicUsage(
 		return nil, anthropicCredentialMetadata{}, err
 	}
 	usageSampledAt := time.Now().UTC()
+	if queryResetCredits {
+		resetBlock, resetErr := parseAnthropicResetBlock(usageBody)
+		if resetErr != nil {
+			summary.Warnings = append(summary.Warnings, "Anthropic reset credits unavailable")
+		} else {
+			summary.AnthropicResetCredits = projectAnthropicResetCredits(resetBlock, usageSampledAt)
+		}
+	}
 	for i := range summary.Windows {
 		summary.Windows[i].SampledAt = usageSampledAt
 	}
@@ -1605,6 +1629,11 @@ func (s *Server) persistOAuthUsage(
 		return summary, nil
 	}
 
+	// 凭证刷新可能先开纪元；采用刷新完成后真正发出的额度请求时间。
+	if !summary.codexRequestedAt.IsZero() {
+		requestedAt = summary.codexRequestedAt
+	}
+
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -1622,15 +1651,45 @@ func (s *Server) persistOAuthUsage(
 			return nil, errors.New("OAuth credential changed provider while persisting usage")
 		}
 		persisted, _, persistedRequestAt := persistedOAuthUsage(state.oauthUsage, summary.Provider)
+		if state.restartQuotaEpoch != nil {
+			epoch := state.quotaCostUsage.EpochTime()
+			stale := requestedAt.Before(epoch) || sampledAt.Before(epoch) ||
+				(summary.codexAccountID != "" && summary.codexAccountID != state.accountID)
+			for _, window := range summary.Windows {
+				if !window.SampledAt.IsZero() && window.SampledAt.Before(epoch) {
+					stale = true
+				}
+			}
+			if stale {
+				// 必须在每次 CAS 重试检查；重新读取状态不代表旧采样也变新。
+				if persisted != nil {
+					return attachOAuthQuotaCostUsage(persisted, s.oauthQuotaCostView(ctx, currentCfg.ID, state, time.Now())), nil
+				}
+				return nil, errors.New("usage: Codex quota epoch changed during request")
+			}
+		}
 		if persisted != nil && !persistedRequestAt.Before(requestedAt) {
 			s.invalidateOAuthCredential(currentCfg.ID, summary.Provider)
 			s.InvalidateChannelListCache()
-			return attachOAuthQuotaCostUsage(persisted, state.quotaCostUsage), nil
+			return attachOAuthQuotaCostUsage(persisted, s.oauthQuotaCostView(ctx, currentCfg.ID, state, time.Now())), nil
 		}
 
+		baseCostUsage := state.quotaCostUsage
+		if state.restartQuotaEpoch != nil && persisted != nil &&
+			persisted.UpstreamPlanType != "" && summary.UpstreamPlanType != "" &&
+			!strings.EqualFold(persisted.UpstreamPlanType, summary.UpstreamPlanType) {
+			// 辅助 reset credits 请求不能把额度采样的实际时间向后挪。
+			changedAt := sampledAt
+			for _, window := range summary.Windows {
+				if !window.SampledAt.IsZero() && window.SampledAt.Before(changedAt) {
+					changedAt = window.SampledAt
+				}
+			}
+			baseCostUsage = state.restartQuotaEpoch(changedAt)
+		}
 		var nextQuotaCostUsage *oauthcost.Usage
 		if state.tracksQuotaCost() {
-			nextQuotaCostUsage = reconcileOAuthQuotaCostUsage(state.quotaCostUsage, summary, sampledAt)
+			nextQuotaCostUsage = reconcileOAuthQuotaCostUsage(baseCostUsage, summary, sampledAt)
 		}
 		storedSummary := *summary
 		storedSummary.QuotaCostUsage = nil
@@ -1649,7 +1708,7 @@ func (s *Server) persistOAuthUsage(
 		if len(payload) > maxOAuthCredentialBytes {
 			return nil, errors.New("OAuth credential exceeds persistence limit")
 		}
-		updated, persistedCosts, err := s.store.CompareAndSwapOAuthUsage(
+		updated, err := s.store.CompareAndSwapOAuthUsage(
 			ctx, currentCfg.ID, state.authType, currentCfg.OAuthCredential, payload,
 		)
 		if err != nil {
@@ -1664,7 +1723,12 @@ func (s *Server) persistOAuthUsage(
 
 		s.invalidateOAuthCredential(currentCfg.ID, summary.Provider)
 		s.InvalidateChannelListCache()
-		return attachOAuthQuotaCostUsage(summary, persistedCosts), nil
+		// 在 CAS 之外求和：窗口已按 sampledAt 对齐，求和时刻与持久化边界一致。
+		var costs *oauthcost.CostView
+		if nextQuotaCostUsage != nil {
+			costs = s.loadOAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{currentCfg.ID: nextQuotaCostUsage}, sampledAt)[currentCfg.ID]
+		}
+		return attachOAuthQuotaCostUsage(summary, costs), nil
 	}
 }
 
@@ -1731,6 +1795,7 @@ func latestOAuthUsage(
 		}
 		merged := *passive
 		merged.RateLimitResetCredits = cloneCodexQuotaResetCredits(active.RateLimitResetCredits)
+		merged.AnthropicResetCredits = active.AnthropicResetCredits
 		return &merged
 	}
 	return active
@@ -1800,9 +1865,7 @@ func mergeLatestCodexOAuthUsage(active *oauthUsageSummary, activeSampledAt time.
 				}
 				window.LimitWindowSeconds = passiveWindow.LimitWindowSeconds
 				window.ResetAt = passiveWindow.ResetAt
-			} else if !oauthQuotaCostMatchesSampledWindow(passiveWindow, &oauthcost.Window{
-				WindowSeconds: window.LimitWindowSeconds, ResetAt: window.ResetAt,
-			}) {
+			} else if !oauthQuotaCostMatchesSampledWindow(passiveWindow, window.LimitWindowSeconds, window.ResetAt) {
 				// A completed official period cannot pin the display forever.
 				// Accept a forward rollover only once both periods' boundaries
 				// and the passive sample prove the new period is current.

@@ -136,6 +136,9 @@ func ApplyCredentialHeaders(h http.Header, c *Credential) {
 	base := BaseURL
 	if c != nil {
 		base = c.Endpoint()
+		if c.IsInternational() {
+			base = ChatBaseURL(c)
+		}
 	}
 	ApplySourceHeadersForBaseURL(h, base)
 	h.Set("Authorization", "Bearer "+c.AccessToken)
@@ -296,6 +299,9 @@ func (s *Service) billingBaseURL() string {
 }
 
 func (s *Service) credentialBaseURL(c *Credential) string {
+	if c != nil && c.IsInternational() {
+		return ChatBaseURL(c)
+	}
 	if c != nil && strings.TrimSpace(c.BaseURL) != "" {
 		return c.Endpoint()
 	}
@@ -306,6 +312,9 @@ func (s *Service) credentialBaseURL(c *Credential) string {
 }
 
 func (s *Service) billingBaseURLForCredential(c *Credential) string {
+	if c != nil && c.IsInternational() {
+		return ChatBaseURL(c)
+	}
 	if c != nil && strings.TrimSpace(c.BaseURL) != "" {
 		return c.Endpoint()
 	}

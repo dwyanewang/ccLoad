@@ -845,6 +845,25 @@ func relayZedResponsesEvents(ctx context.Context, upstream io.ReadCloser, output
 	defer func() { _ = upstream.Close() }()
 	reader := bufio.NewReader(upstream)
 	state := &zedRelayState{}
+	if plan.providerProtocol != protocol.Codex {
+		if _, err := registry.TranslateResponseStream(ctx, plan.providerProtocol, protocol.Codex,
+			plan.model, plan.originalRequest, plan.translatedRequest, nil, &state.transform); err != nil {
+			_ = output.CloseWithError(err)
+			return
+		}
+	}
+	finish := func() error {
+		if state.failed {
+			return nil
+		}
+		chunks, err := protocol.FinalizeResponseToolInput(state.transform)
+		for _, chunk := range chunks {
+			if _, writeErr := output.Write(chunk); writeErr != nil {
+				return writeErr
+			}
+		}
+		return err
+	}
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		line = bytes.TrimSpace(line)
@@ -858,13 +877,13 @@ func relayZedResponsesEvents(ctx context.Context, upstream io.ReadCloser, output
 				return
 			}
 			if ended {
-				_ = output.Close()
+				_ = output.CloseWithError(finish())
 				return
 			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				_ = output.Close()
+				_ = output.CloseWithError(finish())
 			} else {
 				_ = output.CloseWithError(readErr)
 			}
@@ -877,6 +896,7 @@ type zedRelayState struct {
 	transform           any
 	failed              bool
 	unknownStatusLogged bool
+	geminiFinished      bool
 	anthropicStarted    bool
 	anthropicStopped    bool
 	anthropicToolUse    bool
@@ -917,8 +937,13 @@ func writeZedResponsesEvent(
 			}
 			return false, nil
 		}
-		if plan.providerProtocol == protocol.Anthropic {
+		switch plan.providerProtocol {
+		case protocol.Anthropic:
 			if err := finishZedAnthropicStream(ctx, output, plan, registry, state); err != nil {
+				return false, err
+			}
+		case protocol.Gemini:
+			if err := finishZedGeminiStream(ctx, output, plan, registry, state); err != nil {
 				return false, err
 			}
 		}
@@ -1029,7 +1054,38 @@ func writeZedProviderEvent(
 			state.anthropicOpenIndex = nil
 		}
 	}
+	if plan.providerProtocol == protocol.Gemini && gjson.GetBytes(event, "candidates.0.finishReason").String() != "" {
+		state.geminiFinished = true
+	}
 	return translateZedProviderEvent(ctx, output, event, plan, registry, state)
+}
+
+// finishZedGeminiStream 在 stream_ended 时为已给出 finishReason 的 Gemini 流补喂
+// [DONE]：转换器在 finishReason 后等 usage 或 [DONE] 才发终态，末帧不带
+// usageMetadata 时只能靠这里收尾。没有 finishReason 的流不补，截断必须保持可见。
+func finishZedGeminiStream(
+	ctx context.Context,
+	output io.Writer,
+	plan *zedWirePlan,
+	registry *protocol.Registry,
+	state *zedRelayState,
+) error {
+	if state.failed || !state.geminiFinished {
+		return nil
+	}
+	chunks, err := registry.TranslateResponseStream(
+		ctx, plan.providerProtocol, protocol.Codex, plan.model,
+		plan.originalRequest, plan.translatedRequest, sseSynthesizedDoneEvent, &state.transform,
+	)
+	for _, chunk := range chunks {
+		if _, writeErr := output.Write(chunk); writeErr != nil {
+			return writeErr
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("translate Zed %s response: %w", plan.provider, err)
+	}
+	return nil
 }
 
 func finishZedAnthropicStream(
@@ -1080,13 +1136,13 @@ func translateZedProviderEvent(
 		ctx, plan.providerProtocol, protocol.Codex, plan.model,
 		plan.originalRequest, plan.translatedRequest, framed, &state.transform,
 	)
-	if err != nil {
-		return fmt.Errorf("translate Zed %s response: %w", plan.provider, err)
-	}
 	for _, chunk := range chunks {
 		if _, err := output.Write(chunk); err != nil {
 			return err
 		}
+	}
+	if err != nil {
+		return fmt.Errorf("translate Zed %s response: %w", plan.provider, err)
 	}
 	return nil
 }

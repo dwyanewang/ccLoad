@@ -1,5 +1,17 @@
 package schema
 
+// DefineOAuthQuotaCostLedgerTable 定义独立于日志保留期的 OAuth 周期额度成本账本。
+func DefineOAuthQuotaCostLedgerTable() *TableBuilder {
+	return NewTable("oauth_quota_cost_ledger").
+		Column("channel_id INT NOT NULL").
+		Column("bucket_at BIGINT NOT NULL").
+		Column("model VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL").
+		Column("window_key VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''").
+		Column("cost_microusd BIGINT NOT NULL").
+		Column("PRIMARY KEY (channel_id, bucket_at, model, window_key)").
+		Index("idx_oauth_quota_cost_ledger_bucket", "bucket_at")
+}
+
 // DefineChannelsTable 定义channels表结构
 func DefineChannelsTable() *TableBuilder {
 	return NewTable("channels").
@@ -46,6 +58,7 @@ func DefineAPIKeysTable() *TableBuilder {
 		Column("api_key VARCHAR(255) NOT NULL").
 		Column("note VARCHAR(512) NOT NULL DEFAULT ''").
 		Column("allowed_models VARCHAR(2000) NOT NULL DEFAULT ''").
+		Column("detected_models TEXT"). // 可空 TEXT：MySQL utf8mb4 下两个 VARCHAR(8000) 会超过 65535 行长上限
 		Column("model_scope_empty TINYINT NOT NULL DEFAULT 0").
 		Column("key_strategy VARCHAR(32) NOT NULL DEFAULT 'sequential'").
 		Column("cooldown_until BIGINT NOT NULL DEFAULT 0").
@@ -67,6 +80,8 @@ func DefineChannelModelsTable() *TableBuilder {
 		Column("model VARCHAR(191) NOT NULL").
 		Column("redirect_model VARCHAR(191) NOT NULL DEFAULT ''"). // 重定向目标模型（空表示不重定向）
 		Column("disabled TINYINT NOT NULL DEFAULT 0").
+		Column("pricing TEXT").        // 渠道模型价格 JSON（NULL 表示沿用全局价格）
+		Column("model_variants TEXT"). // 同名模型的完整有序配置；NULL 表示单行
 		Column("created_at BIGINT NOT NULL DEFAULT 0").
 		Column("PRIMARY KEY (channel_id, model)").
 		Column("FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE").
@@ -184,6 +199,7 @@ func DefineLogsTable() *TableBuilder {
 		Column("duration DOUBLE NOT NULL DEFAULT 0.0").
 		Column("is_streaming TINYINT NOT NULL DEFAULT 0").
 		Column("upstream_websocket TINYINT NOT NULL DEFAULT 0").
+		Column("codex_has_credits TINYINT NOT NULL DEFAULT 0").
 		Column("first_byte_time DOUBLE NOT NULL DEFAULT 0.0").
 		Column("api_key_used VARCHAR(191) NOT NULL DEFAULT ''").
 		Column("api_key_hash VARCHAR(64) NOT NULL DEFAULT ''"). // API Key SHA256（用于精确定位 key_index）

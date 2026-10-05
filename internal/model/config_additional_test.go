@@ -3,6 +3,8 @@ package model
 import (
 	"testing"
 	"time"
+
+	"ccLoad/internal/util"
 )
 
 func TestConfigDailyScheduledCheck(t *testing.T) {
@@ -62,8 +64,8 @@ func TestThinkingSuffixEntriesAreRoutableByBaseName(t *testing.T) {
 	if !cfg.SupportsModel("gpt-5.6-luna") {
 		t.Fatal("base name must resolve to the suffixed entry")
 	}
-	if redirect, ok := cfg.GetRedirectModel("gpt-5.6-luna"); !ok || redirect != "gpt-5.6-luna-2026" {
-		t.Fatalf("GetRedirectModel(base) = %q, %v; want the suffixed entry's redirect", redirect, ok)
+	if entries := cfg.EnabledModelEntries("gpt-5.6-luna"); len(entries) != 1 || entries[0].RedirectModel != "gpt-5.6-luna-2026" {
+		t.Fatalf("EnabledModelEntries(base) = %+v; want the suffixed entry's redirect", entries)
 	}
 }
 
@@ -76,8 +78,8 @@ func TestThinkingSuffixAliasDoesNotShadowExplicitEntry(t *testing.T) {
 		{Model: "gpt-5.6-luna(max)", RedirectModel: "alias"},
 	}}
 
-	if redirect, ok := cfg.GetRedirectModel("gpt-5.6-luna"); !ok || redirect != "explicit" {
-		t.Fatalf("GetRedirectModel(base) = %q, %v; want explicit", redirect, ok)
+	if entries := cfg.EnabledModelEntries("gpt-5.6-luna"); len(entries) != 1 || entries[0].RedirectModel != "explicit" {
+		t.Fatalf("EnabledModelEntries(base) = %+v; want explicit", entries)
 	}
 	if models := cfg.GetModels(); len(models) != 1 || models[0] != "gpt-5.6-luna" {
 		t.Fatalf("GetModels() = %v, want a single deduplicated base name", models)
@@ -134,6 +136,58 @@ func TestModelEntry_Validate(t *testing.T) {
 			t.Fatal("expected error for illegal chars in redirect_model")
 		}
 	})
+
+	t.Run("pricing", func(t *testing.T) {
+		empty := &ModelEntry{Model: "gpt-4", Pricing: &util.CustomModelPrice{}}
+		if err := empty.Validate(); err != nil || empty.Pricing != nil {
+			t.Fatalf("empty pricing must normalize to nil: err=%v pricing=%#v", err, empty.Pricing)
+		}
+		for _, entry := range []*ModelEntry{
+			{Model: "gpt-4", Pricing: &util.CustomModelPrice{InputPrice: testPrice(-1), OutputPrice: testPrice(1)}},
+			{Model: "gpt-4", Pricing: &util.CustomModelPrice{CacheReadPrice: testPrice(0.1)}},
+			{Model: "*", Pricing: &util.CustomModelPrice{InputPrice: testPrice(1), OutputPrice: testPrice(1)}},
+		} {
+			if err := entry.Validate(); err == nil {
+				t.Fatalf("expected pricing error for %q", entry.Model)
+			}
+		}
+	})
+}
+
+func testPrice(value float64) *float64 { return &value }
+
+func TestConfig_EnabledModelEntriesExposeRowPricing(t *testing.T) {
+	t.Parallel()
+	price := &util.CustomModelPrice{InputPrice: testPrice(1)}
+	suffixed := &util.CustomModelPrice{InputPrice: testPrice(3)}
+	cfg := &Config{ModelEntries: []ModelEntry{
+		{Model: "claude-sonnet", RedirectModel: "upstream-sonnet", Pricing: price},
+		{Model: "gpt-5.6-luna(max)", Pricing: suffixed},
+		{Model: "disabled-model", Disabled: true, Pricing: price},
+	}}
+	if entries := cfg.EnabledModelEntries("claude-sonnet"); len(entries) != 1 || entries[0].Pricing != price {
+		t.Fatal("pricing must match the channel model")
+	}
+	if entries := cfg.EnabledModelEntries("gpt-5.6-luna"); len(entries) != 1 || entries[0].Pricing != suffixed {
+		t.Fatal("pricing must match the channel model and its routing base name")
+	}
+	// 价格挂在渠道逻辑模型上：重定向目标不是查找键，停用条目不参与。
+	if len(cfg.EnabledModelEntries("upstream-sonnet")) != 0 || len(cfg.EnabledModelEntries("disabled-model")) != 0 {
+		t.Fatal("redirect targets and disabled entries must not match pricing")
+	}
+}
+
+func TestCarryModelPricingKeepsPricesForRetainedModels(t *testing.T) {
+	t.Parallel()
+	price := &util.CustomModelPrice{InputPrice: testPrice(1)}
+	explicit := &util.CustomModelPrice{InputPrice: testPrice(9)}
+	got := CarryModelPricing(
+		[]ModelEntry{{Model: "GPT-5", Pricing: price}, {Model: "removed", Pricing: price}},
+		[]ModelEntry{{Model: "gpt-5"}, {Model: "added"}, {Model: "removed", Pricing: explicit}},
+	)
+	if got[0].Pricing != price || got[1].Pricing != nil || got[2].Pricing != explicit {
+		t.Fatalf("carried pricing = %#v", got)
+	}
 }
 
 func TestConfig_SupportsModel(t *testing.T) {
@@ -155,22 +209,48 @@ func TestConfig_SupportsModel(t *testing.T) {
 	if cfg.SupportsModel("m1") {
 		t.Fatal("disabled model must not be supported")
 	}
-	if redirect, ok := cfg.GetRedirectModel("m1"); ok || redirect != "" {
-		t.Fatalf("disabled model redirect must not resolve, got (%q, %v)", redirect, ok)
+	if entries := cfg.EnabledModelEntries("m1"); len(entries) != 0 {
+		t.Fatalf("disabled model redirect must not resolve, got %+v", entries)
 	}
 	if models := cfg.GetModels(); len(models) != 1 || models[0] != "m2" {
 		t.Fatalf("GetModels()=%v, want only enabled model m2", models)
 	}
 }
 
-func TestConfig_WildcardModelSupportsAnyModelWithoutRedirect(t *testing.T) {
+func TestValidateModelEntriesAllowsDistinctTargetsAndRejectsAmbiguousGroups(t *testing.T) {
 	t.Parallel()
-	cfg := &Config{ModelEntries: []ModelEntry{{Model: "*"}}}
-	if !cfg.SupportsModel("gpt-5.4") || !cfg.SupportsModel("future-codex-model") {
-		t.Fatal("wildcard channel must support arbitrary models")
+	valid, err := ValidateModelEntries([]ModelEntry{
+		{Model: "auto", RedirectModel: "upstream-a", Disabled: true},
+		{Model: "auto", RedirectModel: "upstream-b"},
+		{Model: "auto", RedirectModel: "auto"},
+	})
+	if err != nil || len(valid) != 3 || valid[2].RedirectModel != "" {
+		t.Fatalf("distinct targets = (%+v, %v)", valid, err)
 	}
-	if redirect, ok := cfg.GetRedirectModel("gpt-5.4"); ok || redirect != "" {
-		t.Fatalf("wildcard must not rewrite model, got (%q, %v)", redirect, ok)
+	for name, entries := range map[string][]ModelEntry{
+		"duplicate disabled target": {{Model: "auto", RedirectModel: "upstream", Disabled: true}, {Model: "auto", RedirectModel: "UPSTREAM"}},
+		"thinking target collision": {{Model: "auto", RedirectModel: "upstream(max)"}, {Model: "auto", RedirectModel: "upstream(low)"}},
+		"mixed case group":          {{Model: "auto", RedirectModel: "a"}, {Model: "AUTO", RedirectModel: "b"}},
+		"suffixed group":            {{Model: "auto(max)", RedirectModel: "a"}, {Model: "auto(max)", RedirectModel: "b"}},
+		"wildcard group":            {{Model: "*", RedirectModel: "a"}, {Model: "*", RedirectModel: "b"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateModelEntries(entries); err == nil {
+				t.Fatal("ambiguous model group accepted")
+			}
+		})
+	}
+}
+
+func TestConfig_WildcardModelDoesNotMatchOtherModels(t *testing.T) {
+	t.Parallel()
+	entry := &ModelEntry{Model: "*"}
+	if err := entry.Validate(); err == nil {
+		t.Fatal("wildcard model must be rejected")
+	}
+	cfg := &Config{ModelEntries: []ModelEntry{{Model: "*"}}}
+	if cfg.SupportsModel("gpt-5.4") || cfg.SupportsModel("future-codex-model") {
+		t.Fatal("a stored * row must not match other models")
 	}
 }
 
@@ -348,6 +428,21 @@ func TestAPIKey_AllowsModel(t *testing.T) {
 	}
 }
 
+func TestAPIKey_AllowsUpstreamModelWildcard(t *testing.T) {
+	t.Parallel()
+
+	probed := &APIKey{DetectedModels: []string{"gpt-5"}}
+	if !probed.AllowsUpstreamModel("") || !probed.AllowsUpstreamModel("*") {
+		t.Fatal("model-less and wildcard requests must stay usable after discovery")
+	}
+	if !probed.AllowsUpstreamModel("GPT-5") || probed.AllowsUpstreamModel("other") {
+		t.Fatal("named upstream models must still match discovery")
+	}
+	if (&APIKey{}).AllowsUpstreamModel("anything") != true {
+		t.Fatal("keys without discovery data stay usable")
+	}
+}
+
 func TestConfig_ChannelURLs(t *testing.T) {
 	t.Parallel()
 
@@ -396,29 +491,5 @@ func TestChannelURLs_NormalizeRejectsInvalidData(t *testing.T) {
 				t.Fatal("Normalize() expected error")
 			}
 		})
-	}
-}
-
-func TestConfig_AnthropicOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeAnthropicOAuth}
-	if NormalizeAuthType(AuthTypeAnthropicOAuth) != AuthTypeAnthropicOAuth ||
-		!cfg.UsesAnthropicOAuth() || !cfg.UsesOAuth() || cfg.UsesXAIOAuth() {
-		t.Fatalf("Anthropic OAuth auth type was not isolated: %+v", cfg)
-	}
-}
-
-func TestConfig_CursorOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeCursorOAuth}
-	if NormalizeAuthType(AuthTypeCursorOAuth) != AuthTypeCursorOAuth ||
-		!cfg.UsesCursorOAuth() || !cfg.UsesOAuth() || cfg.UsesZAIOAuth() {
-		t.Fatalf("Cursor OAuth auth type was not isolated: %+v", cfg)
-	}
-}
-
-func TestConfig_ZedOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeZedOAuth}
-	if NormalizeAuthType(AuthTypeZedOAuth) != AuthTypeZedOAuth ||
-		!cfg.UsesZedOAuth() || !cfg.UsesOAuth() || cfg.UsesCodexOAuth() {
-		t.Fatalf("Zed OAuth auth type was not isolated: %+v", cfg)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 )
 
 func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
-	store := newTestStore(t, "metrics_basic.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	// 两个渠道：用于覆盖 type/name 过滤与交集逻辑
@@ -264,8 +265,44 @@ func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
 	}
 }
 
+func TestMetrics_TokenSpeedUsesSuccessfulOutputAndEffectiveDuration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "speed-channel",
+		URLs:         model.ChannelURLs{{URL: "https://example.com"}},
+		Enabled:      true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-4o"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+
+	now := time.Now()
+	logs := []*model.LogEntry{
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 200, IsStreaming: true, Duration: 4, FirstByteTime: 1, OutputTokens: 60, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 200, Duration: 2, OutputTokens: 20, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 200, IsStreaming: true, Duration: 1.2, FirstByteTime: 0.6, OutputTokens: 12, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 500, Duration: 1, OutputTokens: 1000, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 499, Duration: 1, OutputTokens: 1000, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 200, Duration: 1, LogSource: model.LogSourceProxy},
+	}
+	if err := store.BatchAddLogs(ctx, logs); err != nil {
+		t.Fatalf("BatchAddLogs failed: %v", err)
+	}
+
+	stats, err := store.GetStats(ctx, now.Add(-time.Minute), now.Add(time.Minute), &model.LogFilter{LogSource: model.LogSourceProxy}, false)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if len(stats) != 1 || stats[0].SpeedOutputTokens == nil || *stats[0].SpeedOutputTokens != 92 ||
+		stats[0].SpeedDurationSeconds == nil || math.Abs(*stats[0].SpeedDurationSeconds-6.2) > 1e-9 {
+		t.Fatalf("speed aggregates = %+v, want 92 tokens over 6.2 seconds", stats)
+	}
+}
+
 func TestMetrics_UpstreamProtocolFilterUsesPersistedAttemptProtocol(t *testing.T) {
-	store := newTestStore(t, "metrics_upstream_protocol.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	nativeOpenAI, err := store.CreateConfig(ctx, &model.Config{
@@ -353,7 +390,7 @@ func TestMetrics_UpstreamProtocolFilterUsesPersistedAttemptProtocol(t *testing.T
 }
 
 func TestGetHealthTimeline_AppliesFullStatsFilter(t *testing.T) {
-	store := newTestStore(t, "health_timeline_full_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	openaiCfg, err := store.CreateConfig(ctx, &model.Config{
@@ -429,7 +466,7 @@ func TestGetHealthTimeline_AppliesFullStatsFilter(t *testing.T) {
 }
 
 func TestMetrics_LastSuccessAndLastFailedRequest(t *testing.T) {
-	store := newTestStore(t, "metrics_last_success.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -494,7 +531,7 @@ func TestMetrics_LastSuccessAndLastFailedRequest(t *testing.T) {
 }
 
 func TestMetrics_ChannelLevelLastRequestIDsExposeTieBreakForFrontEndAggregation(t *testing.T) {
-	store := newTestStore(t, "metrics_last_request_ids.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -550,7 +587,7 @@ func TestMetrics_ChannelLevelLastRequestIDsExposeTieBreakForFrontEndAggregation(
 }
 
 func TestMetrics_LastSuccessAtIgnoresCurrentRange(t *testing.T) {
-	store := newTestStore(t, "metrics_last_success_all_time.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -599,7 +636,7 @@ func TestMetrics_LastSuccessAtIgnoresCurrentRange(t *testing.T) {
 }
 
 func TestMetrics_LastRequestAtIgnoresCurrentRange(t *testing.T) {
-	store := newTestStore(t, "metrics_last_request_all_time.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -654,7 +691,7 @@ func TestMetrics_LastRequestAtIgnoresCurrentRange(t *testing.T) {
 }
 
 func TestMetrics_LastStateIsChannelLevelWithoutModelFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_channel_level.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -710,7 +747,7 @@ func TestMetrics_LastStateIsChannelLevelWithoutModelFilter(t *testing.T) {
 }
 
 func TestMetrics_LastStateRespectsModelFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_model_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -766,7 +803,7 @@ func TestMetrics_LastStateRespectsModelFilter(t *testing.T) {
 }
 
 func TestMetrics_LastStateIgnoresStatusCodeFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_status_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -830,7 +867,7 @@ func TestMetrics_LastStateIgnoresStatusCodeFilter(t *testing.T) {
 }
 
 func TestGetStats_PreservesZeroCostMultiplierForFreeChannels(t *testing.T) {
-	store := newTestStore(t, "metrics_zero_multiplier.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{

@@ -158,15 +158,27 @@ type channelTestRequestPlan struct {
 	fullURL           string
 	// endpointPath 是下游端点路径，协议族判定一律用它，不能用 fullURL 的完整
 	// 路径——渠道基础 URL 带子路径时两者不等，见 downstreamEndpointPath。
-	endpointPath     string
-	headers          http.Header
-	upstreamHeaders  http.Header
-	requestBody      []byte
-	clientBody       []byte
-	zedWire          *zedWirePlan
-	timeout          *channelTestTimeout
-	debugCapture     *debugCapture
-	antigravityOAuth bool
+	endpointPath              string
+	headers                   http.Header
+	upstreamHeaders           http.Header
+	requestBody               []byte
+	clientBody                []byte
+	anthropicOAuthFingerprint *anthropicOAuthFingerprint
+	anthropicMappedSessionID  string
+	zedWire                   *zedWirePlan
+	openCodeResponses         *openCodeResponsesPlan
+	xaiTools                  *xaiResponsesToolsPlan
+	timeout                   *channelTestTimeout
+	debugCapture              *debugCapture
+	antigravityOAuth          bool
+}
+
+// requestedServiceTier 读取本次测试上游请求体声明的计费档位，与代理 requestedServiceTier 同源。
+func (p *channelTestRequestPlan) requestedServiceTier() string {
+	if p == nil {
+		return ""
+	}
+	return requestBodyServiceTier(protocol.Protocol(p.upstreamProtocol), p.requestBody)
 }
 
 type channelTestTimeout struct {
@@ -554,6 +566,7 @@ func parseTestStreamResponseBytes(
 	statusCode int,
 	result map[string]any,
 	testReq *testutil.TestChannelRequest,
+	requestedServiceTier string,
 ) map[string]any {
 	collector := newTestSSECollector()
 	usageParser := newSSEUsageParser(parseProtocol)
@@ -578,7 +591,7 @@ func parseTestStreamResponseBytes(
 		return result
 	}
 	collector.applyResult(result)
-	populateTestSSEUsageAndCost(result, testReq, usageParser, collector.lastUsage)
+	populateTestSSEUsageAndCost(result, testReq, requestedServiceTier, usageParser, collector.lastUsage)
 
 	if collector.lastErrMsg != "" {
 		result["success"] = false
@@ -630,23 +643,21 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		}
 		testReq.BaseURL = normalizedBaseURL
 	}
-	routedModel := model.RoutingModelName(testReq.Model)
-	testCfg := cfg
-	if !cfg.SupportsModel(routedModel) {
-		// Disabled models remain excluded from normal routing, but the admin test
-		// endpoint must be able to probe the configured upstream model explicitly.
-		testCfg = cfg.Clone()
-		if !enableDisabledChannelTestModel(testCfg, routedModel) {
+	testCfg, selectErr := s.selectChannelTestModel(cfg, &testReq, false)
+	if selectErr != nil {
+		if strings.TrimSpace(testReq.TargetModel) != "" {
+			RespondErrorMsg(c, http.StatusBadRequest, selectErr.Error())
+		} else {
 			RespondJSON(c, http.StatusOK, gin.H{
 				"success":          false,
-				"error":            "模型 " + testReq.Model + " 不在此渠道的支持列表中",
+				"error":            selectErr.Error(),
 				"model":            testReq.Model,
 				"supported_models": cfg.GetModels(),
 			})
-			return
 		}
-		cfg = testCfg
+		return
 	}
+	cfg = testCfg
 
 	apiKeys, err := s.store.GetAPIKeys(c.Request.Context(), id)
 	if err != nil {
@@ -654,7 +665,7 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		return
 	}
 	runtimeCfg, keySelection, err := s.prepareChannelTestAuth(
-		c.Request.Context(), cfg, apiKeys, testReq.Model, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
+		c.Request.Context(), cfg, apiKeys, testReq.Model, resolveClientProtocol(&testReq), testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
 		oauthCredentialUseCurrent,
 	)
 	if err != nil {
@@ -706,20 +717,102 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 	RespondJSON(c, http.StatusOK, testResult)
 }
 
-// enableDisabledChannelTestModel enables one configured model on a cloned
-// config so the admin test can exercise it without changing normal routing.
-func enableDisabledChannelTestModel(cfg *model.Config, routedModel string) bool {
-	if cfg == nil || routedModel == "" {
-		return false
+// selectChannelTestModel binds one configured row on a request-private config.
+// Manual tests ignore model cooldown; scheduled checks call this only for enabled groups.
+func (s *Server) selectChannelTestModel(cfg *model.Config, req *testutil.TestChannelRequest, requireEnabled bool) (*model.Config, error) {
+	return s.selectChannelTestModelWithAvailability(cfg, req, requireEnabled, nil)
+}
+
+func (s *Server) selectChannelTestModelWithAvailability(cfg *model.Config, req *testutil.TestChannelRequest, requireEnabled bool, rowAvailable func(modelRoutingSelection) bool) (*model.Config, error) {
+	if cfg == nil || req == nil {
+		return nil, errors.New("channel test model is missing")
 	}
-	for index := range cfg.ModelEntries {
-		entry := &cfg.ModelEntries[index]
-		if entry.Disabled && model.RoutingModelName(entry.Model) == routedModel {
-			entry.Disabled = false
-			return true
+	name := model.RoutingModelName(req.Model)
+	if requireEnabled {
+		configured, enabled := false, false
+		for _, entry := range cfg.ModelEntries {
+			if model.RoutingModelName(entry.Model) != name {
+				continue
+			}
+			configured = true
+			enabled = enabled || !entry.Disabled
+		}
+		if configured && !enabled {
+			return nil, fmt.Errorf("模型 %s 的配置行均已停用", req.Model)
 		}
 	}
-	return false
+	var rows []modelRoutingSelection
+	for _, entry := range cfg.ModelEntries {
+		if entry.Model == name && (!requireEnabled || !entry.Disabled) {
+			rows = append(rows, modelRoutingSelection{logicalModel: name, entry: entry})
+		}
+	}
+	if len(rows) == 0 {
+		rows = s.configuredModelRows(cfg, name)
+	}
+	if len(rows) == 0 {
+		for _, entry := range cfg.ModelEntries {
+			if model.RoutingModelName(entry.Model) == name && (!requireEnabled || !entry.Disabled) {
+				rows = append(rows, modelRoutingSelection{logicalModel: name, entry: entry})
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("模型 %s 不在此渠道的支持列表中", req.Model)
+	}
+	chosen := -1
+	if target := strings.TrimSpace(req.TargetModel); target != "" {
+		for i, row := range rows {
+			effective := row.entry.RedirectModel
+			if effective == "" {
+				effective = row.logicalModel
+			}
+			if strings.EqualFold(model.RoutingModelName(effective), model.RoutingModelName(target)) {
+				chosen = i
+				break
+			}
+		}
+		if chosen < 0 {
+			return nil, fmt.Errorf("模型 %q 未配置目标 %q", req.Model, target)
+		}
+	} else {
+		available := make([]bool, len(rows))
+		for i, row := range rows {
+			available[i] = !row.entry.Disabled && (rowAvailable == nil || rowAvailable(row))
+		}
+		if s.keySelector != nil {
+			if index, ok := s.keySelector.SelectModelRow(cfg.ID, rows[0].logicalModel, available); ok {
+				chosen = index
+			}
+		} else {
+			for i, ok := range available {
+				if ok {
+					chosen = i
+					break
+				}
+			}
+		}
+		if chosen < 0 {
+			if rowAvailable != nil {
+				return nil, fmt.Errorf("模型 %s 没有可用的 API Key", req.Model)
+			}
+			chosen = 0
+		}
+	}
+	selected := rows[chosen]
+	clone := cfg.Clone()
+	clone.ModelEntries = clone.ModelEntries[:0]
+	for _, entry := range cfg.ModelEntries {
+		if entry.Model != selected.entry.Model {
+			clone.ModelEntries = append(clone.ModelEntries, entry)
+			continue
+		}
+		if entry.Identity() == selected.entry.Identity() {
+			entry.Disabled = false
+			clone.ModelEntries = append(clone.ModelEntries, entry)
+		}
+	}
+	return clone, nil
 }
 
 func channelTestActualModel(result map[string]any, fallback string) string {
@@ -757,6 +850,7 @@ func (s *Server) prepareChannelTestAuth(
 	cfg *model.Config,
 	apiKeys []*model.APIKey,
 	requestedModel string,
+	requestProtocol string,
 	requestedKeyIndex *int,
 	requestAPIKey string,
 	oauthMode oauthCredentialLoadMode,
@@ -769,16 +863,17 @@ func (s *Server) prepareChannelTestAuth(
 	if len(apiKeys) == 0 && requestAPIKey == "" {
 		return nil, channelTestKeySelection{}, errors.New("渠道未配置有效的 API Key")
 	}
-	channelModel := s.resolveChannelRoutingModel(cfg, requestedModel)
+	selected, _ := s.firstModelRow(cfg, requestedModel)
 	if requestAPIKey != "" {
 		if requestedKeyIndex != nil {
 			if persisted, ok := findAPIKeyByIndex(apiKeys, *requestedKeyIndex); ok &&
-				persisted.APIKey == requestAPIKey && !persisted.AllowsModel(channelModel) {
+				persisted.APIKey == requestAPIKey && !s.keyModelScopeAllowsRow(cfg, persisted, selected,
+				possibleUpstreamProtocols(cfg, protocol.Protocol(util.NormalizeProtocol(requestProtocol)))) {
 				return nil, channelTestKeySelection{}, fmt.Errorf("key #%d 不允许模型 %s", *requestedKeyIndex, requestedModel)
 			}
 		}
 	} else {
-		apiKeys, _ = filterAPIKeysForModel(apiKeys, channelModel)
+		apiKeys, _ = s.filterAPIKeysForModelRow(cfg, apiKeys, selected, requestProtocol)
 		if len(apiKeys) == 0 {
 			return nil, channelTestKeySelection{}, fmt.Errorf("模型 %s 没有可用的 API Key", requestedModel)
 		}
@@ -843,6 +938,7 @@ func (s *Server) prepareOAuthChannelTestAuthForRejectedToken(
 		runtimeCfg := cfg.Clone()
 		runtimeCfg.CodexAccessToken = credential.AccessToken
 		runtimeCfg.CodexAccountID = credential.AccountID
+		runtimeCfg.CodexQuotaEpochAt = credential.QuotaCostUsage.EpochTime()
 		runtimeCfg.CodexAccountFedRAMP = credential.AccountFedRAMP
 		if err != nil {
 			return runtimeCfg, selection, true, fmt.Errorf("加载 Codex OAuth 凭证失败: %w", err)
@@ -1117,6 +1213,7 @@ func (s *Server) applyChannelTestResultCooldown(ctx context.Context, cfg *model.
 	input := httpErrorInputFromParts(cfg.ID, keyIndex, statusCode, errorBody, headers)
 	if upstreamStatusCode, ok := getResultInt(result["status_code"]); ok {
 		input.UpstreamStatusCode = upstreamStatusCode
+		input.ModelScoped = isAntigravityModelNotFound(cfg, upstreamStatusCode)
 	}
 	action := s.applyCooldownDecision(
 		ctx,
@@ -1215,6 +1312,7 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 	if strings.TrimSpace(testReq.Content) == "" {
 		testReq.Content = configuredChannelTestContent(s.configService)
 	}
+	s.bindChannelTestBilling(cfg, testReq)
 	if cfg != nil && cfg.UsesCursorOAuth() {
 		return s.testCursorOAuthChannel(reqCtx, cfg, apiKey, testReq)
 	}
@@ -1287,7 +1385,7 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 				}
 				return lastResult
 			}
-			if !isChannelTestProtocolEndpointMissing(lastResult) {
+			if !isChannelTestProtocolEndpointMissing(cfg, lastResult) {
 				break
 			}
 			capabilityExhausted = protocolIdx == len(upstreamProtocols)-1
@@ -1370,7 +1468,8 @@ func (s *Server) testCursorOAuthChannel(
 
 	requestedModel := testReq.Model
 	attemptReq := *testReq
-	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, requestedModel, clientProtocol)
+	selected, _ := s.firstModelRow(cfg, requestedModel)
+	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, selected, clientProtocol)
 	result["actual_model"] = attemptReq.Model
 
 	if testReq.WaitForCapacity {
@@ -1439,6 +1538,14 @@ func (s *Server) testCursorOAuthChannel(
 		result["success"] = true
 		result["message"] = "API测试成功"
 		if testReq.Stream {
+			usageParser := newSSEUsageParser(clientProtocol)
+			_ = usageParser.Feed(bodyBytes)
+			populateTestNormalizedUsageAndCost(
+				result,
+				&attemptReq,
+				requestBodyServiceTier(protocol.Protocol(clientProtocol), body),
+				usageParser,
+			)
 			result["response_text"] = string(proxyRes.body)
 			result["raw_response"] = rec.Body.String()
 			result["upstream_response_body"] = rec.Body.String()
@@ -1458,6 +1565,14 @@ func (s *Server) testCursorOAuthChannel(
 			result["upstream_response_body"] = string(bodyBytes)
 			return result
 		}
+		usageParser := newJSONUsageParser(clientProtocol)
+		_ = usageParser.Feed(bodyBytes)
+		populateTestNormalizedUsageAndCost(
+			result,
+			&attemptReq,
+			requestBodyServiceTier(protocol.Protocol(clientProtocol), body),
+			usageParser,
+		)
 		result["success"] = true
 		result["message"] = "API测试成功"
 		result["upstream_response_body"] = string(bodyBytes)
@@ -1492,7 +1607,8 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 ) (result map[string]any) {
 	requestedModel := testReq.Model
 	attemptReq := *testReq
-	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, requestedModel, upstreamProtocol)
+	selected, _ := s.firstModelRow(cfg, requestedModel)
+	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, selected, upstreamProtocol)
 	if attemptReq.Model != requestedModel {
 		log.Printf("[INFO] [测试-请求体修改] 渠道ID=%d, 修改后模型=%s", cfg.ID, attemptReq.Model)
 	}
@@ -1518,7 +1634,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	if testReq.WaitForCapacity {
 		var cfgForBuild *model.Config
 		cfgForBuild, requestPlan, err = s.buildTestUpstreamRequestPlan(
-			cfg, apiKey, testReq, requestedModel, clientProtocol, upstreamProtocol, selectedURL,
+			reqCtx, cfg, apiKey, testReq, requestedModel, clientProtocol, upstreamProtocol, selectedURL,
 		)
 		if err == nil {
 			capacityRelease, err = s.waitForUpstreamRequest(reqCtx, cfg)
@@ -1675,6 +1791,11 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 		})
 	}
 	wrapCodexSSEResponseBody(resp, protocol.Protocol(requestPlan.upstreamProtocol), isEventStream)
+	if requestPlan.xaiOAuth {
+		prepareXAIResponsesResponse(resp, requestPlan.upstreamStreaming || isEventStream)
+		prepareXAIResponsesToolsResponse(resp, requestPlan.xaiTools, requestPlan.upstreamStreaming || isEventStream)
+	}
+	prepareOpenCodeResponsesResponse(resp, requestPlan.openCodeResponses, requestPlan.upstreamStreaming)
 
 	// 通用结果初始化
 	result = map[string]any{
@@ -1887,7 +2008,7 @@ func (s *Server) parseTestNonStreamResponse(
 
 		usageParser := newJSONUsageParser(requestPlan.upstreamProtocol)
 		_ = usageParser.Feed(upstreamBody)
-		populateTestNormalizedUsageAndCost(result, testReq, usageParser)
+		populateTestNormalizedUsageAndCost(result, testReq, requestPlan.requestedServiceTier(), usageParser)
 
 		result["upstream_response_body"] = string(bodyBytes)
 
@@ -1933,6 +2054,7 @@ func captureImageGenerationFailureDebug(
 }
 
 func (s *Server) buildTestUpstreamRequestPlan(
+	ctx context.Context,
 	cfg *model.Config,
 	apiKey string,
 	testReq *testutil.TestChannelRequest,
@@ -1949,6 +2071,9 @@ func (s *Server) buildTestUpstreamRequestPlan(
 	if err != nil {
 		return nil, nil, fmt.Errorf("构造测试请求失败: %w", err)
 	}
+	for key, value := range testReq.Headers {
+		requestPlan.headers.Set(key, value)
+	}
 
 	requestPath := downstreamEndpointPath(requestPlan.fullURL, selectedURL)
 	upstreamProtocolValue := protocol.Protocol(requestPlan.upstreamProtocol)
@@ -1957,8 +2082,8 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		requestPlan.fullURL = buildXAIResponsesURL(selectedURL, "")
 		requestPath = downstreamEndpointPath(requestPlan.fullURL, selectedURL)
 	}
-	if isAnthropicOAuthMessagesRequest(cfgForBuild, upstreamProtocolValue, requestPath) {
-		requestPlan.fullURL = buildAnthropicOAuthURL(selectedURL, requestPath, "")
+	if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, upstreamProtocolValue, requestPath) {
+		requestPlan.fullURL = buildAnthropicClaudeCodeURL(selectedURL, requestPath, "")
 	}
 	requestedStreaming := isStreamingRequest(requestPath, requestPlan.requestBody)
 	// 与代理链路一致：Anthropic CCH 签名按上游 origin 分流，最终化前必须先有 URL。
@@ -1966,16 +2091,58 @@ func (s *Server) buildTestUpstreamRequestPlan(
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse test upstream URL: %w", err)
 	}
-	requestPlan.requestBody, err = s.prepareTranslatedUpstreamBody(
-		cfgForBuild, upstreamProtocolValue, requestPath, requestPlan.requestBody, requestPlan.clientBody,
+	callerBody := requestPlan.clientBody
+	if len(callerBody) == 0 {
+		callerBody = requestPlan.requestBody
+	}
+	callerBodyIsAnthropic := requestPlan.clientProtocol == string(protocol.Anthropic)
+	callerWire := classifyAnthropicRequestCallerWire(
+		callerBody, requestPlan.headers, upstreamProtocolValue, requestPath, callerBodyIsAnthropic)
+	if cfgForBuild.UsesAnthropicOAuth() {
+		fingerprintSource := http.Header(nil)
+		if callerWire.nativeClaudeCode {
+			fingerprintSource = requestPlan.headers
+		}
+		requestPlan.anthropicOAuthFingerprint = s.getAnthropicOAuthFingerprint(ctx, cfgForBuild, fingerprintSource)
+	}
+	requestPlan.requestBody, _, err = s.prepareTranslatedUpstreamBody(
+		cfgForBuild, upstreamProtocolValue, requestPath, testReq.Model, requestPlan.requestBody, requestPlan.clientBody,
 		requestPlan.apiKey, requestPlan.headers, false, parsedTestURL,
-		false,
+		false, callerBodyIsAnthropic,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("finalize test request body: %w", err)
 	}
+	if cfgForBuild.UsesAnthropicOAuth() &&
+		(isAnthropicMessagesRequest(upstreamProtocolValue, requestPath) || isAnthropicCountTokensRequest(upstreamProtocolValue, requestPath)) {
+		identityHeaders := requestPlan.headers
+		if requestPlan.anthropicOAuthFingerprint != nil {
+			identityHeaders = cloneHeaders(requestPlan.headers)
+			identityHeaders.Set("User-Agent", requestPlan.anthropicOAuthFingerprint.UserAgent)
+		}
+		requestPlan.requestBody, requestPlan.anthropicMappedSessionID, err = rebaseAnthropicNativeOAuthIdentity(
+			requestPlan.requestBody, callerBody, cfgForBuild, callerWire, identityHeaders)
+		if err != nil {
+			return nil, nil, fmt.Errorf("rebase test request identity: %w", err)
+		}
+		if callerWire.nativeClaudeCode && requestPlan.anthropicOAuthFingerprint != nil {
+			requestPlan.requestBody = syncAnthropicOAuthBillingVersion(
+				requestPlan.requestBody, requestPlan.anthropicOAuthFingerprint.UserAgent)
+		}
+	}
+	requestPlan.requestBody, requestPlan.openCodeResponses = prepareOpenCodeResponsesRequest(
+		parsedTestURL, upstreamProtocolValue, requestPath, requestPlan.requestBody, nil,
+	)
+	requestPlan.requestBody, err = refreshAnthropicCallerCCH(requestPlan.requestBody, callerBody, callerWire)
+	if err != nil {
+		return nil, nil, fmt.Errorf("refresh test request CCH: %w", err)
+	}
 	if xaiResponsesRequest {
 		requestPlan.xaiConversationID = testReq.ResolveSessionID()
+		requestPlan.requestBody, requestPlan.xaiTools, err = prepareXAIResponsesToolsRequest(requestPlan.requestBody, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("adapt xAI test tools: %w", err)
+		}
 		requestPlan.requestBody, err = finalizeXAIResponsesBody(
 			requestPlan.requestBody,
 			testReq.Model,
@@ -2032,11 +2199,15 @@ func (s *Server) newTestUpstreamRequest(
 	}
 
 	sourceHeaders := cloneHeaders(requestPlan.headers)
-	for key, value := range testReq.Headers {
-		sourceHeaders.Set(key, value)
-	}
 	requestPlan.upstreamHeaders = sourceHeaders
+	callerBody := requestPlan.clientBody
+	if len(callerBody) == 0 {
+		callerBody = requestPlan.requestBody
+	}
 	requestProtocol := protocol.Protocol(requestPlan.upstreamProtocol)
+	callerWire := classifyAnthropicRequestCallerWire(callerBody, sourceHeaders, requestProtocol,
+		requestPlan.endpointPath, requestPlan.clientProtocol == string(protocol.Anthropic))
+	callerOwnsAnthropicWire := callerWire.ownsWire()
 	if requestProtocol == protocol.Codex {
 		copyCodexHTTPHeaders(req.Header, sourceHeaders)
 	} else {
@@ -2048,6 +2219,7 @@ func (s *Server) newTestUpstreamRequest(
 	}
 	applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
 	wireRebuilt := false
+	oauthFingerprint := requestPlan.anthropicOAuthFingerprint
 	if cfgForBuild.UsesCodeBuddyOAuth() {
 		if err := injectCodeBuddyHeaders(req, cfgForBuild, requestPlan.apiKey); err != nil {
 			timeout.cancelAll()
@@ -2066,20 +2238,40 @@ func (s *Server) newTestUpstreamRequest(
 		// injectAntigravityOAuthHeaders 整体替换 req.Header，同样属于重建路径。
 		injectAntigravityOAuthHeaders(req, cfgForBuild, s.antigravityUserAgent())
 		wireRebuilt = true
+	} else if isAnthropicCountTokensRequest(requestProtocol, requestPlan.endpointPath) {
+		injectAnthropicCountTokensHeadersWithFingerprint(req, cfgForBuild, requestPlan.apiKey,
+			requestPlan.requestBody, callerOwnsAnthropicWire, oauthFingerprint, sourceHeaders)
+		wireRebuilt = true
 	} else if isAnthropicOAuthMessagesRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) {
-		injectAnthropicOAuthHeaders(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody, sourceHeaders)
+		injectAnthropicOAuthHeadersWithFingerprint(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody,
+			callerOwnsAnthropicWire, oauthFingerprint, sourceHeaders)
 		wireRebuilt = true
 	} else if isZAICodingPlanRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) {
 		injectZAICodingPlanHeaders(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody, sourceHeaders)
 		wireRebuilt = true
 	} else if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) {
-		injectAnthropicAPIKeyHeaders(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody, sourceHeaders)
+		injectAnthropicAPIKeyHeaders(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody,
+			callerOwnsAnthropicWire, sourceHeaders)
 		wireRebuilt = true
 	}
-	// 指纹路径清空（或整体替换）并重建了请求头，规则产物随之丢失；与代理链路一样重跑
-	// 一次，渠道测试才能反映真实上游请求头。
+	if requestPlan.anthropicMappedSessionID != "" &&
+		anthropicHeaderValue(sourceHeaders, "X-Claude-Code-Session-Id") != "" &&
+		anthropicSessionIDFromBody(requestPlan.requestBody) == requestPlan.anthropicMappedSessionID {
+		setRawHeader(req.Header, "X-Claude-Code-Session-Id", requestPlan.anthropicMappedSessionID)
+	}
+	if isAnthropicCountTokensRequest(requestProtocol, requestPlan.endpointPath) && isOfficialAnthropicURL(req.URL) {
+		req.Header.Del("X-Claude-Code-Session-Id")
+	}
+	// 指纹路径重建请求头；原生 OAuth 使用账号指纹，模拟请求保留 billing 同源的头。
 	if wireRebuilt {
 		applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
+		if cfgForBuild.UsesAnthropicOAuth() {
+			if callerOwnsAnthropicWire {
+				applyAnthropicOAuthFingerprint(req, oauthFingerprint)
+			} else {
+				applyAnthropicOAuthMimicFingerprint(req, requestPlan.requestBody)
+			}
+		}
 	}
 	// anyrouter 渠道：确保 anthropic-beta 包含 context-1m，与代理链路步骤 6.2 对齐。
 	if requestProtocol == protocol.Anthropic && isAnyrouterChannel(cfgForBuild) {
@@ -2092,9 +2284,15 @@ func (s *Server) newTestUpstreamRequest(
 		}
 		ensureOpenCodeSessionHeader(req.Header, sourceHeaders, executionIdentity)
 	}
-	// Some compatibility gateways decompress the response but leave the gzip marker.
-	// Admin tests need the wire body for diagnostics, so never negotiate compression.
-	req.Header.Set("Accept-Encoding", "identity")
+	if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) ||
+		isAnthropicCountTokensRequest(requestProtocol, requestPlan.endpointPath) {
+		requestPlan.requestBody, err = applyFinalAnthropicBetaBodyPolicy(req, requestPlan.requestBody)
+		if err != nil {
+			timeout.cancelAll()
+			return nil, nil, err
+		}
+	}
+	setAdminTestAcceptEncoding(cfgForBuild, req)
 	requestPlan.debugCapture = s.captureDebugRequest(req, requestPlan.requestBody)
 	if requestPlan.clientProtocol != requestPlan.upstreamProtocol || cfgForBuild.UsesZedOAuth() {
 		originalHeaders := cloneHeaders(requestPlan.clientHeaders)
@@ -2107,6 +2305,16 @@ func (s *Server) newTestUpstreamRequest(
 	return req, timeout.cancelAll, nil
 }
 
+// setAdminTestAcceptEncoding 让管理测试拿到上游原始响应体：部分兼容网关解压响应后
+// 仍保留 gzip 标记，net/http 再自动解压会报 gzip: invalid header，因此一律请求 identity。
+// Codex OAuth 例外：凭证池已关闭自动解压，官方客户端也不发 Accept-Encoding，保持线上一致。
+func setAdminTestAcceptEncoding(cfg *model.Config, req *http.Request) {
+	if cfg.UsesCodexOAuth() {
+		return
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
 func (s *Server) buildTestUpstreamRequestForProtocol(
 	reqCtx context.Context,
 	cfg *model.Config,
@@ -2115,7 +2323,7 @@ func (s *Server) buildTestUpstreamRequestForProtocol(
 	requestedModel string,
 	clientProtocol, upstreamProtocol, selectedURL string,
 ) (*http.Request, *channelTestRequestPlan, context.CancelFunc, error) {
-	cfgForBuild, requestPlan, err := s.buildTestUpstreamRequestPlan(cfg, apiKey, testReq, requestedModel, clientProtocol, upstreamProtocol, selectedURL)
+	cfgForBuild, requestPlan, err := s.buildTestUpstreamRequestPlan(reqCtx, cfg, apiKey, testReq, requestedModel, clientProtocol, upstreamProtocol, selectedURL)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2152,7 +2360,10 @@ func (s *Server) parseTestTranslatedSSEResponse(
 	translatedWriter.WriteHeader(resp.StatusCode)
 	var rawUpstreamBuf bytes.Buffer
 	upstreamTee := io.TeeReader(resp.Body, &rawUpstreamBuf)
-	streamReader := readerWithCloser{Reader: upstreamTee, Closer: resp.Body}
+	var streamReader io.ReadCloser = readerWithCloser{Reader: upstreamTee, Closer: resp.Body}
+	if requestPlan.antigravityOAuth {
+		streamReader = terminateAntigravitySSE(streamReader)
+	}
 	firstContentCaptured := false
 	upstreamParser := newSSEUsageParser(requestPlan.upstreamProtocol)
 	var translatedComplete bool
@@ -2175,7 +2386,7 @@ func (s *Server) parseTestTranslatedSSEResponse(
 			if requestPlan.antigravityOAuth {
 				var err error
 				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || parserEvent == nil {
 					return err
 				}
 			}
@@ -2194,9 +2405,13 @@ func (s *Server) parseTestTranslatedSSEResponse(
 				rawEvent = normalizeCodeBuddySSEEvent(rawEvent)
 			}
 			if requestPlan.antigravityOAuth {
+				// 与代理链路一致：后端错误帧只交给 usage parser，不进转换器。
+				if isAntigravityErrorPayload(antigravityEventPayload(rawEvent)) {
+					return nil, nil
+				}
 				var err error
 				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || rawEvent == nil {
 					return nil, err
 				}
 				translatedRequestBody, err = unwrapAntigravityRequest(requestPlan.requestBody)
@@ -2246,7 +2461,7 @@ func (s *Server) parseTestTranslatedSSEResponse(
 
 	result["duration_ms"] = time.Since(start).Milliseconds()
 	result["upstream_response_body"] = rawUpstreamBuf.String()
-	return parseTestStreamResponseBytes(recorder.Body.Bytes(), requestPlan.clientProtocol, resp.StatusCode, result, testReq)
+	return parseTestStreamResponseBytes(recorder.Body.Bytes(), requestPlan.clientProtocol, resp.StatusCode, result, testReq, requestPlan.requestedServiceTier())
 }
 
 // extractSSEDeltaText 从 SSE 单事件 JSON 对象提取增量文本（覆盖 OpenAI/Gemini/Anthropic/Codex）。
@@ -2416,6 +2631,7 @@ func (c *testSSECollector) rawResponse() string {
 func populateTestSSEUsageAndCost(
 	result map[string]any,
 	testReq *testutil.TestChannelRequest,
+	requestedServiceTier string,
 	usageParser *sseUsageParser,
 	lastUsage map[string]any,
 ) {
@@ -2429,7 +2645,7 @@ func populateTestSSEUsageAndCost(
 			result["api_response"] = map[string]any{"usage": usage}
 		}
 	}
-	populateTestNormalizedUsageAndCost(result, testReq, usageParser)
+	populateTestNormalizedUsageAndCost(result, testReq, requestedServiceTier, usageParser)
 }
 
 func normalizedTestUsage(parser usageParser) (map[string]any, bool) {
@@ -2450,29 +2666,59 @@ func normalizedTestUsage(parser usageParser) (map[string]any, bool) {
 	}, true
 }
 
-func populateTestNormalizedUsageAndCost(result map[string]any, testReq *testutil.TestChannelRequest, parser usageParser) {
+// populateTestNormalizedUsageAndCost 写入用量与成本；testReq.Model 此时已是实际上游模型。
+func populateTestNormalizedUsageAndCost(result map[string]any, testReq *testutil.TestChannelRequest, requestedServiceTier string, parser usageParser) {
 	usage, ok := normalizedTestUsage(parser)
+	result["codex_has_credits"] = parser.GetCodexHasCredits()
 	if ok {
 		result["usage"] = usage
 	}
 	if effort := parser.GetThinkingEffort(); effort != "" {
 		result["thinking_effort"] = effort
 	}
-
-	billableInput, output, cacheRead, _ := parser.GetUsage()
-	cache5m, cache1h, _ := parser.GetCacheBreakdown()
-	if billableInput+output+cacheRead > 0 {
-		result["cost_usd"] = util.CalculateCostDetailed(
-			model.RoutingModelName(testReq.Model),
-			billableInput,
-			output,
-			cacheRead,
-			cache5m,
-			cache1h,
-		) + parser.GetToolCostUSD()
-	} else if toolCost := parser.GetToolCostUSD(); toolCost > 0 {
-		result["cost_usd"] = toolCost
+	if cost, ok := channelTestCostUSD(testReq, testReq.Model, requestedServiceTier, parser); ok {
+		result["cost_usd"] = cost
 	}
+}
+
+// bindChannelTestBilling 快照与代理同源的计费输入：价格挂在重定向前的渠道逻辑模型上，
+// 请求模型留给计费模型回退（实际上游模型没有目录价格时按请求模型定价）。
+func (s *Server) bindChannelTestBilling(cfg *model.Config, testReq *testutil.TestChannelRequest) {
+	if cfg == nil || testReq == nil {
+		return
+	}
+	testReq.RequestModel = testReq.Model
+	if selected, ok := s.firstModelRow(cfg, testReq.Model); ok {
+		testReq.ChannelModelPrice = selected.entry.Pricing
+	}
+}
+
+// channelTestCostUSD 与代理 computeRequestCostWithPrice 同一口径计算测试成本：计费模型由
+// ResolveBillingModel 在实际上游模型与请求模型间选择，service_tier 合并请求声明与上游回显，
+// 渠道模型价格整份替换标准价格。没有 token 用量时只计工具费用；ok=false 表示无可计费用量。
+func channelTestCostUSD(testReq *testutil.TestChannelRequest, actualModel, requestedServiceTier string, parser usageParser) (float64, bool) {
+	input, output, cacheRead, cacheCreation := parser.GetUsage()
+	cache5m, cache1h, observedServiceTier := parser.GetCacheBreakdown()
+	toolCost := parser.GetToolCostUSD()
+	if input+output+cacheRead+cacheCreation <= 0 {
+		return toolCost, toolCost > 0
+	}
+	requestModel := testReq.RequestModel
+	if requestModel == "" {
+		requestModel = testReq.Model
+	}
+	billingModel := util.ResolveBillingModel(model.RoutingModelName(actualModel), model.RoutingModelName(requestModel))
+	serviceTier := resolveBillingServiceTier(requestedServiceTier, observedServiceTier)
+	return computeRequestCostWithPrice(billingModel, serviceTier, testReq.ChannelModelPrice, &fwResult{
+		InputTokens:              input,
+		OutputTokens:             output,
+		CacheReadInputTokens:     cacheRead,
+		CacheCreationInputTokens: cacheCreation,
+		Cache5mInputTokens:       cache5m,
+		Cache1hInputTokens:       cache1h,
+		ServiceTier:              serviceTier,
+		ToolCostUSD:              toolCost,
+	}), true
 }
 
 func testRequestThinkingEffort(testReq *testutil.TestChannelRequest, requestPlan *channelTestRequestPlan) string {
@@ -2562,7 +2808,7 @@ func (s *Server) parseTestNativeSSEResponse(
 	collector.applyResult(result)
 	result["raw_response"] = collector.rawResponse()
 	result["upstream_response_body"] = collector.rawResponse()
-	populateTestSSEUsageAndCost(result, testReq, usageParser, collector.lastUsage)
+	populateTestSSEUsageAndCost(result, testReq, requestPlan.requestedServiceTier(), usageParser, collector.lastUsage)
 
 	if timeoutStatus, timeoutMsg, ok := s.describeChannelTestTimeoutError(start, testReq, requestPlan.timeout, ctx.Err()); ok {
 		result["success"] = false
@@ -2719,12 +2965,12 @@ func (s *Server) applyChannelTestCapacityCooldown(
 	result["antigravity_capacity_cooldown_applied"] = true
 }
 
-func isChannelTestProtocolEndpointMissing(result map[string]any) bool {
+func isChannelTestProtocolEndpointMissing(cfg *model.Config, result map[string]any) bool {
 	if missing, _ := result["protocol_capability_missing"].(bool); missing {
 		return true
 	}
 	statusCode, ok := getResultInt(result["status_code"])
-	if !ok {
+	if !ok || isAntigravityModelNotFound(cfg, statusCode) {
 		return false
 	}
 	_, errorBody, _ := buildTestFailureClassificationInput(result)

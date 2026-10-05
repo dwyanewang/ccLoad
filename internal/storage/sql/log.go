@@ -37,13 +37,15 @@ func scanLogEntry(scanner interface {
 	var inputTokens, outputTokens, reasoningTokens, cacheReadTokens, cacheCreationTokens, cache5mTokens, cache1hTokens sql.NullInt64
 	var cost sql.NullFloat64
 	var costMultiplier sql.NullFloat64
+	var codexHasCredits int
 
 	if err := scanner.Scan(&e.ID, &timeMs, &e.Model, &actualModel, &responseModel, &logSource, &e.ChannelID,
 		&e.StatusCode, &e.Message, &duration, &isStreamingInt, &upstreamWebsocketInt, &firstByteTime, &apiKeyUsed, &apiKeyHash, &e.AuthTokenID, &clientProtocol, &upstreamProtocol, &clientIP, &baseURL, &serviceTier, &thinkingEffort,
-		&inputTokens, &outputTokens, &reasoningTokens, &cacheReadTokens, &cacheCreationTokens, &cache5mTokens, &cache1hTokens, &cost, &costMultiplier); err != nil {
+		&inputTokens, &outputTokens, &reasoningTokens, &cacheReadTokens, &cacheCreationTokens, &cache5mTokens, &cache1hTokens, &cost, &costMultiplier, &codexHasCredits); err != nil {
 		return nil, err
 	}
 
+	e.CodexHasCredits = codexHasCredits != 0
 	e.Time = model.JSONTime{Time: time.UnixMilli(timeMs)}
 
 	if actualModel.Valid {
@@ -170,10 +172,8 @@ func (s *SQLStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 	return err
 }
 
-// AddLogWithOAuthQuotaCost atomically persists one log and any OAuth weekly or
-// monthly standard-cost update caused by it. The returned IDs are the channel
-// credentials actually changed by the transaction.
-func (s *SQLStore) AddLogWithOAuthQuotaCost(ctx context.Context, e *model.LogEntry) ([]int64, error) {
+// AddLogWithOAuthQuotaCost atomically persists one log and its OAuth quota effects.
+func (s *SQLStore) AddLogWithOAuthQuotaCost(ctx context.Context, e *model.LogEntry) (OAuthQuotaLogEffects, error) {
 	return s.addLog(ctx, e, true)
 }
 
@@ -184,47 +184,47 @@ func (s *SQLStore) AddLogReplica(ctx context.Context, e *model.LogEntry) error {
 	return err
 }
 
-func (s *SQLStore) addLog(ctx context.Context, e *model.LogEntry, updateOAuthQuotaCost bool) ([]int64, error) {
+func (s *SQLStore) addLog(ctx context.Context, e *model.LogEntry, updateOAuthQuotaCost bool) (OAuthQuotaLogEffects, error) {
 	if e == nil {
-		return nil, nil
+		return OAuthQuotaLogEffects{}, nil
 	}
-	if s.isChannelDeleted(e.ChannelID) {
-		return nil, nil
+	if e.LogSource != model.LogSourceJev && s.isChannelDeleted(e.ChannelID) {
+		return OAuthQuotaLogEffects{}, nil
 	}
 	if e.Time.IsZero() {
 		e.Time = model.JSONTime{Time: time.Now()}
 	}
 	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return OAuthQuotaLogEffects{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if e.DebugData != nil {
 		if err := insertLogsWithDebug(ctx, s, tx, []*model.LogEntry{e}); err != nil {
-			return nil, err
+			return OAuthQuotaLogEffects{}, err
 		}
 	} else if _, err := s.execTx(ctx, tx, logsInsertColumns+logRowPlaceholders, logRowArgs(e)...); err != nil {
-		return nil, err
+		return OAuthQuotaLogEffects{}, err
 	}
-	var updatedChannelIDs []int64
+	var effects OAuthQuotaLogEffects
 	if updateOAuthQuotaCost {
-		updatedChannelIDs, err = s.updateOAuthQuotaCostsTx(ctx, tx, []*model.LogEntry{e})
+		effects, err = s.applyOAuthQuotaLogEffectsTx(ctx, tx, []*model.LogEntry{e})
 		if err != nil {
-			return nil, err
+			return OAuthQuotaLogEffects{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return OAuthQuotaLogEffects{}, err
 	}
-	return updatedChannelIDs, nil
+	return effects, nil
 }
 
 const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_model, response_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
-				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier) VALUES `
+				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier, codex_has_credits) VALUES `
 
-const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const logRowParams = 31
+const logRowParams = 32
 
 // BatchAddLogs 批量写入日志（单事务，多值 INSERT 提升刷盘吞吐）
 // 设计：
@@ -238,7 +238,7 @@ func (s *SQLStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) err
 }
 
 // BatchAddLogsWithOAuthQuotaCost is the batch form of AddLogWithOAuthQuotaCost.
-func (s *SQLStore) BatchAddLogsWithOAuthQuotaCost(ctx context.Context, logs []*model.LogEntry) ([]int64, error) {
+func (s *SQLStore) BatchAddLogsWithOAuthQuotaCost(ctx context.Context, logs []*model.LogEntry) (OAuthQuotaLogEffects, error) {
 	return s.batchAddLogs(ctx, logs, true)
 }
 
@@ -252,10 +252,10 @@ func (s *SQLStore) batchAddLogs(
 	ctx context.Context,
 	logs []*model.LogEntry,
 	updateOAuthQuotaCost bool,
-) ([]int64, error) {
+) (OAuthQuotaLogEffects, error) {
 	logs = s.filterDeletedChannelLogs(logs)
 	if len(logs) == 0 {
-		return nil, nil
+		return OAuthQuotaLogEffects{}, nil
 	}
 	now := time.Now()
 	for _, entry := range logs {
@@ -266,7 +266,7 @@ func (s *SQLStore) batchAddLogs(
 
 	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return OAuthQuotaLogEffects{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -282,32 +282,32 @@ func (s *SQLStore) batchAddLogs(
 
 	if len(plain) > 0 {
 		if err := batchInsertPlainLogs(ctx, s, tx, plain); err != nil {
-			return nil, err
+			return OAuthQuotaLogEffects{}, err
 		}
 	}
 
 	if len(withDebug) > 0 {
 		if err := insertLogsWithDebug(ctx, s, tx, withDebug); err != nil {
-			return nil, err
+			return OAuthQuotaLogEffects{}, err
 		}
 	}
-	var updatedChannelIDs []int64
+	var effects OAuthQuotaLogEffects
 	if updateOAuthQuotaCost {
-		updatedChannelIDs, err = s.updateOAuthQuotaCostsTx(ctx, tx, logs)
+		effects, err = s.applyOAuthQuotaLogEffectsTx(ctx, tx, logs)
 		if err != nil {
-			return nil, err
+			return OAuthQuotaLogEffects{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return OAuthQuotaLogEffects{}, err
 	}
-	return updatedChannelIDs, nil
+	return effects, nil
 }
 
 func (s *SQLStore) filterDeletedChannelLogs(logs []*model.LogEntry) []*model.LogEntry {
 	out := make([]*model.LogEntry, 0, len(logs))
 	for _, e := range logs {
-		if e == nil || s.isChannelDeleted(e.ChannelID) {
+		if e == nil || (e.LogSource != model.LogSourceJev && s.isChannelDeleted(e.ChannelID)) {
 			continue
 		}
 		out = append(out, e)
@@ -422,6 +422,7 @@ func logRowArgs(e *model.LogEntry) []any {
 		e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens,
 		e.Cache5mInputTokens, e.Cache1hInputTokens, e.Cost,
 		normalizeCostMultiplier(e.CostMultiplier),
+		e.CodexHasCredits,
 	}
 }
 
@@ -431,7 +432,7 @@ func (s *SQLStore) ListLogs(ctx context.Context, since time.Time, limit, offset 
 	// 消除 N+1：渠道过滤/名称解析用一次批量查询完成
 	baseQuery := `
 			SELECT id, time, model, actual_model, response_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
-				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier, codex_has_credits
 			FROM logs`
 
 	// time字段现在是BIGINT毫秒时间戳，需要转换为Unix毫秒进行比较
@@ -513,7 +514,7 @@ func (s *SQLStore) CountLogs(ctx context.Context, since time.Time, filter *model
 func (s *SQLStore) ListLogsRange(ctx context.Context, since, until time.Time, limit, offset int, filter *model.LogFilter) ([]*model.LogEntry, error) {
 	baseQuery := `
 		SELECT id, time, model, actual_model, response_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
-			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier, codex_has_credits
 		FROM logs`
 
 	sinceMs := since.UnixMilli()
@@ -614,6 +615,7 @@ func (s *SQLStore) GetTodayChannelURLStats(ctx context.Context, dayStart time.Ti
 		WHERE time >= ?
 			AND channel_id > 0
 			AND base_url <> ''
+			AND log_source NOT IN ('jev', 'count_tokens')
 		GROUP BY channel_id, base_url
 		ORDER BY channel_id ASC, base_url ASC
 	`
@@ -682,7 +684,7 @@ func (s *SQLStore) ListLogsRangeWithCount(ctx context.Context, since, until time
 	go func() {
 		defer wg.Done()
 		qb := NewQueryBuilder(`SELECT id, time, model, actual_model, response_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
-			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier, codex_has_credits
 			FROM logs`).
 			Where("time >= ?", sinceMs).
 			Where("time <= ?", untilMs)

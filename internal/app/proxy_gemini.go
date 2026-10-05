@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
@@ -105,7 +106,20 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 		return
 	}
 	models = s.filterVisibleModelsForRequest(c, clientProtocol, models)
+	var serviceTiers map[string]json.RawMessage
+	if c.Query("client_version") != "" {
+		models, serviceTiers, err = s.filterCodexResponsesModels(c, models)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load models"})
+			return
+		}
+	}
 	sort.Strings(models)
+
+	if c.Query("client_version") != "" {
+		handleListCodexModels(c, models, clientProtocol == "codex", serviceTiers)
+		return
+	}
 
 	if clientProtocol == "anthropic" {
 		type ModelInfo struct {

@@ -9,10 +9,13 @@ import (
 // LogSource* constants define persisted log sources plus special filter aliases.
 const (
 	LogSourceProxy          = "proxy"
+	LogSourceJev            = "jev"
 	LogSourceScheduledCheck = "scheduled_check"
 	LogSourceManualTest     = "manual_test"
 	LogSourceManualChat     = "manual_chat"
 	LogSourceCheckin        = "checkin"
+	// LogSourceCountTokens 记录 count_tokens 辅助请求：不计费，不进入渠道健康度与统计。
+	LogSourceCountTokens = "count_tokens"
 
 	LogSourceDetection = "detection"
 	LogSourceAll       = "all"
@@ -29,8 +32,12 @@ func NormalizeStoredLogSource(raw string) string {
 		return LogSourceManualTest
 	case LogSourceManualChat:
 		return LogSourceManualChat
+	case LogSourceJev:
+		return LogSourceJev
 	case LogSourceCheckin:
 		return LogSourceCheckin
+	case LogSourceCountTokens:
+		return LogSourceCountTokens
 	default:
 		return LogSourceProxy
 	}
@@ -89,6 +96,7 @@ type LogEntry struct {
 	ClientIP             string   `json:"client_ip"`                    // 客户端IP地址（新增2025-12）
 	BaseURL              string   `json:"base_url,omitempty"`           // 请求使用的上游URL（多URL场景）
 	ServiceTier          string   `json:"service_tier,omitempty"`       // 上游 service_tier/speed；Codex ultrafast 按模型计10倍
+	CodexHasCredits      bool     `json:"codex_has_credits,omitempty"`  // 窗口耗尽且使用购买额度，排除窗口成本对账
 	ThinkingEffort       string   `json:"thinking_effort,omitempty"`
 
 	// Token统计（2025-11新增，支持Claude API usage字段）

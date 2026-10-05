@@ -40,6 +40,7 @@ import (
 	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -66,6 +67,16 @@ type snapshotBarrierStore struct {
 	calls   atomic.Int32
 	ready   chan struct{}
 	release chan struct{}
+}
+
+type codexUsageReadCountingStore struct {
+	storage.Store
+	reads atomic.Int32
+}
+
+func (s *codexUsageReadCountingStore) GetConfig(ctx context.Context, id int64) (*model.Config, error) {
+	s.reads.Add(1)
+	return s.Store.GetConfig(ctx, id)
 }
 
 type anthropicMetadataChurnStore struct {
@@ -137,9 +148,9 @@ func (s *concurrentOAuthWinnerStore) CompareAndSwapOAuthCredential(
 
 func (s *concurrentOAuthWinnerStore) CompareAndSwapOAuthUsage(
 	ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string,
-) (bool, *oauthcost.Usage, error) {
+) (bool, error) {
 	if injected, err := s.injectWinner(ctx, channelID, expectedCredential); injected || err != nil {
-		return false, nil, err
+		return false, err
 	}
 	return s.Store.CompareAndSwapOAuthUsage(ctx, channelID, expectedAuthType, expectedCredential, nextCredential)
 }
@@ -158,6 +169,23 @@ func (s *concurrentOAuthWinnerStore) injectWinner(ctx context.Context, channelID
 		}
 	})
 	return injected, s.winnerErr
+}
+
+// parseTokenRequestForm fills request.Form from either grant encoding: native
+// Codex refreshes with a JSON body, authorization-code exchanges use a form.
+func parseTokenRequestForm(request *http.Request) error {
+	if !strings.HasPrefix(request.Header.Get("Content-Type"), "application/json") {
+		return request.ParseForm()
+	}
+	var grant map[string]string
+	if err := json.NewDecoder(request.Body).Decode(&grant); err != nil {
+		return err
+	}
+	request.Form = url.Values{}
+	for key, value := range grant {
+		request.Form.Set(key, value)
+	}
+	return nil
 }
 
 func codexTestIDToken(t *testing.T, email, accountID string) string {
@@ -180,6 +208,454 @@ func codexTestIDTokenForPlan(t *testing.T, email, accountID, planType string) st
 		t.Fatal(err)
 	}
 	return "x." + base64.RawURLEncoding.EncodeToString(claims) + ".y"
+}
+
+const anthropicResetTestOrganization = "11111111-2222-4333-8444-555555555555"
+const anthropicResetTestGrant = `{"cedar_ember":{"eligible":true,"at_limit":true,"next_grant_id":"private_grant","grants":[{"id":"private_grant","label":"Native reset","resets_left":2,"clears":["five_hour","seven_day"],"usable_now":true}]}}`
+
+func createAnthropicResetTestChannel(t *testing.T, store storage.Store, account string, usage *oauthcost.Usage) *model.Config {
+	t.Helper()
+	credential := &anthropicauth.Credential{Type: anthropicauth.ChannelType, AccessToken: "access-" + account, RefreshToken: "refresh-" + account,
+		Scope: "user:inference user:profile", Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), AccountUUID: account,
+		OrgUUID: "untrusted-cached-organization", QuotaCostUsage: usage}
+	raw, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.CreateConfig(context.Background(), &model.Config{Name: "reset-" + account, AuthType: model.AuthTypeAnthropicOAuth,
+		OAuthCredential: raw, URLs: model.ChannelURLs{{URL: anthropicauth.DefaultUpstreamURL, Protocols: []string{"anthropic"}}}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func anthropicResetTestResponse(request *http.Request, status int, body string) (*http.Response, error) {
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: request}, nil
+}
+
+func configureAnthropicResetTestClient(server *Server, store storage.Store, transport oauthUsageRoundTripper) {
+	server.client = &http.Client{Transport: transport}
+	server.cooldownManager = cooldown.NewManager(store, nil)
+	server.anthropicCredentials = newAnthropicCredentialManager(anthropicauth.NewService(server.client), store,
+		func(cfg *model.Config) *http.Client { return server.getClientForChannel(cfg) }, nil)
+}
+
+func requestAnthropicResetRedeemHTTP(t *testing.T, server *Server, id int64) (*httptest.ResponseRecorder, APIResponse[anthropicResetOutcome]) {
+	t.Helper()
+	router := gin.New()
+	router.POST("/admin/channels/:id/anthropic-reset-credits/redeem", server.HandleRedeemAnthropicResetCredits)
+	request := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/admin/channels/%d/anthropic-reset-credits/redeem", id), nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	var response APIResponse[anthropicResetOutcome]
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode HTTP result: %v: %s", err, recorder.Body.String())
+	}
+	return recorder, response
+}
+
+func TestHandleAnthropicResetRedeemSuccess(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	now := time.Now().UTC()
+	usage := &oauthcost.Usage{Windows: []*oauthcost.Window{
+		{Key: oauthcost.Key("", "five_hour"), Family: oauthcost.FamilyAll, WindowSeconds: 5 * 3600, StartedAt: now.Add(-time.Hour).Unix(), ResetAt: now.Add(4 * time.Hour).Unix()},
+		{Key: oauthcost.Key("", "seven_day"), Family: oauthcost.FamilyAll, WindowSeconds: 7 * 24 * 3600, StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix()},
+		{Key: oauthcost.Key("Claude Sonnet", "seven_day_sonnet"), Family: oauthcost.FamilySonnet, WindowSeconds: 7 * 24 * 3600, StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix()},
+		{Key: oauthcost.Key("Claude Fable", "seven_day_fable"), Family: oauthcost.FamilyFable, WindowSeconds: 7 * 24 * 3600, StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix()},
+	}}
+	cfg := createAnthropicResetTestChannel(t, store, "success-account", usage)
+	ctx := context.Background()
+	for _, entry := range []struct {
+		model string
+		cost  float64
+	}{{"claude-sonnet-4-5", 1}, {"claude-fable-5", 2}} {
+		if err := store.AddLog(ctx, &model.LogEntry{ChannelID: cfg.ID, Time: model.JSONTime{Time: now.Add(-time.Minute)}, Model: entry.model, StatusCode: 200, Cost: entry.cost}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetChannelCooldown(ctx, cfg.ID, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	posts := 0
+	transport := oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			posts++
+			if request.URL.Path != "/api/organizations/"+anthropicResetTestOrganization+"/reset_rate_limits" || request.GetBody != nil || request.Header.Get("Idempotency-Key") != "" {
+				t.Errorf("unsafe claim request: %s %v", request.URL, request.Header)
+			}
+			var payload map[string]string
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			requestID, err := uuid.Parse(payload["request_id"])
+			if payload["program"] != "cedar_ember" || payload["grant_id"] != "private_grant" || err != nil || requestID == uuid.Nil {
+				t.Errorf("claim payload = %v", payload)
+			}
+			return anthropicResetTestResponse(request, 200, `{"result":"reset","cleared":["five_hour","private_identifier"],"reason":"private_grant"}`)
+		}
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"},"account":{"subscription_type":"max"}}`)
+		}
+		if request.URL.Query().Get("skip_spend") == "1" {
+			return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+		}
+		return anthropicResetTestResponse(request, 200, fmt.Sprintf(`{"five_hour":{"utilization":0,"resets_at":%q},"seven_day":{"utilization":40,"resets_at":%q},"seven_day_sonnet":{"utilization":50,"resets_at":%q},"seven_day_overage_included":{"utilization":60,"resets_at":%q}}`, now.Add(4*time.Hour).Format(time.RFC3339), now.Add(6*24*time.Hour).Format(time.RFC3339), now.Add(6*24*time.Hour).Format(time.RFC3339), now.Add(6*24*time.Hour).Format(time.RFC3339)))
+	})
+	configureAnthropicResetTestClient(server, store, transport)
+	w, response := requestAnthropicResetRedeemHTTP(t, server, cfg.ID)
+	if w.Code != 200 || !response.Success || response.Data.Outcome != "reset" || posts != 1 || !reflect.DeepEqual(response.Data.Cleared, []string{"five_hour"}) {
+		t.Fatalf("first result = %d %+v posts=%d", w.Code, response, posts)
+	}
+	for _, secret := range []string{"private_grant", "private_identifier", anthropicResetTestOrganization, "access-success-account"} {
+		if strings.Contains(w.Body.String(), secret) {
+			t.Fatalf("private value leaked: %s", w.Body.String())
+		}
+	}
+	fresh, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := anthropicauth.ParseCredential([]byte(fresh.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.QuotaCostUsage.EpochAt != 0 {
+		t.Fatal("partial reset changed the global quota epoch")
+	}
+	views, err := store.OAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{cfg.ID: credential.QuotaCostUsage}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]int64{"|five_hour": 0, "|seven_day": 3_000_000, "claude sonnet|seven_day_sonnet": 1_000_000, "claude fable|seven_day_fable": 2_000_000} {
+		window := views[cfg.ID].FindWindow(key)
+		if window == nil || window.StandardCostMicroUSD != want {
+			t.Fatalf("window %s = %+v want %d", key, window, want)
+		}
+	}
+	cooldowns, err := store.GetAllChannelCooldowns(ctx)
+	if err != nil || cooldowns[cfg.ID].After(time.Now()) {
+		t.Fatalf("cooldown remained: %v %v", cooldowns, err)
+	}
+}
+
+func TestHandleAnthropicResetRedeemUnknownAllowsLaterExplicitAttempt(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name           string
+		status         int
+		body           string
+		transportError bool
+	}{
+		{"network", 0, "", true}, {"malformed", 200, "{", false}, {"server-error", 500, "{}", false},
+		{"redirect", 302, "", false}, {"unconfirmed", 200, `{"result":"reset","reason":"reset_unconfirmed"}`, false},
+		{"unavailable", 200, `{"result":"unavailable"}`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, store, cleanup := setupAdminTestServer(t)
+			defer cleanup()
+			first := createAnthropicResetTestChannel(t, store, "unknown-first", nil)
+			second := createAnthropicResetTestChannel(t, store, "unknown-second", nil)
+			before, _ := store.GetConfig(context.Background(), first.ID)
+			posts, queries := 0, 0
+			requestIDs := make(map[string]bool)
+			transport := oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+				if request.Method == http.MethodPost {
+					posts++
+					var payload map[string]string
+					if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+						t.Fatal(err)
+					}
+					requestID, err := uuid.Parse(payload["request_id"])
+					if err != nil || requestID == uuid.Nil || requestIDs[payload["request_id"]] {
+						t.Fatalf("request ID must be a fresh UUID: %v", payload)
+					}
+					requestIDs[payload["request_id"]] = true
+					if test.transportError {
+						return nil, errors.New("connection lost")
+					}
+					return anthropicResetTestResponse(request, test.status, test.body)
+				}
+				if request.URL.Path == "/api/oauth/profile" {
+					return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+				}
+				queries++
+				return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+			})
+			configureAnthropicResetTestClient(server, store, transport)
+			w, result := requestAnthropicResetRedeemHTTP(t, server, first.ID)
+			if w.Code != 200 || result.Data.Outcome != "unknown" || result.Data.Reason == "" || posts != 1 || queries != 1 {
+				t.Fatalf("unknown = %d %+v posts=%d", w.Code, result, posts)
+			}
+			after, _ := store.GetConfig(context.Background(), first.ID)
+			if after.OAuthCredential != before.OAuthCredential {
+				t.Fatal("unknown reset changed local quota")
+			}
+			for _, id := range []int64{first.ID, second.ID} {
+				w, next := requestAnthropicResetRedeemHTTP(t, server, id)
+				if w.Code != 200 || next.Data.Outcome != "unknown" || posts != queries {
+					t.Fatalf("later explicit attempt = %d %+v posts=%d queries=%d", w.Code, next, posts, queries)
+				}
+			}
+			if posts != 3 {
+				t.Fatalf("explicit attempts = %d, want 3", posts)
+			}
+		})
+	}
+}
+
+func TestHandleAnthropicResetRedeemConcurrentChannelAndOrganization(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	first := createAnthropicResetTestChannel(t, store, "concurrent-first", nil)
+	second := createAnthropicResetTestChannel(t, store, "concurrent-second", nil)
+	claimStarted, releaseClaim := make(chan struct{}), make(chan struct{})
+	var posts atomic.Int32
+	configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			if posts.Add(1) == 1 {
+				close(claimStarted)
+				<-releaseClaim
+			}
+			return anthropicResetTestResponse(request, 200, `{"result":"not_limited"}`)
+		}
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+		}
+		return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+	}))
+	finished := make(chan int, 1)
+	go func() {
+		w, _ := requestAnthropicResetRedeemHTTP(t, server, first.ID)
+		finished <- w.Code
+	}()
+	select {
+	case <-claimStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim never started")
+	}
+	for _, id := range []int64{first.ID, second.ID} {
+		w, _ := requestAnthropicResetRedeemHTTP(t, server, id)
+		if w.Code != 409 || posts.Load() != 1 {
+			t.Errorf("concurrent channel %d = %d posts=%d", id, w.Code, posts.Load())
+		}
+	}
+	close(releaseClaim)
+	if status := <-finished; status != 200 {
+		t.Fatalf("first claim status = %d", status)
+	}
+	w, result := requestAnthropicResetRedeemHTTP(t, server, second.ID)
+	if w.Code != 200 || result.Data.Outcome != "not_limited" || posts.Load() != 2 {
+		t.Fatalf("later claim = %d %+v posts=%d", w.Code, result, posts.Load())
+	}
+}
+
+func TestHandleAnthropicResetRedeemRequiresFreshEligibility(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	cfg := createAnthropicResetTestChannel(t, store, "preflight-account", nil)
+	var posts, queries int
+	configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			posts++
+			return anthropicResetTestResponse(request, 200, `{"result":"reset"}`)
+		}
+		queries++
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+		}
+		return anthropicResetTestResponse(request, 200, `{"cedar_ember":{"eligible":true,"at_limit":false,"next_grant_id":"private_grant","grants":[{"id":"private_grant","resets_left":2,"clears":["five_hour"],"usable_now":true}]}}`)
+	}))
+	w, _ := requestAnthropicResetRedeemHTTP(t, server, cfg.ID)
+	if w.Code != 409 || queries != 2 || posts != 0 {
+		t.Fatalf("fresh eligibility = %d queries=%d posts=%d", w.Code, queries, posts)
+	}
+}
+
+func TestHandleAnthropicResetRedeemExhaustedPreparationSkipsClaim(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	cfg := createAnthropicResetTestChannel(t, store, "exhausted-account", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	posts := 0
+	configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			posts++
+			return anthropicResetTestResponse(request, 200, `{"result":"reset"}`)
+		}
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+		}
+		cancel() // the eligibility answer arrives as the request budget runs out
+		return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+	}))
+	router := gin.New()
+	router.POST("/admin/channels/:id/anthropic-reset-credits/redeem", server.HandleRedeemAnthropicResetCredits)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("/admin/channels/%d/anthropic-reset-credits/redeem", cfg.ID), nil))
+	var response APIResponse[struct {
+		Code string `json:"code"`
+	}]
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusGatewayTimeout || response.Data.Code != "reset_prepare_timeout" || posts != 0 {
+		t.Fatalf("exhausted preparation = %d %s posts=%d", recorder.Code, recorder.Body.String(), posts)
+	}
+}
+
+func TestHandleAnthropicResetRedeemMissingWindowSurvivesFailedRefresh(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	cfg := createAnthropicResetTestChannel(t, store, "missing-window-account", nil)
+	now := time.Now().UTC()
+	if err := store.AddLog(context.Background(), &model.LogEntry{ChannelID: cfg.ID, Time: model.JSONTime{Time: now.Add(-time.Hour)}, Model: "claude-sonnet-4-5", StatusCode: 200, Cost: 5}); err != nil {
+		t.Fatal(err)
+	}
+	refreshFails := true
+	configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			return anthropicResetTestResponse(request, 200, `{"result":"reset","cleared":["seven_day"]}`)
+		}
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+		}
+		if request.URL.Query().Get("skip_spend") == "1" {
+			return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+		}
+		if refreshFails {
+			return anthropicResetTestResponse(request, 503, `{}`)
+		}
+		return anthropicResetTestResponse(request, 200, fmt.Sprintf(`{"five_hour":{"utilization":20,"resets_at":%q},"seven_day":{"utilization":0,"resets_at":%q}}`, now.Add(4*time.Hour).Format(time.RFC3339), now.Add(6*24*time.Hour).Format(time.RFC3339)))
+	}))
+	w, result := requestAnthropicResetRedeemHTTP(t, server, cfg.ID)
+	if w.Code != 200 || result.Data.Outcome != "reset" || len(result.Data.Warnings) == 0 {
+		t.Fatalf("reset with failed refresh = %d %+v", w.Code, result)
+	}
+	refreshFails = false
+	c, w := newTestContext(t, newRequest(http.MethodPost, fmt.Sprintf("/admin/channels/%d/oauth-usage", cfg.ID), nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(cfg.ID, 10)}}
+	server.HandleOAuthUsage(c)
+	var usageResponse APIResponse[oauthUsageSummary]
+	if err := json.Unmarshal(w.Body.Bytes(), &usageResponse); err != nil || w.Code != 200 {
+		t.Fatalf("later usage = %d %v %s", w.Code, err, w.Body.String())
+	}
+	for _, window := range usageResponse.Data.Windows {
+		want := int64(5_000_000)
+		if window.Kind == "seven_day" {
+			want = 0
+		}
+		if window.StandardCostMicroUSD == nil || *window.StandardCostMicroUSD != want {
+			t.Fatalf("later %s cost = %v want %d", window.Kind, window.StandardCostMicroUSD, want)
+		}
+	}
+}
+
+func TestHandleAnthropicResetRedeemMetadataRefreshesButClaimDoesNotRetry(t *testing.T) {
+	t.Parallel()
+	for _, rejected := range []string{"profile", "usage", "claim"} {
+		t.Run(rejected, func(t *testing.T) {
+			server, store, cleanup := setupAdminTestServer(t)
+			defer cleanup()
+			cfg := createAnthropicResetTestChannel(t, store, "refresh-account", nil)
+			posts, refreshes := 0, 0
+			configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path == "/token" {
+					refreshes++
+					return anthropicResetTestResponse(request, 200, `{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600,"scope":"user:inference user:profile","token_type":"Bearer"}`)
+				}
+				if request.Method == http.MethodPost {
+					posts++
+					if rejected == "claim" {
+						return anthropicResetTestResponse(request, 401, `{}`)
+					}
+					if request.Header.Get("Authorization") != "Bearer rotated-access" {
+						t.Errorf("claim used rejected token: %q", request.Header.Get("Authorization"))
+					}
+					return anthropicResetTestResponse(request, 200, `{"result":"not_limited"}`)
+				}
+				oldToken := request.Header.Get("Authorization") == "Bearer access-refresh-account"
+				if request.URL.Path == "/api/oauth/profile" {
+					if rejected == "profile" && oldToken {
+						return anthropicResetTestResponse(request, 401, `{}`)
+					}
+					return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+				}
+				if rejected == "usage" && oldToken {
+					return anthropicResetTestResponse(request, 401, `{}`)
+				}
+				return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+			}))
+			server.anthropicCredentials.service.TokenURL = "https://oauth.example.test/token"
+			w, response := requestAnthropicResetRedeemHTTP(t, server, cfg.ID)
+			wantOutcome, wantRefreshes := "not_limited", 1
+			if rejected == "claim" {
+				wantOutcome, wantRefreshes = "ineligible", 0
+			}
+			if w.Code != 200 || response.Data.Outcome != wantOutcome || posts != 1 || refreshes != wantRefreshes {
+				t.Fatalf("401 at %s = %d %+v claims=%d refreshes=%d", rejected, w.Code, response, posts, refreshes)
+			}
+		})
+	}
+}
+
+func TestHandleAnthropicResetRedeemChangedIdentitySkipsLocalRepair(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	cfg := createAnthropicResetTestChannel(t, store, "original-account", nil)
+	ctx := context.Background()
+	configureAnthropicResetTestClient(server, store, oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost {
+			fresh, err := store.GetConfig(ctx, cfg.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			credential, err := anthropicauth.ParseCredential([]byte(fresh.OAuthCredential))
+			if err != nil {
+				t.Fatal(err)
+			}
+			credential.AccountUUID = "new-account"
+			raw, err := credential.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := store.CompareAndSwapOAuthCredential(ctx, cfg.ID, model.AuthTypeAnthropicOAuth, fresh.OAuthCredential, raw); err != nil || !changed {
+				t.Fatal(err)
+			}
+			if err = store.SetChannelCooldown(ctx, cfg.ID, time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			return anthropicResetTestResponse(request, 200, `{"result":"reset","cleared":["seven_day"]}`)
+		}
+		if request.URL.Path == "/api/oauth/profile" {
+			return anthropicResetTestResponse(request, 200, `{"organization":{"uuid":"`+anthropicResetTestOrganization+`"}}`)
+		}
+		if request.URL.Query().Get("skip_spend") != "1" {
+			t.Error("refreshed the replacement identity after the original reset")
+		}
+		return anthropicResetTestResponse(request, 200, anthropicResetTestGrant)
+	}))
+	w, response := requestAnthropicResetRedeemHTTP(t, server, cfg.ID)
+	if w.Code != 200 || response.Data.Outcome != "reset" || response.Data.Usage != nil || len(response.Data.Warnings) == 0 {
+		t.Fatalf("changed identity result = %d %+v", w.Code, response)
+	}
+	cooldowns, _ := store.GetAllChannelCooldowns(ctx)
+	if !cooldowns[cfg.ID].After(time.Now()) {
+		t.Fatal("reset cleared the replacement account's cooldown")
+	}
+	fresh, _ := store.GetConfig(ctx, cfg.ID)
+	credential, err := anthropicauth.ParseCredential([]byte(fresh.OAuthCredential))
+	if err != nil || credential.AccountUUID != "new-account" || credential.QuotaCostUsage != nil {
+		t.Fatalf("reset changed replacement quota: %+v %v", credential, err)
+	}
 }
 
 func newCodexAuthTestStore(t *testing.T) storage.Store {
@@ -252,7 +728,7 @@ func newAcceptedCodexImportClient() *http.Client {
 				Request:    request,
 			}, nil
 		case request.Method == http.MethodPost && request.URL.String() == codexauth.DefaultTokenURL:
-			if err := request.ParseForm(); err != nil {
+			if err := parseTokenRequestForm(request); err != nil {
 				return nil, fmt.Errorf("parse Codex refresh request: %w", err)
 			}
 			if request.Form.Get("grant_type") != "refresh_token" || request.Form.Get("refresh_token") == "" {
@@ -358,6 +834,7 @@ func codeBuddyModelCatalogTestClient() *http.Client {
 }
 
 func TestCodeBuddyCredentialImportUsesLiveModels(t *testing.T) {
+	t.Parallel()
 	for _, unavailable := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unavailable=%v", unavailable), func(t *testing.T) {
 			srv := newInMemoryServer(t)
@@ -394,6 +871,7 @@ func TestCodeBuddyCredentialImportUsesLiveModels(t *testing.T) {
 }
 
 func TestCodeBuddyBatchImportWorkbuddyJSON(t *testing.T) {
+	t.Parallel()
 	srv := newInMemoryServer(t)
 	srv.client = codeBuddyModelCatalogTestClient()
 	var body bytes.Buffer
@@ -438,6 +916,7 @@ func TestCodeBuddyBatchImportWorkbuddyJSON(t *testing.T) {
 }
 
 func TestCodeBuddyImportRefreshAndReauthorization(t *testing.T) {
+	t.Parallel()
 	for _, reauthorize := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reauthorize=%v", reauthorize), func(t *testing.T) {
 			srv := newInMemoryServer(t)
@@ -513,6 +992,7 @@ func TestCodeBuddyImportRefreshAndReauthorization(t *testing.T) {
 }
 
 func TestCodeBuddyOAuthSessionOwnershipAndCancellation(t *testing.T) {
+	t.Parallel()
 	srv := newInMemoryServer(t)
 	srv.codeBuddyService.Client = &http.Client{Transport: oauthUsageRoundTripper(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == "/v2/plugin/auth/state" {
@@ -623,7 +1103,8 @@ func TestHandleImportOAuthCredentialsDetectsXAIAndExpandsCredentialsMap(t *testi
 	}
 	wantPriority := map[string]int{"xAI-a@example.com": 10, "xAI-b@example.com": 20}
 	for _, channel := range channels {
-		if !channel.UsesXAIOAuth() || channel.Priority != wantPriority[channel.Name] || len(channel.ModelEntries) != len(xaiOAuthDefaultModels) {
+		if !channel.UsesXAIOAuth() || channel.Priority != wantPriority[channel.Name] ||
+			len(channel.ModelEntries) != len(xaiOAuthDefaultModels) || !channel.SupportsModel("grok-4.7") {
 			t.Fatalf("unexpected xAI channel: %#v", channel)
 		}
 	}
@@ -710,6 +1191,7 @@ func TestXAIOAuthHandlersGenerateLocallyAndExchangeManualCallback(t *testing.T) 
 }
 
 func TestXAIOAuthAcceptsBareCodeForCurrentAdminSession(t *testing.T) {
+	t.Parallel()
 	client := &http.Client{Transport: oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
 		if err := request.ParseForm(); err != nil || request.Form.Get("code") != "bare-code" {
 			return nil, fmt.Errorf("unexpected bare-code request: %v %s", err, request.Form.Encode())
@@ -738,6 +1220,7 @@ func TestXAIOAuthAcceptsBareCodeForCurrentAdminSession(t *testing.T) {
 }
 
 func TestXAIOAuthCancellationRespectsCommitBoundary(t *testing.T) {
+	t.Parallel()
 	newService := func() *xaiauth.Service {
 		return xaiauth.NewService(&http.Client{Transport: oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
 			return &http.Response{
@@ -893,7 +1376,7 @@ func waitXAICredentialImportTestJob(
 }
 
 func TestXAIRefreshTokenImportAcceptsMoreThanHundredWithBoundedConcurrencyAndRedactsSecrets(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	var active atomic.Int32
 	var maximum atomic.Int32
@@ -949,14 +1432,11 @@ func TestXAIRefreshTokenImportAcceptsMoreThanHundredWithBoundedConcurrencyAndRed
 }
 
 func TestXAIOAuthInteractivePersistenceUpdatesStableIdentity(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	first := xaiTestCredential("access-first", "refresh-first", time.Now().Add(time.Hour))
 	first.IDToken = xaiTestJWT("first@example.com", "stable-subject")
-	first.QuotaCostUsage = &oauthcost.Usage{Windows: []*oauthcost.Window{{
-		Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
-		StartedAt: time.Now().Add(-24 * time.Hour).Unix(), ResetAt: time.Now().Add(6 * 24 * time.Hour).Unix(),
-		StandardCostMicroUSD: 8_500_000,
-	}}}
+	first.QuotaCostUsage = testQuotaCostUsage(8500)
 	if err := first.Normalize(); err != nil {
 		t.Fatal(err)
 	}
@@ -977,12 +1457,13 @@ func TestXAIOAuthInteractivePersistenceUpdatesStableIdentity(t *testing.T) {
 	persisted, err := xaiauth.ParseCredential([]byte(updated.OAuthCredential))
 	if err != nil || persisted.AccessToken != "access-rotated" || persisted.RefreshToken != "refresh-rotated" ||
 		oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
-		oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 8_500_000 {
+		quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 8500 {
 		t.Fatalf("persisted credential = %s, error=%v", persisted, err)
 	}
 }
 
 func TestXAIOAuthConcurrentInteractivePersistenceCreatesOneStableIdentity(t *testing.T) {
+	t.Parallel()
 	baseStore := newCodexAuthTestStore(t)
 	store := &snapshotBarrierStore{Store: baseStore, ready: make(chan struct{}), release: make(chan struct{})}
 	credential := xaiTestCredential("access", "refresh", time.Now().Add(time.Hour))
@@ -1020,6 +1501,7 @@ func TestXAIOAuthConcurrentInteractivePersistenceCreatesOneStableIdentity(t *tes
 }
 
 func TestCodexPersonalAccessTokenConcurrentPersistenceCreatesOneStableIdentity(t *testing.T) {
+	t.Parallel()
 	baseStore := newCodexAuthTestStore(t)
 	store := &snapshotBarrierStore{Store: baseStore, ready: make(chan struct{}), release: make(chan struct{})}
 	credential := &codexauth.Credential{
@@ -1073,6 +1555,7 @@ func TestCodexPersonalAccessTokenConcurrentPersistenceCreatesOneStableIdentity(t
 }
 
 func TestXAIFilePersistenceIsCreateOnlyAndCaseInsensitive(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	first := xaiTestCredential("access-first", "refresh-first", time.Now().Add(time.Hour))
 	first.Email = "User@Example.com"
@@ -1236,6 +1719,7 @@ func TestXAISSOImportReportsErrorsWithBoundedConcurrencyAndRedactsSecrets(t *tes
 }
 
 func TestCodexOAuthCreatesDatabaseChannel(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	idToken := codexTestIDToken(t, "user@example.com", "account-1")
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1310,6 +1794,7 @@ func TestCodexOAuthCreatesDatabaseChannel(t *testing.T) {
 }
 
 func TestAntigravityOAuthCreatesDatabaseChannel(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	oauthServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1407,15 +1892,12 @@ func TestAntigravityOAuthCreatesDatabaseChannel(t *testing.T) {
 }
 
 func TestCreateAntigravityChannelUpdatesExistingConcurrency(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	existingCredential := &antigravityauth.Credential{
 		Type: antigravityauth.ChannelType, AccessToken: "old-at", RefreshToken: "old-rt",
 		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Email: "existing@example.com", ProjectID: "old-project",
-		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
-			Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
-			StartedAt: time.Now().Add(-24 * time.Hour).Unix(), ResetAt: time.Now().Add(6 * 24 * time.Hour).Unix(),
-			StandardCostMicroUSD: 9_500_000,
-		}}},
+		QuotaCostUsage: testQuotaCostUsage(9500),
 	}
 	existingPayload, err := existingCredential.JSON()
 	if err != nil {
@@ -1423,6 +1905,11 @@ func TestCreateAntigravityChannelUpdatesExistingConcurrency(t *testing.T) {
 	}
 	existingConfig := newAntigravityOAuthChannel("Antigravity-existing@example.com", existingPayload)
 	existingConfig.MaxConcurrency = 0
+	variants := []model.ModelEntry{
+		{Model: "auto", RedirectModel: "claude-sonnet-4-6", Disabled: true, Pricing: channelPrice(1, 2)},
+		{Model: "auto", RedirectModel: "claude-opus-4-6", Pricing: channelPrice(3, 4)},
+	}
+	existingConfig.ModelEntries = append(existingConfig.ModelEntries, variants...)
 	existing, err := store.CreateConfig(context.Background(), existingConfig)
 	if err != nil {
 		t.Fatal(err)
@@ -1447,12 +1934,133 @@ func TestCreateAntigravityChannelUpdatesExistingConcurrency(t *testing.T) {
 	if persisted.MaxConcurrency != antigravityOAuthMaxConcurrency || parseErr != nil ||
 		persistedCredential.AccessToken != "new-at" || persistedCredential.QuotaCostUsage == nil ||
 		oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|secondary") == nil ||
-		oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 9_500_000 {
+		quotaCostMarker(persistedCredential.QuotaCostUsage, "codex|secondary") != 9500 {
 		t.Fatalf("persisted Antigravity channel = %#v", persisted)
+	}
+	var preserved []model.ModelEntry
+	for _, entry := range persisted.ModelEntries {
+		if entry.Model == "auto" {
+			preserved = append(preserved, entry)
+		}
+	}
+	if !reflect.DeepEqual(preserved, variants) {
+		t.Fatalf("reauthorization changed Antigravity model variants: got=%+v want=%+v", preserved, variants)
+	}
+}
+
+func TestCreateAntigravityChannelPreservesModelEditAtCommit(t *testing.T) {
+	t.Parallel()
+	store := newCodexAuthTestStore(t)
+	ctx := context.Background()
+	oldCredential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "old-at", RefreshToken: "old-rt",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Email: "existing@example.com", ProjectID: "old-project",
+	}
+	oldPayload, err := oldCredential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := newAntigravityOAuthChannel("original", oldPayload)
+	initial.ModelEntries = append(initial.ModelEntries, model.ModelEntry{Model: "auto", RedirectModel: "target-a"})
+	created, err := store.CreateConfig(ctx, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interleaved := &modelStateEditStore{Store: store}
+	interleaved.edit = func(ctx context.Context) error {
+		current, err := store.GetConfig(ctx, created.ID)
+		if err != nil {
+			return err
+		}
+		current.Name = "admin-edited"
+		current.ModelEntries = append(current.ModelEntries, model.ModelEntry{
+			Model: "auto", RedirectModel: "target-b", Disabled: true, Pricing: channelPrice(3, 4),
+		})
+		current.ScheduledCheckModel = "auto"
+		_, err = store.UpdateConfig(ctx, created.ID, current)
+		return err
+	}
+	newCredential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "new-at", RefreshToken: "new-rt",
+		Expired: time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339), Email: "existing@example.com", ProjectID: "new-project",
+	}
+	updated, err := createAntigravityChannel(ctx, interleaved, newCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var variants []model.ModelEntry
+	for _, entry := range updated.ModelEntries {
+		if entry.Model == "auto" {
+			variants = append(variants, entry)
+		}
+	}
+	if updated.Name != "admin-edited" || updated.MaxConcurrency != antigravityOAuthMaxConcurrency ||
+		updated.ScheduledCheckModel != "auto" || !reflect.DeepEqual(variants, []model.ModelEntry{
+		{Model: "auto", RedirectModel: "target-a"},
+		{Model: "auto", RedirectModel: "target-b", Disabled: true, Pricing: channelPrice(3, 4)},
+	}) {
+		t.Fatalf("reauthorization lost concurrent edit: %+v", updated)
+	}
+}
+
+func TestCreateAntigravityChannelPreservesQuotaCostUpdateAtModelCommit(t *testing.T) {
+	t.Parallel()
+	store := newCodexAuthTestStore(t)
+	ctx := context.Background()
+	oldCredential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "old-at", RefreshToken: "old-rt",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Email: "existing@example.com", ProjectID: "project",
+	}
+	oldPayload, err := oldCredential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateConfig(ctx, newAntigravityOAuthChannel("original", oldPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	interleaved := &modelStateEditStore{Store: store}
+	interleaved.edit = func(ctx context.Context) error {
+		current, err := store.GetConfig(ctx, created.ID)
+		if err != nil {
+			return err
+		}
+		credential, err := antigravityauth.ParseCredential([]byte(current.OAuthCredential))
+		if err != nil {
+			return err
+		}
+		credential.QuotaCostUsage = testQuotaCostUsage(4250)
+		updatedJSON, err := credential.JSON()
+		if err != nil {
+			return err
+		}
+		updated, err := store.CompareAndSwapOAuthCredential(ctx, created.ID, model.AuthTypeAntigravityOAuth, current.OAuthCredential, updatedJSON)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return errors.New("concurrent quota cost update lost credential race")
+		}
+		return nil
+	}
+	newCredential := &antigravityauth.Credential{
+		Type: antigravityauth.ChannelType, AccessToken: "new-at", RefreshToken: "new-rt",
+		Expired: time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339), Email: "existing@example.com", ProjectID: "project",
+	}
+	updated, err := createAntigravityChannel(ctx, interleaved, newCredential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := antigravityauth.ParseCredential([]byte(updated.OAuthCredential))
+	if err != nil || persisted.AccessToken != "new-at" || persisted.RefreshToken != "new-rt" ||
+		oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
+		quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 4250 {
+		t.Fatalf("reauthorization lost concurrent quota cost update: (%+v, %v)", persisted, err)
 	}
 }
 
 func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
+	t.Parallel()
 	t.Run("Anthropic", func(t *testing.T) {
 		baseStore := newCodexAuthTestStore(t)
 		expired := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
@@ -1469,7 +2077,7 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 		winner := *current
-		winner.QuotaCostUsage = testQuotaCostUsage(1_250_000)
+		winner.QuotaCostUsage = testQuotaCostUsage(1250)
 		winnerJSON, err := winner.JSON()
 		if err != nil {
 			t.Fatal(err)
@@ -1484,7 +2092,7 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 		persisted, err := anthropicauth.ParseCredential([]byte(updated.OAuthCredential))
 		if err != nil || persisted.AccessToken != "new-at" || persisted.RefreshToken != "new-rt" ||
 			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
-			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 1_250_000 {
+			quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 1250 {
 			t.Fatalf("persisted Anthropic credential = (%#v, %v)", persisted, err)
 		}
 	})
@@ -1505,7 +2113,7 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 		winner := *current
-		winner.QuotaCostUsage = testQuotaCostUsage(2_250_000)
+		winner.QuotaCostUsage = testQuotaCostUsage(2250)
 		winnerJSON, err := winner.JSON()
 		if err != nil {
 			t.Fatal(err)
@@ -1520,7 +2128,7 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 		persisted, err := antigravityauth.ParseCredential([]byte(updated.OAuthCredential))
 		if err != nil || persisted.AccessToken != "new-at" || persisted.RefreshToken != "new-rt" ||
 			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
-			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 2_250_000 {
+			quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 2250 {
 			t.Fatalf("persisted Antigravity credential = (%#v, %v)", persisted, err)
 		}
 	})
@@ -1541,7 +2149,7 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 			t.Fatal(err)
 		}
 		winner := *current
-		winner.QuotaCostUsage = testQuotaCostUsage(3_250_000)
+		winner.QuotaCostUsage = testQuotaCostUsage(3250)
 		winnerJSON, err := winner.JSON()
 		if err != nil {
 			t.Fatal(err)
@@ -1559,22 +2167,61 @@ func TestOAuthReauthorizationRetriesConcurrentQuotaCostUpdate(t *testing.T) {
 		persisted, err := xaiauth.ParseCredential([]byte(updated.OAuthCredential))
 		if err != nil || persisted.AccessToken != "new-at" || persisted.RefreshToken != "new-rt" ||
 			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
-			oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 3_250_000 {
+			quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 3250 {
 			t.Fatalf("persisted xAI credential = (%#v, %v)", persisted, err)
 		}
 	})
 }
 
-func testQuotaCostUsage(costMicroUSD int64) *oauthcost.Usage {
+func testQuotaCostUsage(markerSeconds int64) *oauthcost.Usage {
 	now := time.Now().UTC()
+	startedAt := now.Add(-24 * time.Hour).Unix()
 	return &oauthcost.Usage{Windows: []*oauthcost.Window{{
 		Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
-		StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
-		StandardCostMicroUSD: costMicroUSD,
+		StartedAt: startedAt, ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
+		CountFromAt: startedAt + markerSeconds,
 	}}}
 }
 
+func quotaCostMarker(usage *oauthcost.Usage, key string) int64 {
+	w := oauthcost.Find(usage, key)
+	if w == nil || w.CountFromAt == 0 {
+		return -1
+	}
+	return w.CountFromAt - w.StartedAt
+}
+
+func seedQuotaLedger(t testing.TB, store storage.Store, channelID int64, at time.Time, modelName string, costMicroUSD int64) {
+	t.Helper()
+	if err := store.AddLog(context.Background(), &model.LogEntry{
+		Time: model.JSONTime{Time: at}, ChannelID: channelID, Model: modelName,
+		StatusCode: http.StatusOK, Cost: float64(costMicroUSD) / 1e6,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func quotaCostViewAt(t testing.TB, store storage.Store, channelID int64, at time.Time) *oauthcost.CostView {
+	t.Helper()
+	ctx := context.Background()
+	cfg, err := store.GetConfig(ctx, channelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := parseOAuthUsageCredentialState(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := oauthcost.EffectiveUsage(state.quotaCostUsage, state.oauthUsage)
+	views, err := store.OAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{channelID: usage}, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return views[channelID]
+}
+
 func TestAntigravityChannelEditorExposesCredentialOnlyInEditor(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &antigravityauth.Credential{
@@ -1819,7 +2466,7 @@ func TestHandleImportCodexCredentialUsesAcceptedAccessTokenAndFailsUnusableCrede
 			}
 			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
 		case request.Method == http.MethodPost && request.URL.String() == codexauth.DefaultTokenURL:
-			if err := request.ParseForm(); err != nil {
+			if err := parseTokenRequestForm(request); err != nil {
 				return nil, err
 			}
 			if request.Form.Get("refresh_token") == "rt-refreshable" {
@@ -1878,7 +2525,7 @@ func TestHandleImportCodexCredentialUsesAcceptedAccessTokenAndFailsUnusableCrede
 		)
 		if file.personal {
 			credential = fmt.Sprintf(
-				`{"type":"codex","auth_mode":"personalAccessToken","access_token":%q,"chatgpt_user_id":"forged-user","account_id":%q,"email":"forged@example.com","plan_type":"free","quota_cost_usage":{"windows":[{"key":"codex|secondary","window_seconds":604800,"started_at":1893456000,"reset_at":1894060800,"standard_cost_microusd":6500000}]}}`,
+				`{"type":"codex","auth_mode":"personalAccessToken","access_token":%q,"chatgpt_user_id":"forged-user","account_id":%q,"email":"forged@example.com","plan_type":"free","quota_cost_usage":{"windows":[{"key":"codex|secondary","window_seconds":604800,"started_at":1893456000,"reset_at":1894060800,"count_from_at":1893462500}]}}`,
 				file.accessToken, file.accountID,
 			)
 		}
@@ -1943,7 +2590,7 @@ func TestHandleImportCodexCredentialUsesAcceptedAccessTokenAndFailsUnusableCrede
 		personal.Email != "verified-pat@example.com" || personal.PlanType != "plus" || !personal.AccountFedRAMP ||
 		personal.QuotaCostUsage == nil ||
 		oauthcost.Find(personal.QuotaCostUsage, "codex|secondary") == nil ||
-		oauthcost.Find(personal.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 6_500_000 {
+		oauthcost.Find(personal.QuotaCostUsage, "codex|secondary").CountFromAt != 1893462500 {
 		t.Fatalf("persisted PAT did not use whoami identity and local quota state: %#v", personal)
 	}
 	for _, secret := range []string{"at-stale", "rt-refreshable", "at-short-lived", "rt-short-lived-invalid", "at-transient", "rt-transient", "at-unusable", "rt-unusable", "at-refreshed", "rt-rotated", "at-personal-import"} {
@@ -2323,7 +2970,7 @@ func TestHandleImportOAuthCredentialsSortsPriorityByCredentialFileName(t *testin
 }
 
 func TestHandleImportOAuthCredentialsValidatesConcurrentlyAndContinuesAfterNetworkFailure(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	var active, maxActive atomic.Int32
 	concurrent := make(chan struct{})
@@ -2953,6 +3600,7 @@ func TestHandleImportOAuthCredentialsRejectsInvalidOptions(t *testing.T) {
 }
 
 func TestCodexOAuthManualCallbackCreatesDatabaseChannel(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	idToken := codexTestIDToken(t, "manual@example.com", "account-manual")
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3113,6 +3761,7 @@ func TestCodexOAuthStartReplacesExistingPendingSession(t *testing.T) {
 }
 
 func TestCodexOAuthCancelInterruptsTokenExchangeWithoutCreatingChannel(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	tokenStarted := make(chan struct{})
 	tokenCancelled := make(chan struct{})
@@ -3177,6 +3826,7 @@ func TestCodexOAuthCancelInterruptsTokenExchangeWithoutCreatingChannel(t *testin
 }
 
 func TestImportedOAuthCredentialUpsertsSameEmail(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	now := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	first := &codexauth.Credential{
@@ -3188,7 +3838,7 @@ func TestImportedOAuthCredentialUpsertsSameEmail(t *testing.T) {
 		t.Fatalf("first import = (%#v, %v, %v)", created, wasCreated, err)
 	}
 	legacy := created.Clone()
-	legacy.ModelEntries = []model.ModelEntry{{Model: "*"}}
+	legacy.ModelEntries = []model.ModelEntry{{Model: "gpt-5"}}
 	if _, err := store.UpdateConfig(context.Background(), created.ID, legacy); err != nil {
 		t.Fatalf("prepare legacy wildcard channel: %v", err)
 	}
@@ -3203,8 +3853,8 @@ func TestImportedOAuthCredentialUpsertsSameEmail(t *testing.T) {
 	if updated.ID != created.ID || !strings.Contains(updated.OAuthCredential, `"access_token":"at-2"`) {
 		t.Fatalf("updated channel = %#v", updated)
 	}
-	if got := updated.GetModels(); !slices.Equal(got, []string{"*"}) {
-		t.Fatalf("reimported legacy channel models = %v, want wildcard preserved", got)
+	if got := updated.GetModels(); !slices.Equal(got, []string{"gpt-5"}) {
+		t.Fatalf("reimported channel models = %v, want gpt-5 preserved", got)
 	}
 	channels, err := store.ListConfigs(context.Background())
 	if err != nil || len(channels) != 1 {
@@ -3470,11 +4120,7 @@ func TestCodexReauthorizationRetriesConcurrentRuntimeMetadataUpdate(t *testing.T
 		}},
 	}
 	winner.OAuthUsage = json.RawMessage(`{"provider":"codex","windows":[]}`)
-	winner.QuotaCostUsage = &oauthcost.Usage{Windows: []*oauthcost.Window{{
-		Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
-		StartedAt: time.Now().Add(-24 * time.Hour).Unix(), ResetAt: time.Now().Add(6 * 24 * time.Hour).Unix(),
-		StandardCostMicroUSD: 7_500_000,
-	}}}
+	winner.QuotaCostUsage = testQuotaCostUsage(7500)
 	winnerJSON, err := winner.JSON()
 	if err != nil {
 		t.Fatal(err)
@@ -3503,12 +4149,13 @@ func TestCodexReauthorizationRetriesConcurrentRuntimeMetadataUpdate(t *testing.T
 		persisted.PassiveUsage.Windows[0].UsedPercent != 25 ||
 		!bytes.Equal(persisted.OAuthUsage, winner.OAuthUsage) ||
 		oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary") == nil ||
-		oauthcost.Find(persisted.QuotaCostUsage, "codex|secondary").StandardCostMicroUSD != 7_500_000 {
+		quotaCostMarker(persisted.QuotaCostUsage, "codex|secondary") != 7500 {
 		t.Fatalf("reauthorization lost runtime metadata: %#v", persisted)
 	}
 }
 
 func TestImportedOAuthCredentialPreservesModelsOnPlanChange(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
 	plus := &codexauth.Credential{
@@ -3534,97 +4181,107 @@ func TestImportedOAuthCredentialPreservesModelsOnPlanChange(t *testing.T) {
 	}
 }
 
-func TestReauthorizationResetsQuotaCostOnPlanTierChange(t *testing.T) {
+func TestReauthorizationStartsQuotaEpochOnIdentityChange(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
+	ctx := context.Background()
 	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-
-	team := &codexauth.Credential{
-		Type: "codex", AccessToken: "at-team", RefreshToken: "rt-team", Expired: expiresAt,
-		ChatGPTUserID: "user-plan-change", AccountID: "account-plan-change",
-		Email: "plan-change@example.com", PlanType: "team",
+	window := func(marker int64) *oauthcost.Usage {
+		startedAt := time.Now().Add(-7 * 24 * time.Hour).Unix()
+		return &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 2592000,
+			StartedAt:   startedAt,
+			ResetAt:     time.Now().Add(23 * 24 * time.Hour).Unix(),
+			CountFromAt: startedAt + marker,
+		}}}
 	}
-	team.QuotaCostUsage = &oauthcost.Usage{Windows: []*oauthcost.Window{{
-		Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 2592000,
-		StartedAt:            time.Now().Add(-7 * 24 * time.Hour).Unix(),
-		ResetAt:              time.Now().Add(23 * 24 * time.Hour).Unix(),
-		StandardCostMicroUSD: 351_000_000,
-		AccountedFrom:        time.Now().Add(-7 * 24 * time.Hour).Unix(),
-		AccountedUntil:       time.Now().Add(23 * 24 * time.Hour).Unix(),
-	}}}
+	credential := func(suffix, accountID, planType string) *codexauth.Credential {
+		return &codexauth.Credential{
+			Type: "codex", AccessToken: "at-" + suffix, RefreshToken: "rt-" + suffix, Expired: expiresAt,
+			ChatGPTUserID: "user-plan-change", AccountID: accountID,
+			Email: "plan-change@example.com", PlanType: planType,
+		}
+	}
+	reauthorize := func(next *codexauth.Credential) (*codexauth.Credential, int64, int64) {
+		t.Helper()
+		before := time.Now().Unix()
+		updated, wasCreated, err := createOrUpdateCodexChannel(ctx, store, next)
+		after := time.Now().Unix()
+		if err != nil || wasCreated {
+			t.Fatalf("reauthorization = (%#v, %v, %v)", updated, wasCreated, err)
+		}
+		parsed, err := codexauth.ParseCredential([]byte(updated.OAuthCredential))
+		if err != nil {
+			t.Fatalf("parse updated credential: %v", err)
+		}
+		return parsed, before, after
+	}
+	assertNewEpoch := func(got *codexauth.Credential, wantIdentity string, before, after int64) {
+		t.Helper()
+		usage := got.QuotaCostUsage
+		if usage == nil || usage.Identity != wantIdentity || usage.EpochAt < before || usage.EpochAt > after || len(usage.Windows) != 0 {
+			t.Fatalf("quota cost usage = %#v, want fresh epoch for %q within [%d, %d]", usage, wantIdentity, before, after)
+		}
+		if got.PassiveUsage != nil || len(got.OAuthUsage) != 0 {
+			t.Fatalf("old quota snapshots survived the new epoch: passive=%#v oauth_usage=%s", got.PassiveUsage, got.OAuthUsage)
+		}
+	}
+	injectCost := func(channelID int64, cost int64) {
+		t.Helper()
+		channel, err := store.GetConfig(ctx, channelID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := codexauth.ParseCredential([]byte(channel.OAuthCredential))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored.QuotaCostUsage = window(cost)
+		storedJSON, err := stored.JSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		swapped, err := store.CompareAndSwapOAuthCredential(ctx, channelID, model.AuthTypeCodexOAuth, channel.OAuthCredential, storedJSON)
+		if err != nil || !swapped {
+			t.Fatalf("inject quota cost = (%v, %v)", swapped, err)
+		}
+	}
 
-	created, wasCreated, err := createOrUpdateCodexChannel(context.Background(), store, team)
+	team := credential("team", "account-plan-change", "team")
+	team.QuotaCostUsage = window(351)
+	created, wasCreated, err := createOrUpdateCodexChannel(ctx, store, team)
 	if err != nil || !wasCreated {
 		t.Fatalf("team import = (%#v, %v, %v)", created, wasCreated, err)
 	}
 
-	// Reauthorize as free — plan tier changed, quota cost must be cleared.
-	free := &codexauth.Credential{
-		Type: "codex", AccessToken: "at-free", RefreshToken: "rt-free", Expired: expiresAt,
-		ChatGPTUserID: team.ChatGPTUserID, AccountID: "account-plan-change",
-		Email: "plan-change@example.com", PlanType: "free",
+	// team→free：套餐变了，旧成本对着另一份上游额度，开新纪元。
+	free := credential("free", "account-plan-change", "free")
+	got, before, after := reauthorize(free)
+	if got.AccessToken != free.AccessToken || got.RefreshToken != free.RefreshToken || got.PlanType != free.PlanType {
+		t.Fatalf("free reauthorization did not persist the new credential: %#v", got)
 	}
-	updated, wasCreated, err := createOrUpdateCodexChannel(context.Background(), store, free)
-	if err != nil || wasCreated {
-		t.Fatalf("free reimport = (%#v, %v, %v)", updated, wasCreated, err)
-	}
-	updatedCredential, err := codexauth.ParseCredential([]byte(updated.OAuthCredential))
-	if err != nil {
-		t.Fatalf("parse updated credential: %v", err)
-	}
-	if updatedCredential.Type != free.Type ||
-		updatedCredential.AccessToken != free.AccessToken ||
-		updatedCredential.RefreshToken != free.RefreshToken ||
-		updatedCredential.Expired != free.Expired ||
-		updatedCredential.ChatGPTUserID != free.ChatGPTUserID ||
-		updatedCredential.AccountID != free.AccountID ||
-		updatedCredential.Email != free.Email ||
-		updatedCredential.PlanType != free.PlanType {
-		t.Fatalf("free reauthorization did not persist credential identity: got %#v want %#v", updatedCredential, free)
-	}
-	if updatedCredential.QuotaCostUsage != nil {
-		t.Fatalf("plan tier changed team→free but QuotaCostUsage not cleared: %+v", updatedCredential.QuotaCostUsage)
-	}
-	if updatedCredential.PassiveUsage != nil {
-		t.Fatalf("plan tier changed but PassiveUsage not cleared: %+v", updatedCredential.PassiveUsage)
+	assertNewEpoch(got, "account-plan-change|free", before, after)
+
+	// 同一身份重新授权：原样继承累计成本（注入的旧格式状态由 Normalize 补记身份）。
+	injectCost(created.ID, 5000)
+	got, _, _ = reauthorize(credential("free2", "account-plan-change", "free"))
+	if got.QuotaCostUsage == nil || got.QuotaCostUsage.Identity != "account-plan-change|free" ||
+		len(got.QuotaCostUsage.Windows) != 1 || quotaCostMarker(got.QuotaCostUsage, "codex|primary") != 5000 {
+		t.Fatalf("same-identity reauthorization changed quota cost: %#v", got.QuotaCostUsage)
 	}
 
-	// Same-tier reauthorization preserves quota cost.
-	quotaCostUsage := &oauthcost.Usage{Windows: []*oauthcost.Window{{
-		Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 2592000,
-		StartedAt:            time.Now().Add(-3 * 24 * time.Hour).Unix(),
-		ResetAt:              time.Now().Add(27 * 24 * time.Hour).Unix(),
-		StandardCostMicroUSD: 5_000_000,
-		AccountedFrom:        time.Now().Add(-3 * 24 * time.Hour).Unix(),
-		AccountedUntil:       time.Now().Add(27 * 24 * time.Hour).Unix(),
-	}}}
-	// Inject quota cost into the stored credential so the next update can inherit it.
-	storedCred, _ := codexauth.ParseCredential([]byte(updated.OAuthCredential))
-	storedCred.QuotaCostUsage = oauthcost.Clone(quotaCostUsage)
-	storedJSON, _ := storedCred.JSON()
-	_, _ = store.CompareAndSwapOAuthCredential(context.Background(), updated.ID, model.AuthTypeCodexOAuth, updated.OAuthCredential, storedJSON)
+	// free→business：再次开新纪元。
+	got, before, after = reauthorize(credential("business", "account-plan-change", "business"))
+	assertNewEpoch(got, "account-plan-change|business", before, after)
 
-	sameReauth := &codexauth.Credential{
-		Type: "codex", AccessToken: "at-free3", RefreshToken: "rt-free3", Expired: expiresAt,
-		ChatGPTUserID: team.ChatGPTUserID, AccountID: "account-plan-change",
-		Email: "plan-change@example.com", PlanType: "free",
-	}
-	preserved, wasCreated, err := createOrUpdateCodexChannel(context.Background(), store, sameReauth)
-	if err != nil || wasCreated {
-		t.Fatalf("same-tier reimport = (%#v, %v, %v)", preserved, wasCreated, err)
-	}
-	preservedCredential, err := codexauth.ParseCredential([]byte(preserved.OAuthCredential))
-	if err != nil {
-		t.Fatalf("parse preserved credential: %v", err)
-	}
-	if preservedCredential.QuotaCostUsage == nil || len(preservedCredential.QuotaCostUsage.Windows) == 0 {
-		t.Fatalf("same-tier reauth erased QuotaCostUsage")
-	}
-	if preservedCredential.QuotaCostUsage.Windows[0].StandardCostMicroUSD != 5_000_000 {
-		t.Fatalf("same-tier reauth cost = %d, want 5000000", preservedCredential.QuotaCostUsage.Windows[0].StandardCostMicroUSD)
-	}
+	// 同一用户换 account_id（例如换团队席位）：账号变了，同样开新纪元。
+	injectCost(created.ID, 7000)
+	got, before, after = reauthorize(credential("seat", "account-plan-change-2", "business"))
+	assertNewEpoch(got, "account-plan-change-2|business", before, after)
 }
 
 func TestImportedOAuthCredentialModelsFollowPlanType(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		plan              string
 		paidModelsAllowed bool
@@ -3652,10 +4309,13 @@ func TestImportedOAuthCredentialModelsFollowPlanType(t *testing.T) {
 			if !channel.SupportsModel("gpt-5.5") {
 				t.Fatalf("plan %q lost the shared model", tt.plan)
 			}
-			for _, name := range []string{"gpt-6-astra", "gpt-5.6-sol"} {
+			for _, name := range []string{"gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol"} {
 				if channel.SupportsModel(name) != tt.paidModelsAllowed {
 					t.Fatalf("plan %q allows %q = %v, want %v", tt.plan, name, channel.SupportsModel(name), tt.paidModelsAllowed)
 				}
+			}
+			if !channel.SupportsModel("gpt-6-luna") {
+				t.Fatalf("plan %q does not allow gpt-6-luna", tt.plan)
 			}
 		})
 	}
@@ -3869,7 +4529,7 @@ func TestCodexChannelKeyMutationEndpointsAreReadOnly(t *testing.T) {
 	engine.PUT("/channels/:id", server.HandleChannelByID)
 	engine.DELETE("/channels/:id/keys/:keyIndex", server.HandleDeleteAPIKey)
 
-	update := fmt.Sprintf(`{"name":%q,"auth_type":"codex_oauth","urls":[{"url":%q,"exact":true,"protocols":["codex"]}],"api_key":"forbidden","models":[{"model":"*"}],"enabled":true,"websockets":true}`, channel.Name, codexUpstreamURL)
+	update := fmt.Sprintf(`{"name":%q,"auth_type":"codex_oauth","urls":[{"url":%q,"exact":true,"protocols":["codex"]}],"api_key":"forbidden","models":[{"model":"gpt-5"}],"enabled":true,"websockets":true}`, channel.Name, codexUpstreamURL)
 	updateRequest := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/channels/%d", channel.ID), strings.NewReader(update))
 	updateRequest.Header.Set("Content-Type", "application/json")
 	updateResponse := httptest.NewRecorder()
@@ -3924,6 +4584,7 @@ func TestCodexChannelKeyMutationEndpointsAreReadOnly(t *testing.T) {
 }
 
 func TestOAuthCredentialRefreshIsSingleflightAndPersistsToDatabase(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	credential := &codexauth.Credential{
 		Type: "codex", AccessToken: "at-old", RefreshToken: "rt-old",
@@ -3938,7 +4599,7 @@ func TestOAuthCredentialRefreshIsSingleflightAndPersistsToDatabase(t *testing.T)
 	freeIDToken := codexTestIDTokenForPlan(t, "refresh@example.com", "account-refresh", "free")
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		refreshCount.Add(1)
-		if err := r.ParseForm(); err != nil {
+		if err := parseTokenRequestForm(r); err != nil {
 			t.Errorf("ParseForm() error = %v", err)
 		}
 		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt-old" {
@@ -4000,6 +4661,7 @@ func TestOAuthCredentialRefreshIsSingleflightAndPersistsToDatabase(t *testing.T)
 }
 
 func TestCodexCredentialManagerCASMissReusesConcurrentWinner(t *testing.T) {
+	t.Parallel()
 	baseStore := newCodexAuthTestStore(t)
 	initial := &codexauth.Credential{
 		Type: codexauth.ChannelType, AccessToken: "at-old", RefreshToken: "rt-old",
@@ -4023,7 +4685,7 @@ func TestCodexCredentialManagerCASMissReusesConcurrentWinner(t *testing.T) {
 	var refreshCount atomic.Int32
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		refreshCount.Add(1)
-		if err := r.ParseForm(); err != nil {
+		if err := parseTokenRequestForm(r); err != nil {
 			t.Fatal(err)
 		}
 		if got := r.Form.Get("refresh_token"); got != "rt-old" {
@@ -4060,6 +4722,7 @@ func TestCodexCredentialManagerCASMissReusesConcurrentWinner(t *testing.T) {
 }
 
 func TestCodexCredentialManagerCASMissMergesPassiveUsageWithoutRefreshingTwice(t *testing.T) {
+	t.Parallel()
 	baseStore := newCodexAuthTestStore(t)
 	initial := &codexauth.Credential{
 		Type: codexauth.ChannelType, AccessToken: "at-old", RefreshToken: "rt-once",
@@ -4121,6 +4784,7 @@ func TestCodexCredentialManagerCASMissMergesPassiveUsageWithoutRefreshingTwice(t
 }
 
 func TestCodexPassiveUsageKeepsLatestResultPerQuotaGroup(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	credential := &codexauth.Credential{
 		Type: codexauth.ChannelType, AccessToken: "at", RefreshToken: "rt",
@@ -4188,6 +4852,38 @@ func TestCodexPassiveUsageKeepsLatestResultPerQuotaGroup(t *testing.T) {
 		persistedCredential.PassiveUsage.Windows[1].UsedPercent != 30 {
 		t.Fatalf("header and SSE quota were not merged by limit name: (%#v, %v)", persistedCredential, err)
 	}
+	// 新进程首次重放库中已有的采样无需写入，后续重放也不应再次读库。
+	countingStore := &codexUsageReadCountingStore{Store: store}
+	coldManager := newCodexCredentialManager(nil, countingStore, nil, nil)
+	duplicate := codexPassiveUsageUpdate{
+		SampledAt: sseTime.Format(time.RFC3339Nano),
+		Windows:   []codexauth.PassiveUsageWindow{window("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark", 30, sseTime)},
+	}
+	for range 2 {
+		if updated, err := coldManager.updatePassiveUsage(context.Background(), channel, duplicate); err != nil || updated {
+			t.Fatalf("replayed persisted sample = (%v, %v)", updated, err)
+		}
+	}
+	if reads := countingStore.reads.Load(); reads != 1 {
+		t.Fatalf("duplicate sample caused %d reads, want 1", reads)
+	}
+	// 完整作用域重复携带同一窗口时，去重不能把该窗口当成缺失。
+	duplicate.ReplaceScopes = []string{"gpt-5.3-codex-spark"}
+	duplicate.SampledAt = sseTime.Add(time.Second).Format(time.RFC3339Nano)
+	if _, err := coldManager.updatePassiveUsage(context.Background(), channel, duplicate); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err = store.GetConfig(context.Background(), channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedCredential, err = codexauth.ParseCredential([]byte(persisted.OAuthCredential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persistedCredential.PassiveUsage.Windows) != 2 || oauthcost.Find(persistedCredential.QuotaCostUsage, oauthcost.Key("GPT-5.3-Codex-Spark", "primary")) == nil {
+		t.Fatal("deduplication removed a window present in the complete scope")
+	}
 }
 
 func TestCodexPassiveUsageDoesNotResetCostFromStaleMergedWindow(t *testing.T) {
@@ -4216,13 +4912,13 @@ func TestCodexPassiveUsageDoesNotResetCostFromStaleMergedWindow(t *testing.T) {
 			StartedAt: base.Add(-24 * time.Hour).Unix(), ResetAt: resetAt,
 			SampledUpstreamUsedPercent: &activeUsedPercent,
 			SampledUpstreamAtUnixNano:  activeSampledAt.UnixNano(),
-			StandardCostMicroUSD:       1_000_000,
 		}}},
 	}
 	channel, _, err := createOrUpdateCodexChannel(context.Background(), store, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedQuotaLedger(t, store, channel.ID, base, "gpt-5.6-sol", 1_000_000)
 	manager := newCodexCredentialManager(codexauth.NewService(nil), store, nil, nil)
 	updated, err := manager.updatePassiveUsage(context.Background(), channel, codexPassiveUsageUpdate{
 		SampledAt: secondarySampledAt.Format(time.RFC3339Nano),
@@ -4242,7 +4938,8 @@ func TestCodexPassiveUsageDoesNotResetCostFromStaleMergedWindow(t *testing.T) {
 	}
 	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
 	primary := oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|primary")
-	if err != nil || primary == nil || primary.StandardCostMicroUSD != 1_000_000 ||
+	primaryCost := quotaCostViewAt(t, store, channel.ID, secondarySampledAt.Add(time.Second)).FindWindow("codex|primary")
+	if err != nil || primary == nil || primaryCost == nil || primaryCost.StandardCostMicroUSD != 1_000_000 ||
 		primary.SampledUpstreamUsedPercent == nil || *primary.SampledUpstreamUsedPercent != activeUsedPercent ||
 		primary.SampledUpstreamAtUnixNano != activeSampledAt.UnixNano() {
 		t.Fatalf("stale merged primary reset quota cost: credential=%#v err=%v", persistedCredential, err)
@@ -4272,16 +4969,18 @@ func TestCodexPassiveSparkRollbackDoesNotResetCodexWeeklyCost(t *testing.T) {
 		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
 			{Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 7 * 24 * 60 * 60,
 				StartedAt: base.Add(-time.Hour).Unix(), ResetAt: mainResetAt.Unix(),
-				SampledUpstreamUsedPercent: &mainUsed, SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 7_000_000},
+				SampledUpstreamUsedPercent: &mainUsed, SampledUpstreamAtUnixNano: base.UnixNano()},
 			{Key: "gpt-5.3-codex-spark|primary", Family: oauthcost.FamilySpark, WindowSeconds: 5 * 60 * 60,
 				StartedAt: base.Add(-time.Hour).Unix(), ResetAt: sparkResetAt.Unix(),
-				SampledUpstreamUsedPercent: &sparkUsed, SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 900_000},
+				SampledUpstreamUsedPercent: &sparkUsed, SampledUpstreamAtUnixNano: base.UnixNano()},
 		}},
 	}
 	channel, _, err := createOrUpdateCodexChannel(context.Background(), store, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedQuotaLedger(t, store, channel.ID, base.Add(-30*time.Minute), "gpt-5.6-sol", 7_000_000)
+	seedQuotaLedger(t, store, channel.ID, base.Add(-30*time.Minute), "gpt-5.3-codex-spark", 900_000)
 	manager := newCodexCredentialManager(codexauth.NewService(nil), store, nil, nil)
 	sampledAt := base.Add(time.Hour)
 	updated, err := manager.updatePassiveUsage(context.Background(), channel, codexPassiveUsageUpdate{
@@ -4301,11 +5000,13 @@ func TestCodexPassiveSparkRollbackDoesNotResetCodexWeeklyCost(t *testing.T) {
 	persistedCredential, err := codexauth.ParseCredential([]byte(persisted.OAuthCredential))
 	main := oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|secondary")
 	spark := oauthcost.Find(persistedCredential.QuotaCostUsage, "gpt-5.3-codex-spark|primary")
-	if err != nil || main == nil || main.StandardCostMicroUSD != 7_000_000 ||
+	view := quotaCostViewAt(t, store, channel.ID, sampledAt.Add(time.Second))
+	mainCost, sparkCost := view.FindWindow("codex|secondary"), view.FindWindow("gpt-5.3-codex-spark|primary")
+	if err != nil || main == nil || mainCost == nil || mainCost.StandardCostMicroUSD != 7_000_000 ||
 		main.SampledUpstreamUsedPercent == nil || *main.SampledUpstreamUsedPercent != mainUsed {
 		t.Fatalf("Spark rollback reset Codex weekly cost: main=%#v err=%v", main, err)
 	}
-	if spark == nil || spark.StandardCostMicroUSD != 0 || spark.CountFromAt != sampledAt.Unix() ||
+	if spark == nil || sparkCost == nil || sparkCost.StandardCostMicroUSD != 0 || spark.CountFromAt != sampledAt.Unix() ||
 		spark.SampledUpstreamUsedPercent == nil || *spark.SampledUpstreamUsedPercent != 5 {
 		t.Fatalf("Spark quota did not reset independently: %#v", spark)
 	}
@@ -4332,10 +5033,10 @@ func TestCodexReserveResponsePreservesMainQuotaCost(t *testing.T) {
 				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
 					{Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 18000,
 						StartedAt: now.Add(-time.Hour).Unix(), ResetAt: now.Add(4 * time.Hour).Unix(),
-						SampledUpstreamUsedPercent: float64Pointer(99), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 15_000_000},
+						SampledUpstreamUsedPercent: float64Pointer(99), SampledUpstreamAtUnixNano: base.UnixNano()},
 					{Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 604800,
 						StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
-						SampledUpstreamUsedPercent: float64Pointer(31), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 31_000_000},
+						SampledUpstreamUsedPercent: float64Pointer(31), SampledUpstreamAtUnixNano: base.UnixNano()},
 					// Legacy credentials may still label the reserve window as codex.
 					{Key: "gpt-reserve|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 604800,
 						StartedAt: now.Add(-time.Hour).Unix(), ResetAt: now.Add(167 * time.Hour).Unix(),
@@ -4346,6 +5047,8 @@ func TestCodexReserveResponsePreservesMainQuotaCost(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			seedQuotaLedger(t, store, channel.ID, now.Add(-30*time.Minute), "gpt-5.6-sol", 15_000_000)
+			seedQuotaLedger(t, store, channel.ID, now.Add(-2*time.Hour), "gpt-5.6-sol", 16_000_000)
 			s := &Server{store: store, codexCredentials: newCodexCredentialManager(nil, store, nil, nil)}
 			headers := http.Header{}
 			headers.Set("X-Codex-Active-Limit", test.headerIdentity)
@@ -4354,7 +5057,11 @@ func TestCodexReserveResponsePreservesMainQuotaCost(t *testing.T) {
 			headers.Set("X-Codex-Primary-Reset-At", strconv.FormatInt(now.Add(167*time.Hour).Unix(), 10))
 			payload := fmt.Sprintf("data: {\"type\":\"codex.rate_limits\",\"metered_limit_name\":%q,\"rate_limits\":{\"primary\":{\"used_percent\":2,\"window_minutes\":10080,\"reset_at\":%d}}}\n\n", test.eventIdentity, now.Add(167*time.Hour).Unix())
 			resp := &http.Response{StatusCode: http.StatusOK, Header: headers, Body: io.NopCloser(strings.NewReader(payload))}
-			s.persistDetectionCodexPassiveUsage(ctx, channel, resp, test.model)
+			runtimeCfg := channel.Clone()
+			runtimeCfg.CodexAccessToken = credential.AccessToken
+			runtimeCfg.CodexAccountID = credential.AccountID
+			runtimeCfg.CodexQuotaEpochAt = credential.QuotaCostUsage.EpochTime()
+			s.persistDetectionCodexPassiveUsage(ctx, runtimeCfg, resp, test.model)
 			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 				t.Fatal(err)
 			}
@@ -4377,10 +5084,12 @@ func TestCodexReserveResponsePreservesMainQuotaCost(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			view := quotaCostViewAt(t, store, channel.ID, now.Add(time.Second))
 			for key, want := range map[string]int64{"codex|primary": 15_500_000, "codex|secondary": 31_500_000, "gpt-reserve|primary": 250_000} {
 				w := oauthcost.Find(got.QuotaCostUsage, key)
-				if w == nil || w.StandardCostMicroUSD != want || w.CountFromAt != 0 {
-					t.Fatalf("%s persisted cost = %#v, want %d without reset", key, w, want)
+				cost := view.FindWindow(key)
+				if w == nil || cost == nil || cost.StandardCostMicroUSD != want || w.CountFromAt != 0 {
+					t.Fatalf("%s persisted window = %#v cost = %#v, want %d without reset", key, w, cost, want)
 				}
 			}
 			for _, key := range []string{"codex|primary", "codex|secondary"} {
@@ -4400,10 +5109,12 @@ func TestCodexReserveResponsePreservesMainQuotaCost(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			view = quotaCostViewAt(t, store, channel.ID, now.Add(time.Second))
 			for key, want := range map[string]int64{"codex|primary": 500_000, "codex|secondary": 500_000, "gpt-reserve|primary": 250_000} {
 				w := oauthcost.Find(got.QuotaCostUsage, key)
-				if w == nil || w.StandardCostMicroUSD != want || w.CountFromAt != base.Unix() {
-					t.Fatalf("%s reset cost = %#v, want %d", key, w, want)
+				cost := view.FindWindow(key)
+				if w == nil || cost == nil || cost.StandardCostMicroUSD != want || w.CountFromAt != base.Unix() {
+					t.Fatalf("%s reset window = %#v cost = %#v, want %d", key, w, cost, want)
 				}
 			}
 		})
@@ -4434,19 +5145,22 @@ func TestCodexWeeklyRoleChangePersistsCost(t *testing.T) {
 				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
 					{Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: 18000,
 						StartedAt: base.Add(-time.Hour).Unix(), ResetAt: base.Add(4 * time.Hour).Unix(),
-						SampledUpstreamUsedPercent: float64Pointer(80), SampledUpstreamAtUnixNano: latest.UnixNano(), StandardCostMicroUSD: 100_000},
+						SampledUpstreamUsedPercent: float64Pointer(80), SampledUpstreamAtUnixNano: latest.UnixNano()},
 					{Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 604800,
 						StartedAt: base.Add(-24 * time.Hour).Unix(), ResetAt: weeklyResetAt, CountFromAt: base.Unix(),
-						SampledUpstreamUsedPercent: float64Pointer(5), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 900_000},
+						SampledUpstreamUsedPercent: float64Pointer(5), SampledUpstreamAtUnixNano: base.UnixNano()},
 					{Key: "codex-spark|secondary", Family: oauthcost.FamilySpark, WindowSeconds: 604800,
 						StartedAt: base.Add(-24 * time.Hour).Unix(), ResetAt: weeklyResetAt,
-						SampledUpstreamUsedPercent: float64Pointer(30), SampledUpstreamAtUnixNano: base.UnixNano(), StandardCostMicroUSD: 700_000},
+						SampledUpstreamUsedPercent: float64Pointer(30), SampledUpstreamAtUnixNano: base.UnixNano()},
 				}},
 			}
 			channel, _, err := createOrUpdateCodexChannel(ctx, store, credential)
 			if err != nil {
 				t.Fatal(err)
 			}
+			seedQuotaLedger(t, store, channel.ID, base.Add(-30*time.Minute), "gpt-5.6-sol", 100_000)
+			seedQuotaLedger(t, store, channel.ID, base.Add(30*time.Second), "gpt-5.6-sol", 900_000)
+			seedQuotaLedger(t, store, channel.ID, base.Add(-2*time.Hour), "gpt-5.3-codex-spark", 700_000)
 			manager := newCodexCredentialManager(nil, store, nil, nil)
 			server := &Server{store: store, codexCredentials: manager}
 			sampledAt := base.Add(3 * time.Minute)
@@ -4493,10 +5207,12 @@ func TestCodexWeeklyRoleChangePersistsCost(t *testing.T) {
 			}
 			weekly := oauthcost.Find(actual.QuotaCostUsage, weeklyKey)
 			spark := oauthcost.Find(actual.QuotaCostUsage, "codex-spark|secondary")
+			view := quotaCostViewAt(t, store, channel.ID, latest.Add(2*time.Minute))
+			weeklyCost, sparkCost := view.FindWindow(weeklyKey), view.FindWindow("codex-spark|secondary")
 			if len(actual.QuotaCostUsage.Windows) != wantWindows || weekly == nil ||
-				weekly.StandardCostMicroUSD != 1_400_000 || weekly.CountFromAt != base.Unix() ||
-				spark == nil || spark.StandardCostMicroUSD != 700_000 {
-				t.Fatalf("persisted quota cost after role change = %#v", actual.QuotaCostUsage)
+				weeklyCost == nil || weeklyCost.StandardCostMicroUSD != 1_400_000 || weekly.CountFromAt != base.Unix() ||
+				spark == nil || sparkCost == nil || sparkCost.StandardCostMicroUSD != 700_000 {
+				t.Fatalf("persisted quota cost after role change = %#v view = %#v", actual.QuotaCostUsage, view)
 			}
 			wantSparkUsed := 40.0
 			if test.passive {
@@ -4510,6 +5226,7 @@ func TestCodexWeeklyRoleChangePersistsCost(t *testing.T) {
 }
 
 func TestCodexCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *testing.T) {
+	t.Parallel()
 	t.Run("forced request reuses a newer access token", func(t *testing.T) {
 		store := newCodexAuthTestStore(t)
 		initial := &codexauth.Credential{
@@ -4583,7 +5300,7 @@ func TestCodexCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *testin
 		var refreshCount atomic.Int32
 		tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			refreshCount.Add(1)
-			if err := r.ParseForm(); err != nil {
+			if err := parseTokenRequestForm(r); err != nil {
 				t.Error(err)
 			}
 			if got := r.Form.Get("refresh_token"); got != "rt-winner" {
@@ -4611,6 +5328,7 @@ func TestCodexCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *testin
 }
 
 func TestCodexCredentialManagerNeverRefreshesPersonalAccessToken(t *testing.T) {
+	t.Parallel()
 	store := newCodexAuthTestStore(t)
 	credential := &codexauth.Credential{
 		Type:          codexauth.ChannelType,
@@ -4651,6 +5369,7 @@ func TestCodexCredentialManagerNeverRefreshesPersonalAccessToken(t *testing.T) {
 }
 
 func TestCodexCredentialManagerCachesSQLiteWinnerWhenPrimarySyncFails(t *testing.T) {
+	t.Parallel()
 	primaryStore, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "primary.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -4728,6 +5447,7 @@ func TestCodexCredentialManagerCachesSQLiteWinnerWhenPrimarySyncFails(t *testing
 }
 
 func TestAntigravityCredentialManagerCASMissReusesConcurrentWinner(t *testing.T) {
+	t.Parallel()
 	baseStore := newCodexAuthTestStore(t)
 	initial := &antigravityauth.Credential{
 		Type: antigravityauth.ChannelType, AccessToken: "at-old", RefreshToken: "rt-old",
@@ -4802,6 +5522,7 @@ func TestAntigravityCredentialManagerCASMissReusesConcurrentWinner(t *testing.T)
 }
 
 func TestAntigravityMetadataFailurePreservesRefreshedCredential(t *testing.T) {
+	t.Parallel()
 	for _, expired := range []bool{false, true} {
 		t.Run(fmt.Sprintf("expired=%t", expired), func(t *testing.T) {
 			store := newCodexAuthTestStore(t)
@@ -4865,6 +5586,7 @@ func TestAntigravityMetadataFailurePreservesRefreshedCredential(t *testing.T) {
 }
 
 func TestAntigravityCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		force         bool
@@ -4944,6 +5666,7 @@ func TestAntigravityCredentialManagerReloadsPersistedCredentialBeforeRefresh(t *
 }
 
 func TestHandleRefreshCodexCredentialForcesDatabaseRefresh(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -4958,7 +5681,7 @@ func TestHandleRefreshCodexCredentialForcesDatabaseRefresh(t *testing.T) {
 
 	idToken := codexTestIDTokenForPlan(t, "manual-refresh@example.com", "account-manual-refresh", "team")
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
+		if err := parseTokenRequestForm(r); err != nil {
 			t.Errorf("ParseForm() error = %v", err)
 		}
 		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt-old" {
@@ -5011,6 +5734,7 @@ func TestHandleRefreshCodexCredentialForcesDatabaseRefresh(t *testing.T) {
 }
 
 func TestHandleCreateCodexPersonalAccessTokenPersistsStaticCredential(t *testing.T) {
+	t.Parallel()
 	const accessToken = "at-handler-secret"
 	whoami := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+accessToken ||
@@ -5114,6 +5838,7 @@ func TestHandleCreateCodexPersonalAccessTokenPersistsStaticCredential(t *testing
 }
 
 func TestHandleOAuthUsageReconcilesCostsAfterWindowChange(t *testing.T) {
+	t.Parallel()
 	for _, duration := range []time.Duration{5 * time.Hour, 7 * 24 * time.Hour, 30 * 24 * time.Hour} {
 		t.Run(duration.String(), func(t *testing.T) {
 			server, store, cleanup := setupAdminTestServer(t)
@@ -5180,7 +5905,8 @@ func TestHandleOAuthUsageReconcilesCostsAfterWindowChange(t *testing.T) {
 					t.Fatal(err)
 				}
 				persisted, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
-				if err != nil || oauthcost.Find(persisted.QuotaCostUsage, key).StandardCostMicroUSD != want {
+				cost := quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow(key)
+				if err != nil || cost == nil || cost.StandardCostMicroUSD != want {
 					t.Fatalf("persisted quota cost mismatch: %v, %v", persisted, err)
 				}
 			}
@@ -5195,6 +5921,7 @@ func TestHandleOAuthUsageReconcilesCostsAfterWindowChange(t *testing.T) {
 }
 
 func TestHandleOAuthUsageReturnsCodexQuotaWithoutLeakingCredential(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -5288,7 +6015,7 @@ func TestHandleOAuthUsageReturnsCodexQuotaWithoutLeakingCredential(t *testing.T)
 	if response.Data.Provider != codexauth.ChannelType || response.Data.PlanType != "pro" || len(response.Data.Windows) != 3 {
 		t.Fatalf("usage summary = %#v", response.Data)
 	}
-	primaryQuotaCost := oauthcost.Find(response.Data.QuotaCostUsage, "codex|primary")
+	primaryQuotaCost := response.Data.QuotaCostUsage.FindWindow("codex|primary")
 	if primaryQuotaCost == nil || primaryQuotaCost.StandardCostMicroUSD != 0 ||
 		len(response.Data.QuotaCostUsage.Windows) != 3 {
 		t.Fatalf("quota cost usage = %#v", response.Data.QuotaCostUsage)
@@ -5313,7 +6040,7 @@ func TestHandleOAuthUsageReturnsCodexQuotaWithoutLeakingCredential(t *testing.T)
 	list := mustParseAPIResponse[[]ChannelWithCooldown](t, listResponse.Body.Bytes())
 	if len(list.Data) != 1 || list.Data[0].OAuthUsage == nil ||
 		list.Data[0].OAuthUsage.Provider != codexauth.ChannelType || len(list.Data[0].OAuthUsage.Windows) != 3 ||
-		oauthcost.Find(list.Data[0].OAuthUsage.QuotaCostUsage, "codex|primary") == nil ||
+		list.Data[0].OAuthUsage.QuotaCostUsage.FindWindow("codex|primary") == nil ||
 		list.Data[0].OAuthUsage.RateLimitResetCredits == nil ||
 		list.Data[0].OAuthUsage.RateLimitResetCredits.AvailableCount != 2 {
 		t.Fatalf("persisted Codex usage = %+v", list.Data)
@@ -5598,8 +6325,88 @@ func TestLatestCodexOAuthUsageRequiresSameQuotaPeriod(t *testing.T) {
 	}
 }
 
+func TestHandleChannelsQuotaCostSurvivesLogCleanup(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	resetAt := now.Add(4 * 24 * time.Hour)
+	snapshot, err := json.Marshal(persistedOAuthUsageSnapshot{
+		RequestedAt: now.Format(time.RFC3339Nano), SampledAt: now.Format(time.RFC3339Nano),
+		Summary: oauthUsageSummary{Provider: "codex", PlanType: "plus", Windows: []oauthUsageWindow{{
+			LimitName: "codex", Kind: "secondary", LimitWindowSeconds: 604800,
+			ResetAt: resetAt.Unix(), UsedPercent: 30, RemainingPercent: 70,
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutAt := now.Add(-24 * time.Hour)
+	credential := &codexauth.Credential{
+		Type: "codex", AccessToken: "ledger-retention", RefreshToken: "ledger-retention-refresh", PlanType: "plus",
+		Expired: now.Add(24 * time.Hour).Format(time.RFC3339), OAuthUsage: snapshot,
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "codex|secondary", Family: oauthcost.FamilyCodex, WindowSeconds: 604800,
+			StartedAt: resetAt.Add(-7 * 24 * time.Hour).Unix(), ResetAt: resetAt.Unix(),
+			CountFromAt: cutAt.Unix(),
+		}}},
+	}
+	raw, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := store.CreateConfig(ctx, &model.Config{
+		Name: "Codex ledger retention", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: raw,
+		URLs: model.ChannelURLs{{URL: "https://example.test"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedQuotaLedger(t, store, channel.ID, now.Add(-2*24*time.Hour), "gpt-5.6-sol", 2_000_000)
+	if err := store.CleanupLogsBefore(ctx, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	listedCost := func() int64 {
+		t.Helper()
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+		server.HandleChannels(c)
+		list := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+		if w.Code != http.StatusOK || len(list.Data) != 1 || list.Data[0].OAuthUsage == nil || len(list.Data[0].OAuthUsage.Windows) != 1 {
+			t.Fatalf("channel list status=%d response=%#v", w.Code, list)
+		}
+		usage := list.Data[0].OAuthUsage
+		window := usage.Windows[0]
+		view := usage.QuotaCostUsage.FindWindow("codex|secondary")
+		if window.StandardCostMicroUSD == nil || view == nil || *window.StandardCostMicroUSD != view.StandardCostMicroUSD {
+			t.Fatalf("inconsistent weekly cost: window=%#v view=%#v", window, view)
+		}
+		return view.StandardCostMicroUSD
+	}
+	if got := listedCost(); got != 0 {
+		t.Fatalf("cost while truncated = %d, want 0", got)
+	}
+	cfg, err := store.GetConfig(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential.QuotaCostUsage.Windows[0].CountFromAt = 0
+	restored, err := credential.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.CompareAndSwapOAuthUsage(ctx, channel.ID, model.AuthTypeCodexOAuth, cfg.OAuthCredential, restored)
+	if err != nil || !updated {
+		t.Fatalf("restore CAS = (%v, %v)", updated, err)
+	}
+	if got := listedCost(); got != 2_000_000 {
+		t.Fatalf("weekly cost lost after log cleanup and restore = %d, want 2_000_000", got)
+	}
+}
+
 func TestHandleChannelsCodexQuotaUsesCurrentPassivePeriod(t *testing.T) {
-	base := time.Date(2026, time.September, 5, 8, 49, 40, 0, time.UTC)
+	t.Parallel()
+	base := time.Now().UTC().Truncate(time.Second)
 	for _, tc := range []struct {
 		name     string
 		kind     string
@@ -5657,7 +6464,6 @@ func TestHandleChannelsCodexQuotaUsesCurrentPassivePeriod(t *testing.T) {
 				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
 					Key: oauthcost.Key("codex", tc.kind), Family: oauthcost.FamilyCodex, WindowSeconds: seconds,
 					StartedAt: newReset.Add(-tc.duration - 3*time.Minute).Unix(), ResetAt: newReset.Add(-3 * time.Minute).Unix(),
-					StandardCostMicroUSD: tc.cost,
 				}}},
 			}
 			raw, err := credential.JSON()
@@ -5671,6 +6477,7 @@ func TestHandleChannelsCodexQuotaUsesCurrentPassivePeriod(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			seedQuotaLedger(t, store, channel.ID, newReset.Add(-tc.duration-3*time.Minute), "gpt-5.6-sol", tc.cost)
 			c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
 			server.HandleChannels(c)
 			list := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
@@ -5696,8 +6503,9 @@ func TestHandleChannelsCodexQuotaUsesCurrentPassivePeriod(t *testing.T) {
 }
 
 func TestHandleChannelsCodexQuotaFollowsDurationChanges(t *testing.T) {
+	t.Parallel()
 	const day = 24 * time.Hour
-	base := time.Date(2026, time.September, 17, 15, 9, 49, 0, time.UTC)
+	base := time.Now().UTC().Truncate(time.Second)
 	for _, tc := range []struct {
 		name            string
 		activeDuration  time.Duration
@@ -5768,7 +6576,7 @@ func TestHandleChannelsCodexQuotaFollowsDurationChanges(t *testing.T) {
 				},
 				QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
 					Key: "codex|primary", Family: oauthcost.FamilyCodex, WindowSeconds: wantSeconds,
-					StartedAt: wantReset - wantSeconds, ResetAt: wantReset, StandardCostMicroUSD: cost,
+					StartedAt: wantReset - wantSeconds, ResetAt: wantReset,
 				}}},
 			}
 			raw, err := credential.JSON()
@@ -5782,6 +6590,7 @@ func TestHandleChannelsCodexQuotaFollowsDurationChanges(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			seedQuotaLedger(t, store, channel.ID, time.Unix(wantReset-wantSeconds, 0), "gpt-5.6-sol", cost)
 			c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
 			server.HandleChannels(c)
 			list := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
@@ -5819,10 +6628,9 @@ func TestAttachOAuthQuotaCostUsageMatchesResetJitter(t *testing.T) {
 			LimitWindowSeconds: 5 * 60 * 60, ResetAt: displayResetAt,
 		}},
 	}
-	attached := attachOAuthQuotaCostUsage(summary, &oauthcost.Usage{Windows: []*oauthcost.Window{{
+	attached := attachOAuthQuotaCostUsage(summary, &oauthcost.CostView{Windows: []oauthcost.WindowCostView{{
 		Key: "codex|primary", WindowSeconds: 5 * 60 * 60,
-		StartedAt: displayResetAt - 5*60*60, ResetAt: displayResetAt + 3*60,
-		StandardCostMicroUSD: 2_000_000,
+		ResetAt: displayResetAt + 3*60, StandardCostMicroUSD: 2_000_000,
 	}}})
 	if attached == nil || attached.Windows[0].StandardCostMicroUSD == nil ||
 		*attached.Windows[0].StandardCostMicroUSD != 2_000_000 {
@@ -5878,6 +6686,7 @@ func TestRequestCodexUsageSamplesBeforeResetCreditLookupCompletes(t *testing.T) 
 }
 
 func TestHandleOAuthUsageSilentlyFallsBackWhenCodexResetCreditDetailsAreUnavailable(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -5926,6 +6735,7 @@ func TestHandleOAuthUsageSilentlyFallsBackWhenCodexResetCreditDetailsAreUnavaila
 }
 
 func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -5936,12 +6746,10 @@ func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
 				{
 					Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
 					StartedAt: time.Now().Add(-24 * time.Hour).Unix(), ResetAt: time.Now().Add(6 * 24 * time.Hour).Unix(),
-					StandardCostMicroUSD: 12_500_000,
 				},
 				{
 					Key: "codex|monthly", WindowSeconds: 30 * 24 * 60 * 60,
 					StartedAt: time.Now().Add(-24 * time.Hour).Unix(), ResetAt: time.Now().Add(29 * 24 * time.Hour).Unix(),
-					StandardCostMicroUSD: 18_500_000,
 				},
 			},
 		},
@@ -5950,6 +6758,7 @@ func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seedQuotaLedger(t, store, channel.ID, time.Now().Add(-time.Hour), "gpt-5.4", 12_500_000)
 	if err := store.SetChannelCooldown(context.Background(), channel.ID, time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
@@ -6019,7 +6828,7 @@ func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
 		result.Data.Usage.RateLimitResetCredits.AvailableCount != 0 || len(result.Data.Warnings) != 0 {
 		t.Fatalf("reset response = %#v", result.Data)
 	}
-	resultPrimary := oauthcost.Find(result.Data.Usage.QuotaCostUsage, "codex|primary")
+	resultPrimary := result.Data.Usage.QuotaCostUsage.FindWindow("codex|primary")
 	if resultPrimary == nil || len(result.Data.Usage.QuotaCostUsage.Windows) != 1 ||
 		resultPrimary.StandardCostMicroUSD != 0 {
 		t.Fatalf("quota cost usage after reset = %#v", result.Data.Usage.QuotaCostUsage)
@@ -6036,9 +6845,11 @@ func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	persistedPrimary := oauthcost.Find(persistedCredential.QuotaCostUsage, "codex|primary")
-	if persistedPrimary == nil || len(persistedCredential.QuotaCostUsage.Windows) != 1 ||
-		persistedPrimary.StandardCostMicroUSD != 0 {
+	if persistedPrimary == nil || len(persistedCredential.QuotaCostUsage.Windows) != 1 {
 		t.Fatalf("quota cost usage after reset = %#v", persistedCredential.QuotaCostUsage)
+	}
+	if cost := quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary"); cost == nil || cost.StandardCostMicroUSD != 0 {
+		t.Fatalf("quota cost after reset = %#v", cost)
 	}
 	if persisted.CooldownUntil != 0 {
 		t.Fatalf("channel cooldown was not cleared: %d", persisted.CooldownUntil)
@@ -6050,6 +6861,7 @@ func TestHandleResetCodexQuotaConsumesOnceAndRefreshesUsage(t *testing.T) {
 }
 
 func TestHandleResetCodexQuotaRejectsConcurrentConsume(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -6123,6 +6935,7 @@ func TestHandleResetCodexQuotaRejectsConcurrentConsume(t *testing.T) {
 }
 
 func TestHandleOAuthUsageBatchStreamUsesBoundedConcurrencyAndEmitsPerChannelResults(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
@@ -6260,6 +7073,7 @@ func TestHandleOAuthUsageBatchStreamUsesBoundedConcurrencyAndEmitsPerChannelResu
 }
 
 func TestHandleOAuthUsageDoesNotOverwriteNewerSnapshotAfterCASConflict(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	credential := &codexauth.Credential{
@@ -6368,9 +7182,7 @@ func TestPersistOAuthUsageKeepsNewerPassiveQuotaAfterCASConflict(t *testing.T) {
 		Key: "codex-spark|primary", Family: oauthcost.FamilySpark, WindowSeconds: 18000,
 		ResetAt: base.Add(time.Hour), UsedPercent: &used, SampledAt: passiveAt,
 	}}, passiveAt)
-	if _, err := oauthcost.AddStandardCost(winner.QuotaCostUsage, passiveAt, "gpt-5.3-codex-spark", 2_000_000); err != nil {
-		t.Fatal(err)
-	}
+	seedQuotaLedger(t, store, channel.ID, passiveAt, "gpt-5.3-codex-spark", 2_000_000)
 	winnerJSON, err := winner.JSON()
 	if err != nil {
 		t.Fatal(err)
@@ -6389,12 +7201,14 @@ func TestPersistOAuthUsageKeepsNewerPassiveQuotaAfterCASConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	if spark := oauthcost.Find(got.QuotaCostUsage, "codex-spark|primary"); spark == nil ||
-		spark.StandardCostMicroUSD != 2_000_000 || spark.SampledUpstreamAtUnixNano != passiveAt.UnixNano() {
+		quotaCostViewAt(t, store, channel.ID, passiveAt.Add(time.Second)).FindWindow("codex-spark|primary").StandardCostMicroUSD != 2_000_000 ||
+		spark.SampledUpstreamAtUnixNano != passiveAt.UnixNano() {
 		t.Fatalf("active CAS retry deleted newer passive Spark cost: %+v", spark)
 	}
 }
 
 func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		profileBody      string
@@ -6404,6 +7218,10 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 		wantSubscription string
 		wantTrialEndsAt  string
 		wantWarning      bool
+		scope            string
+		resetBody        string
+		wantResetCount   int
+		wantResetWarning bool
 	}{
 		{
 			name:             "pro",
@@ -6441,6 +7259,24 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 			initialPlan: "Pro",
 			wantPlan:    "Team",
 		},
+		{
+			name:        "reset credits share usage request",
+			profileBody: `{"organization":{"organization_type":"claude_pro"}}`,
+			wantPlan:    "Pro", scope: "user:inference user:profile",
+			resetBody:      `,"cedar_ember":{"eligible":true,"at_limit":true,"next_grant_id":"private-grant","grants":[{"id":"private-grant","label":"Weekly","resets_left":2,"clears":["seven_day"],"usable_now":true}]}`,
+			wantResetCount: 2,
+		},
+		{
+			name:        "missing reset block keeps quota",
+			profileBody: `{"organization":{"organization_type":"claude_pro"}}`,
+			wantPlan:    "Pro", scope: "user:profile",
+		},
+		{
+			name:        "invalid optional reset block keeps quota",
+			profileBody: `{"organization":{"organization_type":"claude_pro"}}`,
+			wantPlan:    "Pro", scope: "user:profile",
+			resetBody: `,"cedar_ember":{"grants":"invalid"}`, wantResetWarning: true,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -6448,6 +7284,9 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 			defer cleanup()
 			customBaseURL := "https://gateway.example/anthropic"
 			expectedUsageURL := customBaseURL + "/api/oauth/usage"
+			if test.scope != "" {
+				expectedUsageURL += "?cedar_ember=1"
+			}
 			expectedProfileURL := customBaseURL + "/api/oauth/profile"
 			server.configService = newStubConfigService(map[string]string{
 				config.AnthropicBaseURLSettingKey: customBaseURL,
@@ -6455,7 +7294,7 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 			credential := &anthropicauth.Credential{
 				Type: anthropicauth.ChannelType, AccessToken: "at-anthropic-quota-secret", RefreshToken: "rt-anthropic-quota-secret",
 				Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), AccountUUID: "account-anthropic-quota", EmailAddress: "quota@example.com",
-				PlanType: test.initialPlan, ClaudeCodeTrialEndsAt: test.initialTrial,
+				PlanType: test.initialPlan, ClaudeCodeTrialEndsAt: test.initialTrial, Scope: test.scope,
 			}
 			channel, _, err := createOrUpdateAnthropicChannel(context.Background(), store, credential)
 			if err != nil {
@@ -6471,7 +7310,14 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 				if got := request.Header.Get("Authorization"); got != "Bearer at-anthropic-quota-secret" {
 					t.Errorf("Authorization = %q", got)
 				}
-				if got := request.Header.Get("User-Agent"); got != anthropicUsageUserAgent {
+				wantUserAgent := anthropicUsageUserAgent
+				if request.URL.String() == expectedUsageURL && test.scope != "" {
+					wantUserAgent = "claude-cli/" + anthropicEffectiveCLIVersion() + " (external, cli)"
+					if request.Header.Get("x-app") != "cli" {
+						t.Error("reset usage request missing CLI header")
+					}
+				}
+				if got := request.Header.Get("User-Agent"); got != wantUserAgent {
 					t.Errorf("User-Agent = %q", got)
 				}
 				var responseBody string
@@ -6485,7 +7331,7 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 						"seven_day":{"utilization":40,"resets_at":"2026-08-15T10:00:00Z"},
 						"seven_day_sonnet":{"utilization":25,"resets_at":"2026-08-15T11:00:00Z"},
 						"seven_day_overage_included":{"utilization":75,"resets_at":"2026-08-15T12:00:00Z"}
-					}`
+					` + test.resetBody + `}`
 				case expectedProfileURL:
 					if got := request.Header.Get("Cache-Control"); got != "no-cache" {
 						t.Errorf("Cache-Control = %q", got)
@@ -6522,12 +7368,34 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 				response.Data.SubscriptionTier != test.wantSubscription || len(response.Data.Windows) != 4 {
 				t.Fatalf("usage summary = %#v", response.Data)
 			}
+			wantWarnings := []string{}
+			if test.wantResetWarning {
+				wantWarnings = append(wantWarnings, "Anthropic reset credits unavailable")
+			}
 			if test.wantWarning {
-				if len(response.Data.Warnings) != 1 || response.Data.Warnings[0] != "Anthropic subscription metadata unavailable" {
-					t.Fatalf("usage warnings = %v", response.Data.Warnings)
-				}
-			} else if len(response.Data.Warnings) != 0 {
+				wantWarnings = append(wantWarnings, "Anthropic subscription metadata unavailable")
+			}
+			if strings.Join(response.Data.Warnings, ";") != strings.Join(wantWarnings, ";") {
 				t.Fatalf("usage warnings = %v", response.Data.Warnings)
+			}
+			credits := response.Data.AnthropicResetCredits
+			wantCredits := test.scope != "" && !test.wantResetWarning
+			if (credits != nil) != wantCredits || credits != nil && (credits.AvailableCount != test.wantResetCount || credits.FetchedAt.IsZero()) {
+				t.Fatalf("reset credits = %#v", credits)
+			}
+			var responseFields map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &responseFields); err != nil {
+				t.Fatal(err)
+			}
+			if resetFields, ok := responseFields["data"].(map[string]any)["anthropic_reset_credits"].(map[string]any); ok {
+				if _, leaked := resetFields["next_grant_id"]; leaked {
+					t.Fatal("reset response leaked next grant ID")
+				}
+				for _, credit := range resetFields["credits"].([]any) {
+					if _, leaked := credit.(map[string]any)["id"]; leaked {
+						t.Fatal("reset response leaked grant ID")
+					}
+				}
 			}
 			if requestCounts[expectedUsageURL] != 1 || requestCounts[expectedProfileURL] != 1 || len(requestCounts) != 2 {
 				t.Fatalf("Anthropic request counts = %v", requestCounts)
@@ -6549,6 +7417,17 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 				len(list.Data[0].OAuthUsage.Windows) != 4 {
 				t.Fatalf("Anthropic channel list metadata = %+v", list.Data)
 			}
+			listedCredits := list.Data[0].OAuthUsage.AnthropicResetCredits
+			if (listedCredits != nil) != wantCredits || listedCredits != nil && listedCredits.AvailableCount != test.wantResetCount {
+				t.Fatalf("persisted reset credits = %#v", listedCredits)
+			}
+			if wantCredits {
+				passive := &oauthUsageSummary{Provider: anthropicauth.ChannelType, Windows: []oauthUsageWindow{{Kind: "five_hour", UsedPercent: 80}}}
+				merged := latestOAuthUsage(list.Data[0].OAuthUsage, time.Now(), passive, time.Now().Add(time.Minute).Format(time.RFC3339Nano))
+				if merged.AnthropicResetCredits == nil || merged.AnthropicResetCredits.AvailableCount != test.wantResetCount || merged.Windows[0].UsedPercent != 80 {
+					t.Fatalf("passive merged usage = %#v", merged)
+				}
+			}
 			windows := response.Data.Windows
 			if windows[0].Kind != "five_hour" || windows[0].UsedPercent != 12.5 || windows[0].RemainingPercent != 87.5 || windows[0].LimitWindowSeconds != 5*60*60 {
 				t.Fatalf("five-hour window = %#v", windows[0])
@@ -6563,7 +7442,225 @@ func TestHandleOAuthUsageReturnsAnthropicQuotaAndSubscription(t *testing.T) {
 	}
 }
 
+func TestHandleAnthropicResetCreditsReadOnlyWire(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	credential := &anthropicauth.Credential{
+		Type: anthropicauth.ChannelType, AccessToken: "reset-access-secret", RefreshToken: "reset-refresh-secret",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Scope: "user:inference user:profile",
+		AccountUUID: "reset-account", EmailAddress: "reset@example.com",
+	}
+	channel, _, err := createOrUpdateAnthropicChannel(context.Background(), store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetConfig(context.Background(), channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	upstreamBody := `{"cedar_ember":{"eligible":true,"at_limit":true,"next_grant_id":"grant_1","grants":[{"id":"grant_1","label":"Weekly reset","resets_left":2,"clears":["weekly"],"usable_now":true,"percent_used":{"weekly":75}}]}}`
+	server.client = &http.Client{Transport: oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.URL.String() != "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1" ||
+			request.Method != http.MethodGet || request.Header.Get("Authorization") != "Bearer reset-access-secret" ||
+			request.Header.Get("anthropic-beta") != "oauth-2025-04-20" || request.Header.Get("x-app") != "cli" ||
+			request.Header.Get("User-Agent") != "claude-cli/"+anthropicEffectiveCLIVersion()+" (external, cli)" {
+			t.Errorf("reset request = %s %s %v", request.Method, request.URL, request.Header)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(upstreamBody)), Request: request}, nil
+	})}
+	server.anthropicCredentials = newAnthropicCredentialManager(anthropicauth.NewService(server.client), store,
+		func(cfg *model.Config) *http.Client { return server.getClientForChannel(cfg) }, nil)
+	path := fmt.Sprintf("/admin/channels/%d/anthropic-reset-credits", channel.ID)
+	c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channel.ID, 10)}}
+	server.HandleAnthropicResetCredits(c)
+	if w.Code != http.StatusOK || calls != 1 {
+		t.Fatalf("status=%d calls=%d body=%s", w.Code, calls, w.Body.String())
+	}
+	var response struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Eligible       bool `json:"eligible"`
+			AvailableCount int  `json:"available_count"`
+			Credits        []struct {
+				Redeemable bool `json:"redeemable"`
+			} `json:"credits"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || !response.Success || !response.Data.Eligible ||
+		response.Data.AvailableCount != 2 || len(response.Data.Credits) != 1 || !response.Data.Credits[0].Redeemable {
+		t.Fatalf("reset response = %+v, %v", response, err)
+	}
+	if strings.Contains(w.Body.String(), "grant_1") || strings.Contains(w.Body.String(), "reset-access-secret") {
+		t.Fatalf("reset response leaked private data: %s", w.Body.String())
+	}
+	after, err := store.GetConfig(context.Background(), channel.ID)
+	if err != nil || after.OAuthCredential != before.OAuthCredential {
+		t.Fatalf("read-only query changed credential: %v", err)
+	}
+	baseGrant := `"id":"grant_1","label":"Weekly reset","resets_left":2,"clears":["weekly"],"usable_now":true`
+	for _, test := range []struct {
+		name, blockFields, grantFields string
+		wantCredits, wantAvailable     int
+	}{
+		{"paused", `"eligible":true,"at_limit":true,"next_grant_id":"grant_1"`, baseGrant + `,"paused":true`, 0, 0},
+		{"expired", `"eligible":true,"at_limit":true,"next_grant_id":"grant_1"`, baseGrant + `,"ends_at":"2000-01-01T00:00:00Z"`, 0, 0},
+		{"future", `"eligible":true,"at_limit":true,"next_grant_id":"grant_1"`, baseGrant + `,"starts_at":"2100-01-01T00:00:00Z"`, 0, 0},
+		{"cooldown", `"eligible":true,"at_limit":true,"next_grant_id":"grant_1","cooldown_until":"2100-01-01T00:00:00Z"`, baseGrant, 1, 0},
+		{"requires limit", `"eligible":true,"at_limit":false,"next_grant_id":"grant_1"`, baseGrant, 1, 0},
+		{"blocking", `"eligible":true,"at_limit":true,"next_grant_id":"grant_1"`, baseGrant + `,"blocking":["some_limit"]`, 1, 0},
+		{"ineligible", `"eligible":false,"at_limit":true,"next_grant_id":"grant_1"`, baseGrant, 1, 0},
+		{"not next", `"eligible":true,"at_limit":true,"next_grant_id":"other"`, baseGrant, 1, 0},
+		{"no limit required", `"eligible":true,"at_limit":false,"next_grant_id":"grant_1"`, baseGrant + `,"use_requires_limit":false`, 1, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamBody = `{"cedar_ember":{` + test.blockFields + `,"grants":[{` + test.grantFields + `}]}}`
+			c, response := newTestContext(t, newRequest(http.MethodGet, path, nil))
+			c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channel.ID, 10)}}
+			server.HandleAnthropicResetCredits(c)
+			var result struct {
+				Success bool `json:"success"`
+				Data    struct {
+					AvailableCount int               `json:"available_count"`
+					Credits        []json.RawMessage `json:"credits"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || !result.Success ||
+				len(result.Data.Credits) != test.wantCredits || result.Data.AvailableCount != test.wantAvailable {
+				t.Fatalf("status=%d result=%+v err=%v", response.Code, result, err)
+			}
+		})
+	}
+}
+
+func TestHandleAnthropicResetCreditsRejectsMissingScopeAndMalformedUpstream(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	credential := &anthropicauth.Credential{
+		Type: anthropicauth.ChannelType, AccessToken: "reset-access-secret", RefreshToken: "reset-refresh-secret",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Scope: "user:inference",
+		AccountUUID: "reset-error-account", EmailAddress: "reset-error@example.com",
+	}
+	channel, _, err := createOrUpdateAnthropicChannel(context.Background(), store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	status := http.StatusOK
+	body := `{"cedar_ember":{"eligible":true}}`
+	server.client = &http.Client{Transport: oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: status, Header: http.Header{"Location": []string{"https://other.example/"}}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})}
+	server.anthropicCredentials = newAnthropicCredentialManager(anthropicauth.NewService(server.client), store,
+		func(cfg *model.Config) *http.Client { return server.getClientForChannel(cfg) }, nil)
+	query := func() *httptest.ResponseRecorder {
+		path := fmt.Sprintf("/admin/channels/%d/anthropic-reset-credits", channel.ID)
+		c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channel.ID, 10)}}
+		server.HandleAnthropicResetCredits(c)
+		return w
+	}
+	if response := query(); response.Code != http.StatusBadRequest || calls != 0 {
+		t.Fatalf("missing scope status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+	}
+	credential.Scope = "user:profile"
+	credential.AccountUUID = "reset-error-account-with-scope"
+	credential.EmailAddress = "reset-error-with-scope@example.com"
+	channel, _, err = createOrUpdateAnthropicChannel(context.Background(), store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := query(); response.Code != http.StatusBadGateway || calls != 1 || !strings.Contains(response.Body.String(), "invalid Anthropic reset grants") {
+		t.Fatalf("malformed upstream status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+	}
+	for _, upstream := range []string{`{}`, `{"cedar_ember":null}`} {
+		body = upstream
+		response := query()
+		var result struct {
+			Success bool `json:"success"`
+			Data    struct {
+				Eligible       bool              `json:"eligible"`
+				AvailableCount int               `json:"available_count"`
+				Credits        []json.RawMessage `json:"credits"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != http.StatusOK || !result.Success ||
+			result.Data.Eligible || result.Data.AvailableCount != 0 || len(result.Data.Credits) != 0 {
+			t.Fatalf("absent reset %s status=%d body=%s err=%v", upstream, response.Code, response.Body.String(), err)
+		}
+	}
+	for _, upstream := range []string{`{"error":"denied"}`, `{"cedar_ember":{"grants":null}}`, `{"cedar_ember":42}`} {
+		body = upstream
+		if response := query(); response.Code != http.StatusBadGateway {
+			t.Fatalf("invalid reset %s status=%d body=%s", upstream, response.Code, response.Body.String())
+		}
+	}
+	status = http.StatusFound
+	beforeRedirect := calls
+	if response := query(); response.Code != http.StatusBadGateway || calls != beforeRedirect+1 {
+		t.Fatalf("redirect status=%d calls=%d body=%s", response.Code, calls, response.Body.String())
+	}
+}
+
+func TestHandleAnthropicResetCreditsRefreshesOnceAfterUnauthorized(t *testing.T) {
+	t.Parallel()
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	credential := &anthropicauth.Credential{
+		Type: anthropicauth.ChannelType, AccessToken: "old-reset-token", RefreshToken: "old-reset-refresh",
+		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), Scope: "user:profile",
+		AccountUUID: "reset-retry-account", EmailAddress: "reset-retry@example.com",
+	}
+	channel, _, err := createOrUpdateAnthropicChannel(context.Background(), store, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageCalls, refreshCalls := 0, 0
+	server.client = &http.Client{Transport: oauthUsageRoundTripper(func(request *http.Request) (*http.Response, error) {
+		status, body := http.StatusOK, `{"cedar_ember":{"eligible":true,"grants":[]}}`
+		switch request.URL.String() {
+		case "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1":
+			usageCalls++
+			if request.Header.Get("Authorization") == "Bearer old-reset-token" {
+				status = http.StatusUnauthorized
+			} else if request.Header.Get("Authorization") != "Bearer new-reset-token" {
+				t.Errorf("unexpected reset Authorization = %q", request.Header.Get("Authorization"))
+			}
+		case anthropicauth.TokenURL:
+			refreshCalls++
+			body = `{"access_token":"new-reset-token","refresh_token":"new-reset-refresh","expires_in":3600,"scope":"user:profile"}`
+		default:
+			t.Errorf("unexpected URL = %s", request.URL)
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})}
+	server.anthropicCredentials = newAnthropicCredentialManager(anthropicauth.NewService(server.client), store,
+		func(cfg *model.Config) *http.Client { return server.getClientForChannel(cfg) }, nil)
+	path := fmt.Sprintf("/admin/channels/%d/anthropic-reset-credits", channel.ID)
+	c, response := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(channel.ID, 10)}}
+	server.HandleAnthropicResetCredits(c)
+	if response.Code != http.StatusOK || usageCalls != 2 || refreshCalls != 1 {
+		t.Fatalf("status=%d usage calls=%d refresh calls=%d body=%s", response.Code, usageCalls, refreshCalls, response.Body.String())
+	}
+	var wire struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Eligible bool `json:"eligible"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &wire); err != nil || !wire.Success || !wire.Data.Eligible {
+		t.Fatalf("reset response = %+v, %v", wire, err)
+	}
+}
+
 func TestHandleOAuthUsageReturnsRawCredentialRefreshResponse(t *testing.T) {
+	t.Parallel()
 	const upstreamBody = "  {\"error\":\"invalid_grant\",\"error_description\":\"refresh token expired\"}\n"
 	tests := []struct {
 		name  string
@@ -6689,6 +7786,7 @@ func TestHandleOAuthUsageReturnsRawCredentialRefreshResponse(t *testing.T) {
 }
 
 func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	sonnetResetAt := time.Now().UTC().Add(7 * 24 * time.Hour).Unix()
@@ -6697,7 +7795,7 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 		Expired: time.Now().UTC().Add(time.Hour).Format(time.RFC3339), AccountUUID: "passive-account", PlanType: "Max 20x",
 		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
 			Key: "claude sonnet|seven_day_sonnet", Family: oauthcost.FamilySonnet, WindowSeconds: 604800,
-			StartedAt: sonnetResetAt - 604800, ResetAt: sonnetResetAt, StandardCostMicroUSD: 2_000_000,
+			StartedAt: sonnetResetAt - 604800, ResetAt: sonnetResetAt,
 		}}},
 	}
 	olderTime := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
@@ -6721,6 +7819,7 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 	if err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
+	seedQuotaLedger(t, store, channel.ID, time.Now(), "claude-sonnet-4-6", 2_000_000)
 	server.anthropicCredentials = newAnthropicCredentialManager(
 		anthropicauth.NewService(server.client), store,
 		func(cfg *model.Config) *http.Client { return server.getClientForChannel(cfg) }, nil,
@@ -6746,7 +7845,8 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 		t.Fatalf("parse persisted credential: %v", err)
 	}
 	usage := persistedCredential.PassiveUsage
-	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil || sonnet.StandardCostMicroUSD != 2_000_000 {
+	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil ||
+		quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("claude sonnet|seven_day_sonnet").StandardCostMicroUSD != 2_000_000 {
 		t.Fatalf("passive headers deleted the independent Sonnet weekly counter: %+v", sonnet)
 	}
 	if usage == nil || usage.FiveHour == nil || usage.FiveHour.Utilization == nil || *usage.FiveHour.Utilization != 0.25 ||
@@ -6809,12 +7909,14 @@ func TestAnthropicModelResponsePersistsPassiveQuotaInCredentialAndChannelList(t 
 		oauthcost.Find(persistedCredential.QuotaCostUsage, oauthcost.Key("", "seven_day")) == nil {
 		t.Fatalf("passive usage after 5h window reset = %#v, %v", persistedCredential.PassiveUsage, err)
 	}
-	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil || sonnet.StandardCostMicroUSD != 2_250_000 || sonnet.ResetAt != sonnetResetAt {
+	if sonnet := oauthcost.Find(persistedCredential.QuotaCostUsage, "claude sonnet|seven_day_sonnet"); sonnet == nil ||
+		quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("claude sonnet|seven_day_sonnet").StandardCostMicroUSD != 2_250_000 || sonnet.ResetAt != sonnetResetAt {
 		t.Fatalf("Sonnet weekly cost did not continue after a five-hour-only update: %+v", sonnet)
 	}
 }
 
 func TestHandleOAuthUsageReturnsAntigravityQuotaWithoutLeakingCredential(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	const discoveredUserAgent = "antigravity/hub/9.8.7 darwin/arm64"
@@ -6942,6 +8044,7 @@ func TestHandleOAuthUsageReturnsAntigravityQuotaWithoutLeakingCredential(t *test
 }
 
 func TestHandleOAuthUsageHidesUpstreamErrorBody(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	channel, _, err := createOrUpdateCodexChannel(context.Background(), store, &codexauth.Credential{
@@ -6976,6 +8079,7 @@ func TestHandleOAuthUsageHidesUpstreamErrorBody(t *testing.T) {
 }
 
 func TestHandleOAuthUsageRejectsUnsupportedChannel(t *testing.T) {
+	t.Parallel()
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	channel, err := store.CreateConfig(context.Background(), &model.Config{
@@ -6996,6 +8100,7 @@ func TestHandleOAuthUsageRejectsUnsupportedChannel(t *testing.T) {
 }
 
 func TestAnthropicOAuthManagerValidatesCombinedCodeStateAndCreatesChannel(t *testing.T) {
+	t.Parallel()
 	var exchangedState string
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]string
@@ -7035,6 +8140,7 @@ func TestAnthropicOAuthManagerValidatesCombinedCodeStateAndCreatesChannel(t *tes
 			}
 			channel, getErr := store.GetConfig(context.Background(), status.ChannelID)
 			if getErr != nil || !channel.UsesAnthropicOAuth() || !channel.SupportsModel("claude-fable-5-1") ||
+				!channel.SupportsModel("claude-opus-5-5") ||
 				len(channel.ModelEntries) != len(anthropicOAuthDefaultModels) {
 				t.Fatalf("created channel=%+v err=%v", channel, getErr)
 			}
@@ -7050,164 +8156,23 @@ func TestAnthropicOAuthManagerValidatesCombinedCodeStateAndCreatesChannel(t *tes
 	}
 }
 
-func TestHandleAnthropicCookieAuthCreatesChannelWithoutReturningOrPersistingCookie(t *testing.T) {
-	const sessionKey = "sk-ant-sid01-handler-secret"
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/api/organizations":
-			cookie, err := request.Cookie("sessionKey")
-			if err != nil || cookie.Value != sessionKey {
-				t.Errorf("organization cookie = %v, err = %v", cookie, err)
-			}
-			_, _ = io.WriteString(w, `[{"uuid":"cookie-org"}]`)
-		case "/v1/oauth/cookie-org/authorize":
-			var payload map[string]string
-			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-				t.Errorf("decode authorization request: %v", err)
-			}
-			redirect := anthropicauth.RedirectURI + "?code=cookie-code&state=" + url.QueryEscape(payload["state"])
-			_ = json.NewEncoder(w).Encode(map[string]string{"redirect_uri": redirect})
-		case "/token":
-			_, _ = io.WriteString(w, `{"access_token":"cookie-access-secret","refresh_token":"cookie-refresh-secret","token_type":"Bearer","expires_in":3600,"scope":"user:inference","organization":{"uuid":"cookie-org"},"account":{"uuid":"cookie-account","email_address":"cookie@example.com"}}`)
-		default:
-			http.NotFound(w, request)
-		}
-	}))
-	defer upstream.Close()
-	server, store, cleanup := setupAdminTestServer(t)
-	defer cleanup()
-	service := anthropicauth.NewService(upstream.Client())
-	service.ClaudeWebURL = upstream.URL
-	service.TokenURL = upstream.URL + "/token"
-	server.anthropicService = service
+func TestAnthropicCookieAuthEndpointRemoved(t *testing.T) {
+	server := newInMemoryServer(t)
+	engine := gin.New()
+	server.SetupRoutes(engine)
 
-	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/anthropic/oauth/cookie", map[string]string{
-		"session_key": sessionKey,
-	}))
-	server.HandleAnthropicCookieAuth(c)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("cookie auth status=%d body=%s", w.Code, w.Body.String())
-	}
-	if strings.Contains(w.Body.String(), sessionKey) || strings.Contains(w.Body.String(), "cookie-access-secret") ||
-		strings.Contains(w.Body.String(), "cookie-refresh-secret") {
-		t.Fatalf("cookie auth response leaked credentials: %s", w.Body.String())
-	}
-	var response APIResponse[struct {
-		Status    string `json:"status"`
-		ChannelID int64  `json:"channel_id"`
-		Created   bool   `json:"created"`
-	}]
-	mustUnmarshalJSON(t, w.Body.Bytes(), &response)
-	if !response.Success || response.Data.Status != "complete" || !response.Data.Created || response.Data.ChannelID == 0 {
-		t.Fatalf("cookie auth response = %+v", response)
-	}
-	channel, err := store.GetConfig(context.Background(), response.Data.ChannelID)
-	if err != nil {
-		t.Fatalf("get cookie channel: %v", err)
-	}
-	if !channel.UsesAnthropicOAuth() || strings.Contains(channel.OAuthCredential, sessionKey) {
-		t.Fatalf("cookie channel persisted sessionKey: %+v", channel)
-	}
-	credential, err := anthropicauth.ParseCredential([]byte(channel.OAuthCredential))
-	if err != nil || credential.AccessToken != "cookie-access-secret" || credential.RefreshToken != "cookie-refresh-secret" {
-		t.Fatalf("stored cookie credential = %+v, err = %v", credential, err)
-	}
-}
-
-func TestHandleAnthropicCookieAuthReturnsSanitizedUpstreamErrors(t *testing.T) {
-	const sessionKey = "sk-ant-sid01-a/b+c="
-	var mixedEncodedSecret strings.Builder
-	var percentEncodedSecret strings.Builder
-	for _, char := range sessionKey {
-		_, _ = fmt.Fprintf(&mixedEncodedSecret, "%%5Cu%04x", char)
-	}
-	for index := range len(sessionKey) {
-		_, _ = fmt.Fprintf(&percentEncodedSecret, "%%%02X", sessionKey[index])
-	}
-	tests := []struct {
-		name            string
-		failurePath     string
-		statusCode      int
-		message         string
-		reflectedSecret string
-		rawFailureBody  string
-		expectRedacted  bool
-	}{
-		{name: "organization", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "organization authorization denied"},
-		{name: "authorization", failurePath: "/v1/oauth/cookie-org/authorize", statusCode: http.StatusForbidden, message: "organization cannot use this OAuth client"},
-		{name: "token", failurePath: "/token", statusCode: http.StatusBadRequest, message: "authorization code expired"},
-		{name: "query-encoded secret", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "reflected credential", reflectedSecret: url.QueryEscape(sessionKey), expectRedacted: true},
-		{name: "path-encoded secret", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "reflected credential", reflectedSecret: "sk-ant-sid01-a%2Fb+c=", expectRedacted: true},
-		{name: "HTML-encoded secret", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "reflected credential", reflectedSecret: "sk-ant-sid01-a&#47;b&#43;c&#61;", expectRedacted: true},
-		{name: "duplicate JSON key", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, rawFailureBody: `{"session_key":"sk-ant-sid01-a\/b\u002bc=","session_key":"safe"}`, expectRedacted: true},
-		{name: "multiple JSON values", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, rawFailureBody: "{\"error\":\"safe\"}\n{\"session_key\":\"sk-ant-sid01-a\\/b\\u002bc=\"}", expectRedacted: true},
-		{name: "nested JSON escape", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, rawFailureBody: `{"error":"sk-ant-sid01-a\\u002fb\\u002bc="}`, expectRedacted: true},
-		{name: "mixed URL and JSON escapes", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "reflected credential", reflectedSecret: mixedEncodedSecret.String(), expectRedacted: true},
-		{name: "benign nested JSON escape", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "literal", rawFailureBody: `{"error":"literal \"quoted\" \\u1234"}`},
-		{name: "benign Windows path", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "path C", rawFailureBody: `{"error":"path C:\\users\\name"}`},
-		{name: "invalid JSON escape before secret", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, rawFailureBody: `{"error":"path C:\\users\\name sk-ant-sid01-a\\u002fb\\u002bc="}`, expectRedacted: true},
-		{name: "invalid percent escape before secret", failurePath: "/api/organizations", statusCode: http.StatusUnauthorized, message: "reflected credential", reflectedSecret: "bad%ZZ" + percentEncodedSecret.String(), expectRedacted: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				if request.URL.Path == test.failurePath {
-					w.WriteHeader(test.statusCode)
-					if test.rawFailureBody != "" {
-						_, _ = io.WriteString(w, test.rawFailureBody)
-						return
-					}
-					payload := map[string]string{"error": test.message}
-					if test.reflectedSecret != "" {
-						payload["session_key"] = test.reflectedSecret
-					}
-					_ = json.NewEncoder(w).Encode(payload)
-					return
-				}
-				switch request.URL.Path {
-				case "/api/organizations":
-					_, _ = io.WriteString(w, `[{"uuid":"cookie-org"}]`)
-				case "/v1/oauth/cookie-org/authorize":
-					var payload map[string]string
-					if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-						t.Fatalf("decode authorization request: %v", err)
-					}
-					redirect := anthropicauth.RedirectURI + "?code=cookie-code&state=" + url.QueryEscape(payload["state"])
-					_ = json.NewEncoder(w).Encode(map[string]string{"redirect_uri": redirect})
-				default:
-					http.NotFound(w, request)
-				}
-			}))
-			defer upstream.Close()
-
-			server, _, cleanup := setupAdminTestServer(t)
-			defer cleanup()
-			service := anthropicauth.NewService(upstream.Client())
-			service.ClaudeWebURL = upstream.URL
-			service.TokenURL = upstream.URL + "/token"
-			server.anthropicService = service
-
-			c, recorder := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/anthropic/oauth/cookie", map[string]string{
-				"session_key": sessionKey,
-			}))
-			server.HandleAnthropicCookieAuth(c)
-
-			body := recorder.Body.String()
-			if recorder.Code != http.StatusBadGateway || strings.Contains(body, sessionKey) ||
-				strings.Contains(body, url.QueryEscape(sessionKey)) ||
-				!strings.Contains(body, fmt.Sprintf("returned HTTP %d", test.statusCode)) {
-				t.Fatalf("cookie auth error status=%d body=%s", recorder.Code, body)
-			}
-			if test.expectRedacted != strings.Contains(body, "[REDACTED]") ||
-				(!test.expectRedacted && !strings.Contains(body, test.message)) {
-				t.Fatalf("cookie auth error status=%d body=%s", recorder.Code, body)
-			}
-		})
+	request := newJSONRequest(t, http.MethodPost, "/admin/anthropic/oauth/cookie", map[string]string{
+		"session_key": "removed-cookie-credential",
+	})
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("removed Cookie endpoint status=%d, want 404 body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
 func TestSameAnthropicIdentityNeverUsesSharedOrganization(t *testing.T) {
+	t.Parallel()
 	first := &anthropicauth.Credential{OrgUUID: "shared-org"}
 	second := &anthropicauth.Credential{OrgUUID: "shared-org"}
 	if sameAnthropicIdentity(first, second) {
@@ -7220,6 +8185,7 @@ func TestSameAnthropicIdentityNeverUsesSharedOrganization(t *testing.T) {
 }
 
 func TestAnthropicCredentialManagerPersistsRotatedRefreshToken(t *testing.T) {
+	t.Parallel()
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]string
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
@@ -7267,6 +8233,7 @@ func TestAnthropicCredentialManagerPersistsRotatedRefreshToken(t *testing.T) {
 }
 
 func TestHandleRefreshAnthropicCredentialReturnsUpstreamErrorDetails(t *testing.T) {
+	t.Parallel()
 	const upstreamBody = `{"error":"invalid_grant","error_description":"refresh token expired"}`
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]string
@@ -7315,6 +8282,7 @@ func TestHandleRefreshAnthropicCredentialReturnsUpstreamErrorDetails(t *testing.
 }
 
 func TestAnthropicCredentialManagerConsumesConcurrentCASWinnerAfterInvalidGrant(t *testing.T) {
+	t.Parallel()
 	_, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	oldCredential := &anthropicauth.Credential{
@@ -7362,6 +8330,7 @@ func TestAnthropicCredentialManagerConsumesConcurrentCASWinnerAfterInvalidGrant(
 }
 
 func TestAnthropicCredentialManagerMergesRepeatedMetadataWinnersWithoutRefreshingTwice(t *testing.T) {
+	t.Parallel()
 	_, baseStore, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 	oldCredential := &anthropicauth.Credential{
@@ -7470,9 +8439,6 @@ func TestTrackedOAuthProvidersResetOnlyRolledBackCostWindows(t *testing.T) {
 					LimitWindowSeconds: 7 * 24 * 60 * 60, ResetAt: weeklyResetAt.Unix(), SampledAt: now},
 			}}
 			usage := reconcileOAuthQuotaCostUsage(nil, initial, now)
-			if changed, err := oauthcost.AddStandardCost(usage, now, "gpt-5.6-sol", 1_000_000); err != nil || !changed {
-				t.Fatalf("seed cost = (%t, %v)", changed, err)
-			}
 
 			resetSampledAt := now.Add(time.Hour)
 			reset := &oauthUsageSummary{Provider: provider, Windows: []oauthUsageWindow{
@@ -7485,10 +8451,10 @@ func TestTrackedOAuthProvidersResetOnlyRolledBackCostWindows(t *testing.T) {
 			usage = reconcileOAuthQuotaCostUsage(usage, reset, resetSampledAt)
 			fiveHour := oauthcost.Find(usage, oauthcost.Key("account", "five_hour"))
 			weekly := oauthcost.Find(usage, oauthcost.Key("account", "weekly"))
-			if fiveHour == nil || fiveHour.StandardCostMicroUSD != 1_000_000 || fiveHour.CountFromAt != 0 {
+			if fiveHour == nil || fiveHour.CountFromAt != 0 {
 				t.Fatalf("unrolled 5-hour window followed weekly reset: %#v", fiveHour)
 			}
-			if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != resetSampledAt.Unix() {
+			if weekly == nil || weekly.CountFromAt != resetSampledAt.Unix() {
 				t.Fatalf("weekly window did not reset: %#v", weekly)
 			}
 		})
@@ -7509,9 +8475,6 @@ func TestXAIAccountingFallbackDetectsUsageRollback(t *testing.T) {
 		MonthlyResetAt: monthlyResetAt.Format(time.RFC3339),
 	}}
 	usage := reconcileOAuthQuotaCostUsage(nil, summary, now)
-	if changed, err := oauthcost.AddStandardCost(usage, now, "grok-4", 1_000_000); err != nil || !changed {
-		t.Fatalf("seed cost = (%t, %v)", changed, err)
-	}
 
 	weeklyUsed = 5
 	summary.XAIBilling.WeeklyUsagePercent = &weeklyUsed
@@ -7519,10 +8482,10 @@ func TestXAIAccountingFallbackDetectsUsageRollback(t *testing.T) {
 	usage = reconcileOAuthQuotaCostUsage(usage, summary, resetSampledAt)
 	weekly := oauthcost.Find(usage, oauthcost.Key("xai", "weekly"))
 	monthly := oauthcost.Find(usage, oauthcost.Key("xai", "monthly"))
-	if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != resetSampledAt.Unix() {
+	if weekly == nil || weekly.CountFromAt != resetSampledAt.Unix() {
 		t.Fatalf("xAI weekly fallback did not reset: %#v", weekly)
 	}
-	if monthly == nil || monthly.StandardCostMicroUSD != 1_000_000 || monthly.CountFromAt != 0 {
+	if monthly == nil || monthly.CountFromAt != 0 {
 		t.Fatalf("xAI monthly was reset with weekly: %#v", monthly)
 	}
 }
@@ -7542,35 +8505,28 @@ func TestAnthropicPassiveUsageKeepsSiblingCostAcrossWeeklyRollback(t *testing.T)
 		SevenDay: window(0.73, weeklyResetAt, now),
 	}}
 	usage := reconcileOAuthQuotaCostUsage(nil, anthropicPassiveUsageSummary(credential), now)
-	if changed, err := oauthcost.AddStandardCost(usage, now, "claude-opus-4-6", 1_000_000); err != nil || !changed {
-		t.Fatalf("seed cost = (%t, %v)", changed, err)
-	}
 
 	weeklyRolledAt := now.Add(time.Hour)
 	credential.PassiveUsage.SevenDay = window(0.05, weeklyRolledAt.Add(7*24*time.Hour).Unix(), weeklyRolledAt)
 	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), weeklyRolledAt)
 	fiveHour := oauthcost.Find(usage, oauthcost.Key("", "five_hour"))
 	weekly := oauthcost.Find(usage, oauthcost.Key("", "seven_day"))
-	if fiveHour == nil || fiveHour.StandardCostMicroUSD != 1_000_000 ||
+	if fiveHour == nil || fiveHour.CountFromAt != 0 ||
 		fiveHour.SampledUpstreamUsedPercent == nil || *fiveHour.SampledUpstreamUsedPercent != 80 {
 		t.Fatalf("unrolled Anthropic 5-hour window followed weekly reset: %#v", fiveHour)
 	}
-	if weekly == nil || weekly.StandardCostMicroUSD != 0 || weekly.CountFromAt != weeklyRolledAt.Unix() {
+	if weekly == nil || weekly.CountFromAt != weeklyRolledAt.Unix() {
 		t.Fatalf("Anthropic weekly rollback did not reset weekly: %#v", weekly)
-	}
-	if changed, err := oauthcost.AddStandardCost(usage, weeklyRolledAt.Add(time.Second), "claude-opus-4-6", 500_000); err != nil || !changed {
-		t.Fatalf("post-reset cost = (%t, %v)", changed, err)
 	}
 
 	credential.PassiveUsage.FiveHour = window(0.05, weeklyRolledAt.Add(5*time.Hour).Unix(), weeklyRolledAt.Add(time.Minute))
 	usage = reconcileOAuthQuotaCostUsage(usage, anthropicPassiveUsageSummary(credential), weeklyRolledAt.Add(time.Minute))
 	fiveHour = oauthcost.Find(usage, oauthcost.Key("", "five_hour"))
 	weekly = oauthcost.Find(usage, oauthcost.Key("", "seven_day"))
-	if fiveHour == nil || fiveHour.StandardCostMicroUSD != 0 ||
-		fiveHour.CountFromAt != weeklyRolledAt.Add(time.Minute).Unix() {
+	if fiveHour == nil || fiveHour.CountFromAt != weeklyRolledAt.Add(time.Minute).Unix() {
 		t.Fatalf("fresh Anthropic 5-hour rollback was not isolated: %#v", fiveHour)
 	}
-	if weekly == nil || weekly.StandardCostMicroUSD != 500_000 {
+	if weekly == nil || weekly.CountFromAt != weeklyRolledAt.Unix() {
 		t.Fatalf("fresh Anthropic 5-hour sample reset weekly again: %#v", weekly)
 	}
 }
@@ -7753,5 +8709,252 @@ func TestAnthropicLegacySampleTimeMigratesBeforePartialUpdate(t *testing.T) {
 	}, base.Add(2*time.Minute).Format(time.RFC3339Nano))
 	if !changed || mergedWeekly.Utilization == nil || *mergedWeekly.Utilization != delayedWeeklyUtilization {
 		t.Fatalf("delayed sibling was compared against aggregate time: %#v, %t", mergedWeekly, changed)
+	}
+}
+
+func TestPersistOAuthUsageRestartsQuotaEpochOnUpstreamPlanChange(t *testing.T) {
+	t.Parallel()
+	store := newCodexAuthTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	weeklyResetAt := base.Add(6 * 24 * time.Hour).Unix()
+	channel, _, err := createOrUpdateCodexChannel(ctx, store, &codexauth.Credential{
+		Type: "codex", AccessToken: "at-plan-poll", RefreshToken: "rt-plan-poll",
+		ChatGPTUserID: "user-plan-poll", Expired: base.Add(2 * time.Hour).Format(time.RFC3339), AccountID: "account-plan-poll", PlanType: "free",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := newCodexCredentialManager(nil, store, nil, nil)
+	server := &Server{store: store, codexCredentials: manager}
+	poll := func(at time.Time, upstreamPlan string) {
+		t.Helper()
+		if _, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+			Provider: codexauth.ChannelType, PlanType: upstreamPlan, UpstreamPlanType: upstreamPlan,
+			Windows: []oauthUsageWindow{{
+				LimitName: "codex", Kind: "primary", UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt, SampledAt: at,
+			}},
+		}, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addLog := func(at time.Time) {
+		t.Helper()
+		if err := store.AddLog(ctx, &model.LogEntry{
+			Time: model.JSONTime{Time: at}, ChannelID: channel.ID, Model: "gpt-5.6-sol", StatusCode: http.StatusOK, Cost: 0.5,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	load := func() *codexauth.Credential {
+		t.Helper()
+		cfg, err := store.GetConfig(ctx, channel.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return credential
+	}
+
+	poll(base, "free")
+	addLog(base.Add(time.Minute))
+	poll(base.Add(2*time.Minute), "free")
+	got := load()
+	cost := quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary")
+	if window := oauthcost.Find(got.QuotaCostUsage, "codex|primary"); got.QuotaCostUsage.EpochAt != 0 ||
+		window == nil || cost == nil || cost.StandardCostMicroUSD != 500_000 {
+		t.Fatalf("same upstream plan must keep counting: %#v", got.QuotaCostUsage)
+	}
+
+	// /wham/usage 报告的套餐变了：旧成本作废，从这次采样起重新计数；身份留空等 id_token 补记。
+	changedAt := base.Add(10 * time.Minute)
+	poll(changedAt, "pro")
+	got = load()
+	window := oauthcost.Find(got.QuotaCostUsage, "codex|primary")
+	cost = quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary")
+	if got.QuotaCostUsage.EpochAt != changedAt.Unix() || got.QuotaCostUsage.Identity != "" ||
+		window == nil || oauthcost.CountFrom(window) != changedAt.Unix() || cost == nil || cost.StandardCostMicroUSD != 0 {
+		t.Fatalf("upstream plan change did not start a new epoch: %#v", got.QuotaCostUsage)
+	}
+	if persisted, _, _ := persistedOAuthUsage(got.OAuthUsage, codexauth.ChannelType); persisted == nil || persisted.UpstreamPlanType != "pro" {
+		t.Fatalf("persisted snapshot = %#v, want upstream_plan_type pro", persisted)
+	}
+
+	// 同一套餐继续采样：纪元不变，纪元后的日志正常累计。
+	addLog(changedAt.Add(time.Minute))
+	poll(changedAt.Add(2*time.Minute), "pro")
+	got = load()
+	cost = quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary")
+	if window = oauthcost.Find(got.QuotaCostUsage, "codex|primary"); got.QuotaCostUsage.EpochAt != changedAt.Unix() ||
+		window == nil || cost == nil || cost.StandardCostMicroUSD != 500_000 {
+		t.Fatalf("second sample under the new plan must not restart the epoch: %#v", got.QuotaCostUsage)
+	}
+	// 同秒旧请求的响应晚于手动重置，不能把纪元倒退或重新计入旧日志。
+	resetAt := changedAt.Add(3*time.Minute + 500*time.Millisecond)
+	if err := store.ResetOAuthQuotaCostUsage(ctx, channel.ID, resetAt); err != nil {
+		t.Fatal(err)
+	}
+	addLog(resetAt.Add(time.Second))
+	if _, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+		Provider: codexauth.ChannelType, UpstreamPlanType: "free",
+		Windows: []oauthUsageWindow{{LimitName: "codex", Kind: "primary", UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt}},
+	}, resetAt.Add(-time.Millisecond), resetAt.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	got = load()
+	cost = quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary")
+	if !got.QuotaCostUsage.EpochTime().Equal(resetAt) || cost == nil || cost.StandardCostMicroUSD != 500_000 {
+		t.Fatalf("stale poll overwrote manual reset: %#v", got.QuotaCostUsage)
+	}
+	persisted, _, _ := persistedOAuthUsage(got.OAuthUsage, codexauth.ChannelType)
+	if persisted.UpstreamPlanType != "pro" {
+		t.Fatalf("stale plan persisted: %#v", persisted)
+	}
+
+	// 外层操作早于纪元，但凭证刷新后真正发出的额度请求属于新纪元，应正常落盘。
+	actualRequestAt := resetAt.Add(2 * time.Second)
+	if _, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+		Provider: codexauth.ChannelType, UpstreamPlanType: "pro",
+		codexAccountID: "account-plan-poll", codexRequestedAt: actualRequestAt,
+		Windows: []oauthUsageWindow{{LimitName: "codex", Kind: "primary", UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt}},
+	}, resetAt.Add(-time.Millisecond), actualRequestAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, persistedRequestAt := persistedOAuthUsage(load().OAuthUsage, codexauth.ChannelType)
+	if !persistedRequestAt.Equal(actualRequestAt) {
+		t.Fatal("fresh request after credential refresh was discarded")
+	}
+
+	// 重新授权先收到旧声明，再收到新声明，均不得重置轮询后的累计。
+	for _, plan := range []string{"free", "pro"} {
+		_, _, err := createOrUpdateCodexChannel(ctx, store, &codexauth.Credential{
+			Type: "codex", AccessToken: "at-plan-poll", RefreshToken: "rt-plan-poll",
+			ChatGPTUserID: "user-plan-poll", AccountID: "account-plan-poll", PlanType: plan,
+			Expired: time.Now().Add(time.Hour).Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = load()
+		cost = quotaCostViewAt(t, store, channel.ID, time.Now()).FindWindow("codex|primary")
+		if !got.QuotaCostUsage.EpochTime().Equal(resetAt) || cost == nil || cost.StandardCostMicroUSD != 500_000 {
+			t.Fatalf("claims %q reset costs after poll: %#v", plan, got.QuotaCostUsage)
+		}
+	}
+	// 换到同套餐的另一个账号必须重新计数。
+	updated, created, err := createOrUpdateCodexChannel(ctx, store, &codexauth.Credential{
+		Type: "codex", AccessToken: "at-account-b", RefreshToken: "rt-account-b",
+		ChatGPTUserID: "user-plan-poll", AccountID: "account-b", PlanType: "pro",
+		Expired: time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if err != nil || created || updated.ID != channel.ID {
+		t.Fatalf("reauthorization: created=%v err=%v", created, err)
+	}
+	got = load()
+	if got.QuotaCostUsage.AccountID != "account-b" || got.QuotaCostUsage.Identity != "account-b|pro" ||
+		len(got.QuotaCostUsage.Windows) != 0 || !got.QuotaCostUsage.EpochTime().After(resetAt) {
+		t.Fatalf("account change inherited old costs: %#v", got.QuotaCostUsage)
+	}
+	// 清空快照后也必须拒绝旧账号在途响应，不能靠快照的 requested_at 挡旧数据。
+	before, err := got.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+		Provider: codexauth.ChannelType, codexAccountID: "account-plan-poll", UpstreamPlanType: "pro",
+		Windows: []oauthUsageWindow{{LimitName: "codex", Kind: "primary", UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: weeklyResetAt}},
+	}, time.Now(), time.Now()); err == nil {
+		t.Fatal("accepted old-account sample")
+	}
+	after, err := load().JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("rejected poll mutated credential")
+	}
+}
+
+func TestCodexQuotaEpochRejectsSamplesAfterCASConflict(t *testing.T) {
+	t.Parallel()
+	for _, passive := range []bool{false, true} {
+		name := "active"
+		if passive {
+			name = "passive"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			store := newCodexAuthTestStore(t)
+			base := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
+			requestAt, resetAt, sampledAt := base.Add(100*time.Millisecond), base.Add(500*time.Millisecond), base.Add(900*time.Millisecond)
+			credential := &codexauth.Credential{
+				Type: "codex", AccessToken: "at-epoch-cas", RefreshToken: "rt-epoch-cas",
+				AccountID: "epoch-cas", PlanType: "pro", Expired: base.Add(time.Hour).Format(time.RFC3339),
+			}
+			channel, _, err := createOrUpdateCodexChannel(ctx, store, credential)
+			if err != nil {
+				t.Fatal(err)
+			}
+			winner := *credential
+			winner.QuotaCostUsage = oauthcost.Reset(nil, resetAt)
+			winnerJSON, err := winner.JSON()
+			if err != nil {
+				t.Fatal(err)
+			}
+			raceStore := &concurrentOAuthWinnerStore{Store: store, authType: model.AuthTypeCodexOAuth, winnerJSON: winnerJSON}
+			if passive {
+				manager := newCodexCredentialManager(nil, raceStore, nil, nil)
+				oldEpoch := time.Time{}
+				updated, err := manager.updatePassiveUsage(ctx, channel, codexPassiveUsageUpdate{
+					AccountID: credential.AccountID, SourceEpoch: &oldEpoch, SampledAt: sampledAt.Format(time.RFC3339Nano),
+					Windows: []codexauth.PassiveUsageWindow{{Scope: "codex", LimitName: "codex", Kind: "primary", UsedPercent: 5,
+						LimitWindowSeconds: 604800, ResetAt: base.Add(24 * time.Hour).Unix(), SampledAt: sampledAt.Format(time.RFC3339Nano)}},
+				})
+				if err != nil || updated {
+					t.Fatalf("old passive response updated=%v err=%v", updated, err)
+				}
+				// 被拒绝的旧样本不能占用去重水位；同时间的新纪元样本仍能入库。
+				freshChannel, err := store.GetConfig(ctx, channel.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				fresh, err := manager.updatePassiveUsage(ctx, freshChannel, codexPassiveUsageUpdate{
+					AccountID: credential.AccountID, SourceEpoch: &resetAt, SampledAt: sampledAt.Format(time.RFC3339Nano),
+					Windows: []codexauth.PassiveUsageWindow{{Scope: "codex", LimitName: "codex", Kind: "primary", UsedPercent: 5,
+						LimitWindowSeconds: 604800, ResetAt: base.Add(24 * time.Hour).Unix(), SampledAt: sampledAt.Format(time.RFC3339Nano)}},
+				})
+				if err != nil || !fresh {
+					t.Fatalf("fresh passive response updated=%v err=%v", fresh, err)
+				}
+			} else {
+				server := &Server{store: raceStore}
+				_, err := server.persistOAuthUsage(ctx, channel, &oauthUsageSummary{
+					Provider: "codex", UpstreamPlanType: "free", codexAccountID: credential.AccountID,
+					Windows: []oauthUsageWindow{{LimitName: "codex", Kind: "primary", UsedPercent: 5,
+						LimitWindowSeconds: 604800, ResetAt: base.Add(24 * time.Hour).Unix(), SampledAt: sampledAt}},
+				}, requestAt, sampledAt)
+				if err == nil {
+					t.Fatal("accepted stale active request after CAS retry")
+				}
+			}
+			cfg, err := store.GetConfig(ctx, channel.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.QuotaCostUsage.EpochTime().Equal(resetAt) || len(got.OAuthUsage) != 0 {
+				t.Fatalf("stale observation overwrote epoch or snapshot: %#v", got.QuotaCostUsage)
+			}
+			if !passive && cfg.OAuthCredential != winnerJSON {
+				t.Fatal("rejected active sample changed winner credential")
+			}
+		})
 	}
 }

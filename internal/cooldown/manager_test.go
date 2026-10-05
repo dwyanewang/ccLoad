@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -123,14 +124,17 @@ func TestHandleErrorCallerConfirmedModelScopedHTTP(t *testing.T) {
 	defer cleanup()
 	manager := NewManager(store, nil)
 	cfg := createTestChannel(t, store, "test-provider-model-scope")
-	action := manager.DecideAction(context.Background(), ErrorInput{
+	input := manager.PrepareError(ErrorInput{
 		ChannelID: cfg.ID, KeyIndex: NoKeyIndex, Model: "test-model",
 		StatusCode: 403, ErrorBody: []byte(`{"error":"model is not in plan"}`), ModelScoped: true,
 		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
 			Enabled: true, Name: "generic forbidden", Priority: 0, StatusCodes: []int{403},
 			Scope: model.CooldownScopeChannel, Mode: model.CooldownModeFixed, CooldownSeconds: 120,
 		}}},
+	}, func(local util.HTTPResponseClassification) util.HTTPResponseClassification {
+		return util.HTTPResponseClassification{Level: util.ErrorLevelChannel, ChannelCooldownReason: "jev_channel"}
 	})
+	action := manager.DecideAction(context.Background(), input)
 	if action != ActionRetryModel {
 		t.Fatalf("action = %v, want ActionRetryModel", action)
 	}
@@ -399,6 +403,43 @@ func TestHandleError_XAIFreeUsageExhaustedCoolsModelFor24Hours(t *testing.T) {
 	}
 	if channelCfg.IsCoolingDown(time.Now()) {
 		t.Fatal("xAI free usage exhaustion must not cool the whole channel while another model is available")
+	}
+}
+
+func TestHandleError_XAIAccountFreeUsageExhaustedCoolsCredential(t *testing.T) {
+	for _, status := range []int{429, 403, util.StatusSSEError} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			ctx := context.Background()
+			cfg, err := store.CreateConfig(ctx, &model.Config{
+				Name: "xai-shared-quota", Enabled: true,
+				URLs:         model.ChannelURLs{{URL: "https://cli-chat-proxy.grok.com/v1"}},
+				ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}, {Model: "grok-4.6"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now()
+			action := NewManager(store, nil).HandleError(ctx, ErrorInput{
+				ChannelID: cfg.ID, Model: "grok-4.5", ChannelModels: []string{"grok-4.5", "grok-4.6"},
+				KeyIndex: NoKeyIndex, StatusCode: status,
+				ErrorBody: []byte(`{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for this account."}}`),
+			})
+			if action != ActionRetryChannel {
+				t.Fatalf("action=%v, want ActionRetryChannel", action)
+			}
+			updated, err := store.GetConfig(ctx, cfg.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !updated.IsCoolingDown(before.Add(24*time.Hour-time.Minute)) || updated.IsCoolingDown(before.Add(24*time.Hour+time.Minute)) {
+				t.Fatal("shared quota exhaustion must cool the entire OAuth channel for 24h")
+			}
+			if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "grok-4.5"); exists {
+				t.Fatal("account exhaustion must not be recorded as a single-model cooldown")
+			}
+		})
 	}
 }
 
@@ -2393,5 +2434,57 @@ func TestHandleError_CloudflareChallengeCoolsChannelWithoutKeys(t *testing.T) {
 	}
 	if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "test-model"); exists {
 		t.Error("cloudflare challenge is IP/fingerprint scoped, it must not cool down the model")
+	}
+}
+
+// OAuth 渠道没有独立 Key：Key 级 403、账号终态 400 与 5h/7d 窗口被拒都必须冷却整个渠道。
+func TestHandleError_KeylessCredentialFailuresCoolChannel(t *testing.T) {
+	resetAt := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	cases := []struct {
+		name      string
+		status    int
+		body      string
+		headers   map[string][]string
+		wantUntil time.Time
+	}{
+		{name: "forbidden", status: http.StatusForbidden, body: `{"type":"error","error":{"type":"permission_error","message":"OAuth token does not meet scope requirement"}}`},
+		{name: "organization disabled", status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"invalid_request_error","message":"This organization has been disabled."}}`},
+		{name: "credit balance", status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}`},
+		{name: "identity verification", status: http.StatusBadRequest, body: `{"type":"error","error":{"type":"invalid_request_error","message":"Identity verification is required to continue using Claude."}}`},
+		{name: "unified 7d rejected", status: http.StatusTooManyRequests, body: `{"type":"error","error":{"type":"rate_limit_error"}}`,
+			headers: map[string][]string{
+				"Anthropic-Ratelimit-Unified-7d-Status": {"rejected"},
+				"Anthropic-Ratelimit-Unified-7d-Reset":  {strconv.FormatInt(resetAt.Unix(), 10)},
+			}, wantUntil: resetAt},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, cleanup := setupTestStore(t)
+			defer cleanup()
+			manager := NewManager(store, nil)
+			ctx := context.Background()
+			cfg := createTestChannel(t, store, "test-keyless-"+tc.name)
+
+			action := manager.HandleError(ctx, ErrorInput{
+				ChannelID: cfg.ID, KeyIndex: NoKeyIndex, Model: "claude-opus-4-6",
+				StatusCode: tc.status, ErrorBody: []byte(tc.body), Headers: tc.headers,
+			})
+			if action != ActionRetryChannel {
+				t.Fatalf("action=%v, want ActionRetryChannel", action)
+			}
+			channelCfg, err := store.GetConfig(ctx, cfg.ID)
+			if err != nil {
+				t.Fatalf("GetConfig: %v", err)
+			}
+			if !channelCfg.IsCoolingDown(time.Now()) {
+				t.Fatal("credential failure must cool the keyless channel")
+			}
+			if !tc.wantUntil.IsZero() && channelCfg.CooldownUntil != tc.wantUntil.Unix() {
+				t.Fatalf("channel cooldown until=%d, want window reset %d", channelCfg.CooldownUntil, tc.wantUntil.Unix())
+			}
+			if _, exists := getModelCooldownUntil(ctx, store, cfg.ID, "claude-opus-4-6"); exists {
+				t.Error("credential failure must not be narrowed to a model cooldown")
+			}
+		})
 	}
 }

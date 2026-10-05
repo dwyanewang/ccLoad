@@ -18,6 +18,7 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -59,6 +60,83 @@ func writeResponseWithHeaders(w http.ResponseWriter, status int, hdr http.Header
 	}
 }
 
+// writeLocalProxyError 写网关自身产生的错误：Anthropic 客户端按官方错误体
+// 返回，便于 SDK 按 error.type 分支；其他协议保持既有 {"error": "..."} 形状。
+func writeLocalProxyError(c *gin.Context, status int, message string) {
+	if clientProtocol, _ := clientRequestMetadata(c); clientProtocol == protocol.Anthropic {
+		c.JSON(status, anthropicErrorBody(status, message))
+		return
+	}
+	c.JSON(status, gin.H{"error": message})
+}
+
+func anthropicErrorBody(status int, message string) gin.H {
+	return gin.H{"type": "error", "error": gin.H{"type": anthropicErrorType(status), "message": message}}
+}
+
+func anthropicErrorType(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusPaymentRequired:
+		return "billing_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		return "request_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return "timeout_error"
+	case http.StatusServiceUnavailable, 529:
+		return "overloaded_error"
+	}
+	if status >= 500 {
+		return "api_error"
+	}
+	return "invalid_request_error"
+}
+
+// writeAnthropicStreamErrorEvent 在已提交的 Anthropic SSE 流末尾追加 error 事件。
+func writeAnthropicStreamErrorEvent(w http.ResponseWriter, message string) {
+	encoded, err := json.Marshal(anthropicErrorBody(http.StatusInternalServerError, message))
+	if err != nil {
+		return
+	}
+	if _, err := fmt.Fprintf(w, "event: error\ndata: %s\n\n", encoded); err != nil {
+		return
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// anthropicLocalFailureBody 把没有上游响应头的本地失败（网络错误、凭证不可用等）
+// 改写为 Anthropic 错误体；已是 Anthropic 错误体的保持原样。
+func anthropicLocalFailureBody(status int, body []byte) []byte {
+	if gjson.GetBytes(body, "type").String() == "error" {
+		return body
+	}
+	message := strings.TrimSpace(string(body))
+	if looksLikeJSON(body) {
+		if msg := gjson.GetBytes(body, "error.message").String(); msg != "" {
+			message = msg
+		} else if msg := gjson.GetBytes(body, "error").String(); msg != "" {
+			message = msg
+		}
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	encoded, err := json.Marshal(anthropicErrorBody(status, message))
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
 // looksLikeJSON 仅扫描首部空白后的第一个非空字符判定 JSON 形状，
 // 避免 bytes.TrimSpace 对长 body 的全量扫描+切片分配。
 func looksLikeJSON(body []byte) bool {
@@ -79,14 +157,25 @@ func looksLikeJSON(body []byte) bool {
 // 类型定义
 // ============================================================================
 
+// upstreamWireAliases 是同一请求重试间必须沿用的 wire 工具名映射：重试回放的是已改写
+// 的 provider body，映射只能从首轮带过来。
+type upstreamWireAliases struct {
+	openCode       *openCodeResponsesPlan
+	xaiTools       *xaiResponsesToolsPlan
+	anthropicTools anthropicMCPToolAliases
+}
+
 // fwResult 转发结果
 type fwResult struct {
+	jevNote             string
+	errorReceivedAt     time.Time
 	Status              int
 	UpstreamStatus      int // 原始上游 HTTP 状态码；Status 可被改写为 596-599 等内部分类码
 	Header              http.Header
-	Body                []byte  // filled for non-2xx or when needed
-	upstreamRequestBody []byte  // 实际发送的 provider wire body，仅用于同请求内安全降级重试
-	FirstByteTime       float64 // 首字节响应时间（秒）
+	Body                []byte              // filled for non-2xx or when needed
+	upstreamRequestBody []byte              // 实际发送的 provider wire body，仅用于同请求内安全降级重试
+	wireAliases         upstreamWireAliases // 同请求重试保留 wire 工具身份映射
+	FirstByteTime       float64             // 首字节响应时间（秒）
 
 	// Token统计（2025-11新增，从SSE响应中提取）
 	InputTokens              int
@@ -118,6 +207,7 @@ type fwResult struct {
 	// false 表示本次尝试仍可在同一请求内切换到其他Key/渠道
 	ResponseCommitted bool
 	// UpstreamWebsocket 只表示本次实际上游请求采用了WebSocket，不表示下游协议或渠道配置。
+	CodexHasCredits   bool
 	UpstreamWebsocket bool
 	// UpstreamWebsocketTransportFailure 表示原生上游 WebSocket 以 close 1006
 	// 或心跳传输错误结束。该故障按物理连接连续计数，不得升级为模型冷却。
@@ -149,6 +239,7 @@ type ForwardObserver struct {
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
+	jevWait                 time.Duration
 	abortChannel            context.CancelCauseFunc // 覆盖当前渠道所有 Key/URL 和重试等待
 	antigravityCreditsTried map[string]bool
 	antigravityRateRetried  map[string]bool
@@ -165,24 +256,35 @@ type proxyRequestContext struct {
 	translatedBody          []byte
 	header                  http.Header
 	isStreaming             bool
-	tokenHash               string               // Token哈希值（用于统计）
-	tokenID                 int64                // Token ID（用于日志记录，0表示未使用token）
-	clientIP                string               // 客户端IP地址（用于日志记录）
-	activeReqID             int64                // 活跃请求ID（用于更新渠道信息）
-	observer                *ForwardObserver     // 转发观测回调（可选）
-	startTime               time.Time            // 请求开始时间（用于统计）
-	channelStartTime        time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
-	attemptStartTime        time.Time            // 渠道内单次 Key/URL 尝试开始时间
-	attemptActualModel      string               // 上次尝试实际发往上游的模型（含后缀剥离/重定向后的结果）
-	attemptSelectedKey      string               // 上次尝试选中的 Key 或 OAuth access token
-	baseURL                 string               // 当前尝试使用的上游URL（多URL场景）
-	attemptCostMultiplier   float64              // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
-	debugData               *model.DebugLogEntry // Debug日志数据（debug开启时填充）
-	skipProxyLog            bool                 // 管理测试等外层会统一持久化日志的调用路径
+	tokenHash               string                 // Token哈希值（用于统计）
+	tokenID                 int64                  // Token ID（用于日志记录，0表示未使用token）
+	clientIP                string                 // 客户端IP地址（用于日志记录）
+	activeReqID             int64                  // 活跃请求ID（用于更新渠道信息）
+	observer                *ForwardObserver       // 转发观测回调（可选）
+	startTime               time.Time              // 请求开始时间（用于统计）
+	channelStartTime        time.Time              // 当前渠道尝试开始时间（每次切换渠道时重置）
+	attemptStartTime        time.Time              // 渠道内单次 Key/URL 尝试开始时间
+	attemptActualModel      string                 // 上次尝试实际发往上游的模型（含后缀剥离/重定向后的结果）
+	attemptSelectedKey      string                 // 上次尝试选中的 Key 或 OAuth access token
+	baseURL                 string                 // 当前尝试使用的上游URL（多URL场景）
+	attemptCostMultiplier   float64                // 当前 attempt 的成本倍率（api_key 渠道取 Key 级，OAuth 取渠道级）
+	attemptModelPrice       *util.CustomModelPrice // 当前渠道此模型的价格（nil 按全局价格计费）
+	attemptModel            modelRoutingSelection  // 本次渠道尝试固定的配置行
+	debugData               *model.DebugLogEntry   // Debug日志数据（debug开启时填充）
+	skipProxyLog            bool                   // 管理测试等外层会统一持久化日志的调用路径
 	thinkingEffort          string
 	routingSession          *responsesExecutionSession // 当前 Responses execution session 的首选渠道
+	sessionAffinityKey      string                     // Anthropic/Codex 会话绑定键（令牌+会话 ID），空表示不绑定
+	sessionAffinity         sessionAffinityTarget      // 请求开始时的会话绑定，channelID=0 表示无
 	nativeCodexWS           *codexUpstreamWebsocketSession
 	nativeCodexBody         []byte
+}
+
+// countTokens reports the auxiliary count_tokens request: it is never billed,
+// logged to the request log, or allowed to cool down a channel, and any
+// upstream failure falls back to the local estimator.
+func (r *proxyRequestContext) countTokens() bool {
+	return r != nil && protocol.DetectRequestFamily(r.requestPath) == protocol.RequestFamilyCountTokens
 }
 
 func (r *proxyRequestContext) requestLogModel() string {
@@ -673,49 +775,88 @@ func buildCodexResponsesPath() string {
 	return "/v1/responses"
 }
 
-// resolveChannelRoutingModel returns the logical model configured on the channel,
-// before redirecting it to an upstream model. API Key scopes use this identity.
-func (s *Server) resolveChannelRoutingModel(cfg *model.Config, originalModel string) string {
-	routedModel := model.RoutingModelName(originalModel)
-	if !cfg.SupportsModel(routedModel) && s.modelFuzzyMatch {
-		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
-			return model.RoutingModelName(matched)
-		}
-	}
-	return routedModel
+type modelRoutingSelection struct {
+	logicalModel string
+	entry        model.ModelEntry
+	wildcard     bool
+	fuzzyMatched bool
 }
 
-// resolveActualModel preserves the historical redirect/fuzzy-match order used for upstream requests.
-func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) string {
-	routedModel := model.RoutingModelName(originalModel)
-	actualModel := routedModel
-	// 1. 精确匹配的重定向优先。
-	if redirectModel, ok := cfg.GetRedirectModel(routedModel); ok && redirectModel != "" {
-		actualModel = redirectModel
+// enumerateModelRows resolves one logical group without advancing its cursor.
+func (s *Server) enumerateModelRows(cfg *model.Config, requested string) []modelRoutingSelection {
+	if cfg == nil {
+		return nil
 	}
-
-	// 2. 仅在未触发精确重定向时做模糊匹配。
-	if actualModel == routedModel && s.modelFuzzyMatch && !cfg.SupportsModel(routedModel) {
-		if matched, ok := cfg.FuzzyMatchModel(routedModel); ok {
-			actualModel = matched
+	name := model.RoutingModelName(requested)
+	entries := cfg.EnabledModelEntries(name)
+	fuzzyMatched := false
+	if len(entries) == 0 && s.modelFuzzyMatch {
+		if matched, ok := cfg.FuzzyMatchModel(name); ok {
+			name = model.RoutingModelName(matched)
+			entries = cfg.EnabledModelEntries(name)
+			fuzzyMatched = true
 		}
 	}
+	result := make([]modelRoutingSelection, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, modelRoutingSelection{logicalModel: name, entry: entry, fuzzyMatched: fuzzyMatched})
+	}
+	return result
+}
 
-	// 3. 历史行为只对上一步得到的模型再解析一次重定向。
-	if actualModel != routedModel {
-		if redirectModel, ok := cfg.GetRedirectModel(actualModel); ok && redirectModel != "" {
-			actualModel = redirectModel
+// configuredModelRows includes disabled rows so cursor positions remain stable
+// while temporary availability changes.
+func (s *Server) configuredModelRows(cfg *model.Config, requested string) []modelRoutingSelection {
+	enabled := s.enumerateModelRows(cfg, requested)
+	if len(enabled) == 0 {
+		return enabled
+	}
+	name := enabled[0].entry.Model
+	rows := make([]modelRoutingSelection, 0, len(enabled))
+	for _, entry := range cfg.ModelEntries {
+		if entry.Model == name {
+			rows = append(rows, modelRoutingSelection{logicalModel: enabled[0].logicalModel, entry: entry, fuzzyMatched: enabled[0].fuzzyMatched})
 		}
 	}
-	// 渠道条目或重定向目标可能字面带思考后缀，但后缀绝不能出现在发往上游的模型名里。
-	return model.RoutingModelName(actualModel)
+	return rows
+}
+
+func (s *Server) firstModelRow(cfg *model.Config, requested string) (modelRoutingSelection, bool) {
+	entries := s.enumerateModelRows(cfg, requested)
+	if len(entries) == 0 {
+		name := model.RoutingModelName(requested)
+		return modelRoutingSelection{logicalModel: name, entry: model.ModelEntry{Model: name}}, false
+	}
+	return entries[0], true
+}
+
+// resolveChannelRoutingModel returns the model identity used by Key scopes.
+func (s *Server) resolveChannelRoutingModel(cfg *model.Config, originalModel string) string {
+	if selected, ok := s.firstModelRow(cfg, originalModel); ok {
+		return selected.logicalModel
+	}
+	return model.RoutingModelName(originalModel)
+}
+
+func resolveActualModel(cfg *model.Config, selected modelRoutingSelection) string {
+	target := selected.entry.RedirectModel
+	if target == "" || selected.wildcard {
+		target = selected.logicalModel
+	} else if !selected.fuzzyMatched {
+		// Preserve the historical second lookup after an exact redirect.
+		// A fuzzy match already consumed that lookup by selecting its configured row.
+		if next, ok := cfg.GetRedirectModel(target); ok {
+			target = next
+		}
+	}
+	return model.RoutingModelName(target)
 }
 
 // resolveFinalUpstreamModel 返回真正发送给上游的模型身份。
 // 协议转换使用 resolved model 构造上游 body，随后 custom_request_rules 可能再次覆盖 body.model。
 // Gemini 的模型位于 URL 路径，body 规则不改变其路由模型。
-func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, originalModel string, upstreamProtocol string) string {
-	actualModel := s.resolveActualModel(cfg, originalModel)
+func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, selected modelRoutingSelection, upstreamProtocol string) string {
+	actualModel := resolveActualModel(cfg, selected)
 	if protocol.Protocol(util.NormalizeProtocol(upstreamProtocol)) != protocol.Gemini {
 		actualModel = resolveModelAfterBodyRules(actualModel, cfg.BodyRules())
 	}
@@ -729,7 +870,11 @@ func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, originalModel stri
 }
 
 func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext, upstreamProtocol protocol.Protocol) (actualModel string, bodyToSend []byte) {
-	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(upstreamProtocol))
+	selected := reqCtx.attemptModel
+	if selected.logicalModel == "" && reqCtx.originalModel != "" {
+		selected, _ = s.firstModelRow(cfg, reqCtx.originalModel)
+	}
+	actualModel = s.resolveFinalUpstreamModel(cfg, selected, string(upstreamProtocol))
 
 	bodyToSend = reqCtx.body
 	requestedModel := reqCtx.requestedModel
@@ -976,9 +1121,10 @@ type logEntryParams struct {
 	BaseURL          string // 请求使用的上游URL
 	Result           *fwResult
 	ErrMsg           string
-	StartTime        time.Time            // 渠道尝试开始时间（用于日志记录）
-	DebugData        *model.DebugLogEntry // Debug日志数据
-	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
+	StartTime        time.Time              // 渠道尝试开始时间（用于日志记录）
+	DebugData        *model.DebugLogEntry   // Debug日志数据
+	CostMultiplier   float64                // 渠道成本倍率快照（0=免费，<0 视为 1）
+	ModelPrice       *util.CustomModelPrice // 渠道模型价格（nil 按全局价格计费）
 	ThinkingEffort   string
 }
 
@@ -1012,6 +1158,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		Duration:          p.Duration,
 		IsStreaming:       p.IsStreaming,
 		UpstreamWebsocket: p.Result != nil && p.Result.UpstreamWebsocket,
+		CodexHasCredits:   p.Result != nil && p.Result.CodexHasCredits,
 		APIKeyUsed:        p.APIKeyUsed,
 		AuthTokenID:       p.AuthTokenID,
 		ClientProtocol:    string(p.ClientProtocol),
@@ -1048,13 +1195,8 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 				msg = fmt.Sprintf("%s: %s", msg, body)
 			}
 		}
-		if p.Result != nil && p.IsStreaming {
-			if p.Result.FirstByteTime > 0 {
-				entry.FirstByteTime = p.Result.FirstByteTime
-			}
-			if p.Result.BytesReceived > 0 {
-				msg = fmt.Sprintf("%s (received %s)", msg, formatBytes(p.Result.BytesReceived))
-			}
+		if p.Result != nil && p.IsStreaming && p.Result.BytesReceived > 0 {
+			msg = fmt.Sprintf("%s (received %s)", msg, formatBytes(p.Result.BytesReceived))
 		}
 		entry.Message = truncateErr(msg)
 	} else if p.Result != nil {
@@ -1077,7 +1219,12 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			}
 			entry.Message = truncateErr(msg)
 		}
+	} else {
+		entry.Message = "unknown"
+	}
 
+	// 用量与消息分支无关：流式中途失败（499/599）也带着已解析的 usage。
+	if res := p.Result; res != nil {
 		// 流式请求记录首字节响应时间
 		if p.IsStreaming && res.FirstByteTime > 0 {
 			entry.FirstByteTime = res.FirstByteTime
@@ -1093,15 +1240,13 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		entry.Cache1hInputTokens = res.Cache1hInputTokens
 		entry.ServiceTier = res.ServiceTier
 
-		if p.StatusCode >= http.StatusOK && p.StatusCode < http.StatusMultipleChoices {
+		if billableResult(p.StatusCode, res) {
 			// 使用实际转发的模型计算成本（重定向时价格可能不同）；
 			// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
 			// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
 			// alpha/search 固定按 search_call 计费。
-			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res)
+			entry.Cost = computeRequestCostWithPrice(billingModel, res.ServiceTier, p.ModelPrice, res)
 		}
-	} else {
-		entry.Message = "unknown"
 	}
 	if p.Result != nil {
 		entry.Message = appendRetryStrategyToMessage(entry.Message, p.Result.RetryStrategy)
@@ -1128,11 +1273,17 @@ func appendRetryStrategyToMessage(message, strategy string) string {
 	return truncateErr(fmt.Sprintf("%s [%s]", message, strategy))
 }
 
-// computeRequestCost 是请求总成本的唯一口径：标准 token 成本加 Responses 工具成本。
+// computeRequestCost 是请求总成本的唯一口径：标准 token 成本加服务端工具成本（Responses 图像、Anthropic web_search）。
 // fast 模式专用模型走 CalculateFastModeCost（已含 fast 倍率）。
 // OpenAI service_tier 是价格倍率，不改变按 token 数选择的长上下文分档；
 // 非 OpenAI 白名单模型即使响应携带 service_tier 也不加倍率。
 func computeRequestCost(model string, serviceTier string, res *fwResult) float64 {
+	return computeRequestCostWithPrice(model, serviceTier, nil, res)
+}
+
+// computeRequestCostWithPrice 在 price 非空时用渠道模型价格替代标准 token 价格；
+// 工具费率只来自系统目录，不受渠道价格影响。
+func computeRequestCostWithPrice(model string, serviceTier string, price *util.CustomModelPrice, res *fwResult) float64 {
 	if res == nil {
 		return 0
 	}
@@ -1141,9 +1292,10 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 			return cost
 		}
 	}
-	return util.CalculateStandardCostBreakdown(
+	return util.CalculateStandardCostBreakdownWithPrice(
 		model,
 		serviceTier,
+		price,
 		res.InputTokens,
 		res.OutputTokens,
 		res.CacheReadInputTokens,
@@ -1160,10 +1312,15 @@ func requestedServiceTier(reqCtx *proxyRequestContext) string {
 	if len(body) == 0 {
 		body = reqCtx.body
 	}
+	return requestBodyServiceTier(reqCtx.upstreamProtocol, body)
+}
+
+// requestBodyServiceTier 读取上游请求体声明的计费档位：Anthropic 用 speed，其余协议用 service_tier。
+func requestBodyServiceTier(upstreamProtocol protocol.Protocol, body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	if reqCtx.upstreamProtocol == protocol.Anthropic {
+	if upstreamProtocol == protocol.Anthropic {
 		return normalizeBillingServiceTier(gjson.GetBytes(body, "speed").String())
 	}
 	return normalizeBillingServiceTier(gjson.GetBytes(body, "service_tier").String())

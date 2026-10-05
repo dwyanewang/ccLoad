@@ -19,17 +19,18 @@ type Store interface {
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
 	CompareAndSwapOAuthCredential(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
-	// CompareAndSwapOAuthUsage also reconciles changed cost windows with durable
-	// logs in the same transaction and returns the actually persisted counters.
-	CompareAndSwapOAuthUsage(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, *oauthcost.Usage, error)
+	// CompareAndSwapOAuthUsage persists a validated quota sample; costs come from OAuthQuotaCostViews.
+	CompareAndSwapOAuthUsage(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
+	OAuthQuotaCostViews(ctx context.Context, usages map[int64]*oauthcost.Usage, at time.Time) (map[int64]*oauthcost.CostView, error)
 	CompareAndSwapChannelManagement(ctx context.Context, channelID int64, expectedEnvelope, nextEnvelope string) (bool, error)
 	ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error
 	DisableOAuthChannelIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string) (bool, error)
 	DisableConfigIfOAuthSnapshotMatches(ctx context.Context, expected *model.Config) (bool, error)
 	DeleteConfigIfOAuthSnapshotMatches(ctx context.Context, expected *model.Config) (bool, error)
-	UpdateOAuthModelStateIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string, modelEntries []model.ModelEntry, scheduledCheckModel string) (bool, error)
+	UpdateModelStateIfSnapshotMatches(ctx context.Context, expected *model.Config, modelEntries []model.ModelEntry, scheduledCheckModel string, maxConcurrency *int) (bool, error)
 	UpdateChannelEnabled(ctx context.Context, id int64, enabled bool) (*model.Config, error)
 	BatchPatchConfigs(ctx context.Context, channelIDs []int64, patch model.BatchConfigPatch) (model.BatchConfigPatchResult, error)
+	BatchDeleteModels(ctx context.Context, operations []model.BatchModelDeleteOperation) (model.BatchModelDeleteResult, error)
 	DeleteConfig(ctx context.Context, id int64) error
 	GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error)
 	BatchUpdatePriority(ctx context.Context, updates []struct {
@@ -89,6 +90,7 @@ type Store interface {
 	CountLogsRange(ctx context.Context, since, until time.Time, filter *model.LogFilter) (int, error)
 	GetTodayChannelURLStats(ctx context.Context, dayStart time.Time) ([]model.ChannelURLLogStat, error)
 	CleanupLogsBefore(ctx context.Context, cutoff time.Time) error
+	CleanupOAuthQuotaLedgerBefore(ctx context.Context, cutoff time.Time) error
 
 	// === Debug Log Management ===
 	AddDebugLog(ctx context.Context, e *model.DebugLogEntry) error
@@ -120,7 +122,7 @@ type Store interface {
 	UpdateAuthToken(ctx context.Context, token *model.AuthToken) error
 	DeleteAuthToken(ctx context.Context, id int64) error
 	UpdateTokenLastUsed(ctx context.Context, tokenHash string, now time.Time) error
-	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error
+	UpdateTokenStats(ctx context.Context, tokenHash string, outcome model.TokenStatsOutcome, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error
 	GetAuthTokenStatsInRange(ctx context.Context, startTime, endTime time.Time) (map[int64]*model.AuthTokenRangeStats, error)
 	FillAuthTokenRPMStats(ctx context.Context, stats map[int64]*model.AuthTokenRangeStats, startTime, endTime time.Time, isToday bool) error
 

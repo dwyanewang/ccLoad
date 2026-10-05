@@ -39,11 +39,20 @@ var beijingTomorrowResetRegex = regexp.MustCompile(`明天\s*(?:凌晨|早上|�
 // retryInDurationRegex 匹配 Gemini RESOURCE_EXHAUSTED 中的 “Please retry in 59.409754061s”。
 var retryInDurationRegex = regexp.MustCompile(`(?i)\bretry\s+in\s+([0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h)(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h))*)`)
 
+// tryAgainInHMRegex 匹配 “Try again in 2h 18m” / “1.5h” / “2 hours 5 minutes”。
+// 末尾词边界避免把 5ms 读成 5m。
+const tryAgainInPart = `\d+(?:\.\d+)?\s*(?:hours?|minutes?|seconds?|h|m|s)`
+
+var tryAgainInHMRegex = regexp.MustCompile(`(?i)\bagain\s+in\s+(` + tryAgainInPart + `(?:\s*(?:and\s+)?` + tryAgainInPart + `)*)\b`)
+var tryAgainInPartRegex = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(hours?|minutes?|seconds?|h|m|s)`)
+
 // retryAfterSecondsRegex 匹配 Codex rolling spend limit 文案中的 “Please retry after 2196 seconds”。
 var retryAfterSecondsRegex = regexp.MustCompile(`(?i)\bretry\s+after\s+([0-9]+)\s*seconds?\b`)
 
 // rollingFreeAllowanceResetRegex 匹配 Token Harbor 免费额度的下一个滚动周期起点。
 var rollingFreeAllowanceResetRegex = regexp.MustCompile(`(?i)\bnext\s+rolling\s+7-day\s+period\s+starts\s+at\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\b`)
+
+var xaiFreeUsageModelRegex = regexp.MustCompile(`(?i)\bfor\s+model\s+["\x60']?([a-z0-9][a-z0-9._/-]*)`)
 
 // globalFixedWindowRetryClockRegex 匹配“请在 今天 12:00 后再试”这类全站固定窗口限额文案。
 var globalFixedWindowRetryClockRegex = regexp.MustCompile(`(今天|明天)\s*(\d{1,2})\s*[:：]\s*(\d{1,2})`)
@@ -117,16 +126,21 @@ type StatusCodeMeta struct {
 
 // HTTPResponseClassification 包含 HTTP 响应分类的结果。
 type HTTPResponseClassification struct {
-	Level                   ErrorLevel
-	Model                   string
-	ModelScoped             bool
-	PreventKeyFallback      bool
-	ModelCooldownUntil      time.Time
-	HasModelCooldownUntil   bool
-	ModelCooldownReason     string
-	KeyCooldownUntil        time.Time
-	HasKeyCooldownUntil     bool
-	KeyCooldownReason       string
+	ExplicitMatch         bool
+	DefaultFallback       bool
+	Level                 ErrorLevel
+	Model                 string
+	ModelScoped           bool
+	PreventKeyFallback    bool
+	ModelCooldownUntil    time.Time
+	HasModelCooldownUntil bool
+	ModelCooldownReason   string
+	KeyCooldownUntil      time.Time
+	HasKeyCooldownUntil   bool
+	KeyCooldownReason     string
+	// CredentialScoped 表示故障属于整个上游凭证（如 Anthropic 5h/7d 窗口被拒）：
+	// 有独立 Key 时冷却该 Key，OAuth 渠道（无独立 Key）冷却整个渠道，而不是收窄到模型。
+	CredentialScoped        bool
 	ChannelCooldownUntil    time.Time
 	HasChannelCooldownUntil bool
 	ChannelCooldownReason   string
@@ -365,7 +379,8 @@ func ClassifyHTTPStatus(statusCode int) ErrorLevel {
 //
 // 分类策略：
 //   - 401/403 做语义分析：默认 Key 级，只在明确账户级不可逆错误时升级为 Channel 级
-//   - 400/413 固定按模型级处理，避免一个模型的请求约束误伤整个渠道；
+//   - 400/413 默认按模型级处理，避免一个模型的请求约束误伤整个渠道；Anthropic 账号终态
+//     （组织禁用/余额耗尽/需身份验证）的 400 例外，按 Key 级处理；
 //     413 不能当客户端直返：同一份 Claude Code 历史在 Anthropic 能过、在别的网关会 RequestTooLarge，
 //     直返会打断已经开始的渠道 failover
 //   - 429 做限流范围分析：默认 Key 级，只有明确长时间/全局限流特征才升级为 Channel 级
@@ -375,7 +390,8 @@ func ClassifyHTTPResponseWithMeta(statusCode int, headers map[string][]string, r
 	return classifyHTTPResponseWithMetaAt(statusCode, headers, responseBody, time.Now())
 }
 
-func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string, responseBody []byte, now time.Time) HTTPResponseClassification {
+func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string, responseBody []byte, now time.Time) (result HTTPResponseClassification) {
+	defer func() { result.ExplicitMatch = !result.DefaultFallback }()
 	// 上游 HTTP 499 与本地 context.Canceled 不同：切换渠道，但只冷却当前实际模型。
 	if statusCode == StatusClientClosedRequest {
 		return HTTPResponseClassification{
@@ -412,7 +428,27 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 				Level: level,
 				Model: strings.TrimSpace(quotaErr.model),
 			}
-			if reason == "model_cooldown" || reason == codexUsageFrequencyLimitReason {
+			if reason == "XAI_FREE_USAGE_EXHAUSTED" {
+				if classification.Model == "" {
+					if match := xaiFreeUsageModelRegex.FindStringSubmatch(quotaErr.message); len(match) == 2 {
+						classification.Model = strings.TrimRight(match[1], ".")
+					}
+				}
+				if classification.Model != "" {
+					classification.ModelScoped = true
+					classification.ModelCooldownUntil = cooldownUntil
+					classification.HasModelCooldownUntil = true
+					classification.ModelCooldownReason = reason
+				} else {
+					classification.Level = ErrorLevelKey
+					classification.CredentialScoped = true
+					classification.KeyCooldownUntil = cooldownUntil
+					classification.HasKeyCooldownUntil = true
+					classification.KeyCooldownReason = reason
+				}
+				return classification
+			}
+			if reason == "model_cooldown" || reason == codexUsageFrequencyLimitReason || reason == "INFERENCE_CAP_ERROR" {
 				classification.ModelScoped = true
 				classification.ModelCooldownReason = reason
 				if cooldownUntil.After(now) {
@@ -452,11 +488,14 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 	// [INFO] 597 SSE error事件：解析实际错误类型动态判断级别
 	// SSE error JSON格式: {"type":"error","error":{"type":"api_error","message":"上游API返回错误: 500"}}
 	// 服务类错误切换渠道但只冷却当前模型；认证/限流类错误仍冷却 Key。
+	// 模型不可用（如 Codex WS 错误事件 "model is not supported"）与 HTTP 400 同口径：只冷却当前模型。
 	if statusCode == StatusSSEError {
-		level := classifySSEError(responseBody)
+		level, matched := classifySSEError(responseBody)
 		return HTTPResponseClassification{
-			Level:       level,
-			ModelScoped: level == ErrorLevelChannel,
+			Level:           level,
+			DefaultFallback: !matched,
+			ModelScoped: level == ErrorLevelChannel ||
+				(level == ErrorLevelKey && isModelUnavailableResponse(responseBody)),
 		}
 	}
 
@@ -467,7 +506,28 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		}
 	}
 
-	// 429 无论限流范围如何，都只冷却当前实际模型。
+	// Anthropic 429 先区分三类：共享 5h/7d 窗口被拒属于整个凭证；fast 模式缺少
+	// usage credits 属于这次请求（换号也一样，且账号对普通请求仍健康）；其余只冷却模型。
+	if statusCode == 429 {
+		if anthropicUnifiedWindowRejected(headers) {
+			classification := HTTPResponseClassification{
+				Level:              ErrorLevelKey,
+				CredentialScoped:   true,
+				PreventKeyFallback: true,
+				KeyCooldownReason:  "anthropic_unified_window_rejected",
+			}
+			if until, ok := anthropicRejectedWindowReset(headers, now); ok {
+				classification.KeyCooldownUntil = until
+				classification.HasKeyCooldownUntil = true
+			}
+			return classification
+		}
+		if anthropicFastModeCreditsRequired(responseBody) {
+			return HTTPResponseClassification{Level: ErrorLevelClient}
+		}
+	}
+
+	// 其余 429 无论限流范围如何，都只冷却当前实际模型。
 	if statusCode == 429 {
 		level := ErrorLevelKey
 		if headers != nil {
@@ -494,6 +554,11 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		}
 	}
 
+	// 账号终态的 400 属于整个凭证：Key 级退避；OAuth 渠道的凭证即渠道，由冷却层落到渠道。
+	if statusCode == http.StatusBadRequest && anthropicAccountUnusable(responseBody) {
+		return HTTPResponseClassification{Level: ErrorLevelKey}
+	}
+
 	// 400/413 表示当前模型/上游无法接受该请求。切换渠道，但只冷却实际请求的模型。
 	// 413 必须与 400 同级：否则 auto 协议探测把 Anthropic 400 交给下一个候选后，
 	// 候选网关的 RequestTooLarge 会 ActionReturnClient，客户端直接中断、后面的匹配渠道进不去。
@@ -516,8 +581,9 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 	// 404错误：根据响应体智能分类
 	if statusCode == 404 {
 		return HTTPResponseClassification{
-			Level:       classify404Error(responseBody),
-			ModelScoped: isModelUnavailableResponse(responseBody),
+			Level:           classify404Error(responseBody),
+			DefaultFallback: !isModelUnavailableResponse(responseBody),
+			ModelScoped:     isModelUnavailableResponse(responseBody),
 		}
 	}
 
@@ -538,12 +604,13 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 
 	// 仅分析401和403错误,其他状态码使用标准分类器
 	if statusCode != 401 && statusCode != 403 {
-		return HTTPResponseClassification{Level: ClassifyHTTPStatus(statusCode)}
+		_, knownStatus := statusCodeMetaMap[statusCode]
+		return HTTPResponseClassification{Level: ClassifyHTTPStatus(statusCode), DefaultFallback: !knownStatus}
 	}
 
 	// 401/403错误:分析响应体内容
 	if len(responseBody) == 0 {
-		return HTTPResponseClassification{Level: ErrorLevelKey} // 无响应体,默认Key级错误
+		return HTTPResponseClassification{Level: ErrorLevelKey, DefaultFallback: true} // 无响应体,默认Key级错误
 	}
 
 	bodyLower := strings.ToLower(string(responseBody))
@@ -569,10 +636,16 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 		}
 	}
 
+	// 明确凭据拒绝优先于远程分类。
+	for _, pattern := range []string{"invalid_api_key", "authentication_error", "invalid api key", "invalid token", "permission_denied", "insufficient_quota"} {
+		if strings.Contains(bodyLower, pattern) {
+			return HTTPResponseClassification{Level: ErrorLevelKey}
+		}
+	}
 	// 默认:Key级错误
 	// 包括:认证失败、权限不足、额度用尽、余额不足等
 	// 让handleProxyError根据渠道Key数量决定是否升级为渠道级
-	return HTTPResponseClassification{Level: ErrorLevelKey}
+	return HTTPResponseClassification{Level: ErrorLevelKey, DefaultFallback: true}
 }
 
 // classifyRateLimitError 分析 429 的限流范围。
@@ -653,6 +726,101 @@ func parseAnthropicRateLimitReset(headers map[string][]string, now time.Time) (t
 	return time.Time{}, false
 }
 
+// anthropicUnifiedWindowRejected 判断 Anthropic 是否明确拒绝了共享 5h/7d 订阅窗口。
+// 仅 overage/7d_oi 被拒而共享窗口仍可用时属于模型级，不能冷却整个凭证。
+func anthropicUnifiedWindowRejected(headers map[string][]string) bool {
+	status := func(name string) string {
+		return strings.ToLower(firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-"+name+"Status"))
+	}
+	status5h, status7d := status("5h-"), status("7d-")
+	if status5h == "rejected" || status7d == "rejected" {
+		return true
+	}
+	if status("") != "rejected" {
+		return false
+	}
+	return !anthropicOverageOnlyRejection(headers, status5h, status7d, status("7d_oi-"))
+}
+
+func anthropicOverageOnlyRejection(headers map[string][]string, status5h, status7d, status7dOI string) bool {
+	claim := strings.ToLower(firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-Representative-Claim"))
+	overageRejected := status7dOI == "rejected" ||
+		strings.EqualFold(firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-Overage-Status"), "rejected") ||
+		firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-Overage-Disabled-Reason") != "" ||
+		strings.Contains(claim, "overage")
+	if !overageRejected {
+		return false
+	}
+	allowed := func(status string) bool { return status == "allowed" || status == "allowed_warning" }
+	healthy := func(window string) bool {
+		u, err := strconv.ParseFloat(firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-"+window+"-Utilization"), 64)
+		return err == nil && u >= 0 && u < 1
+	}
+	switch {
+	case allowed(status5h) && allowed(status7d):
+		return true
+	case allowed(status7d) && status5h == "":
+		return healthy("5h")
+	case allowed(status5h) && status7d == "":
+		return healthy("7d")
+	}
+	return false
+}
+
+// anthropicRejectedWindowReset 取被拒窗口与统一 reset 中最晚的未来时间。
+func anthropicRejectedWindowReset(headers map[string][]string, now time.Time) (time.Time, bool) {
+	var latest time.Time
+	consider := func(name string) {
+		for _, value := range headerValuesFold(headers, name) {
+			resetUnix, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil {
+				continue
+			}
+			if until := time.Unix(resetUnix, 0); until.After(now) && until.After(latest) {
+				latest = until
+			}
+		}
+	}
+	for _, window := range []string{"5h", "7d"} {
+		if strings.EqualFold(firstHeaderValueFold(headers, "Anthropic-Ratelimit-Unified-"+window+"-Status"), "rejected") {
+			consider("Anthropic-Ratelimit-Unified-" + window + "-Reset")
+		}
+	}
+	consider(anthropicRateLimitUnifiedResetHeader)
+	return latest, !latest.IsZero()
+}
+
+// upstreamErrorMessageLower 取 error.message（缺失时退回整个响应体）并转小写，供关键字匹配。
+func upstreamErrorMessageLower(body []byte) string {
+	var payload sseErrorResponse
+	message := ""
+	if json.Unmarshal(body, &payload) == nil {
+		message = payload.Error.Message
+	}
+	if message == "" {
+		message = string(body)
+	}
+	return strings.ToLower(message)
+}
+
+// anthropicFastModeCreditsRequired 识别 fast 模式缺少 usage credits 的拒绝。
+// 真正的限流从不提 fast，因此不会误伤普通 429。
+func anthropicFastModeCreditsRequired(body []byte) bool {
+	message := upstreamErrorMessageLower(body)
+	return strings.Contains(message, "fast request rejected") ||
+		(strings.Contains(message, "fast") &&
+			(strings.Contains(message, "usage credits") || strings.Contains(message, "credits are required")))
+}
+
+// anthropicAccountUnusable 识别 Anthropic 用 400 报告的账号终态：组织被禁用、
+// API 余额耗尽、需完成身份验证。它们与请求和模型无关，换模型重试只会原样失败。
+func anthropicAccountUnusable(body []byte) bool {
+	message := upstreamErrorMessageLower(body)
+	return strings.Contains(message, "organization has been disabled") ||
+		strings.Contains(message, "credit balance") ||
+		strings.Contains(message, "identity verification is required")
+}
+
 // classifySSEError 分析SSE error事件的具体类型
 // SSE error JSON格式: {"type":"error","error":{"type":"api_error","message":"上游API返回错误: 500"}}
 //
@@ -663,9 +831,9 @@ func parseAnthropicRateLimitReset(headers map[string][]string, now time.Time) (t
 //   - authentication_error: 认证错误 → Key级
 //   - invalid_request_error: 请求错误 → Key级
 //   - 其他/解析失败: 默认Key级（保守策略）
-func classifySSEError(responseBody []byte) ErrorLevel {
+func classifySSEError(responseBody []byte) (ErrorLevel, bool) {
 	if len(responseBody) == 0 {
-		return ErrorLevelKey
+		return ErrorLevelKey, false
 	}
 
 	// 解析SSE error JSON
@@ -675,20 +843,20 @@ func classifySSEError(responseBody []byte) ErrorLevel {
 	var errResp sseErrorResponse
 
 	if err := json.Unmarshal(responseBody, &errResp); err != nil {
-		return ErrorLevelKey // 解析失败，保守处理
+		return ErrorLevelKey, false // 解析失败，保守处理
 	}
 
 	// 根据error.type/code判断错误级别
 	switch errResp.ErrorType() {
 	case "api_error", "overloaded_error", "service_unavailable_error", "server_is_overloaded", "1305":
 		// 上游服务错误或过载 → 渠道级冷却
-		return ErrorLevelChannel
+		return ErrorLevelChannel, true
 	case "rate_limit_error", "authentication_error", "invalid_request_error", "1308", "1310":
 		// 限流/认证/请求错误 → Key级冷却
-		return ErrorLevelKey
+		return ErrorLevelKey, true
 	default:
 		// 未知错误类型，保守处理为Key级
-		return ErrorLevelKey
+		return ErrorLevelKey, false
 	}
 }
 
@@ -769,8 +937,11 @@ func parseStructuredQuotaCooldown(quotaErr structuredQuotaError, now time.Time) 
 	case strings.Contains(code, "FREE-USAGE-EXHAUSTED") ||
 		strings.Contains(messageUpper, "FREE-USAGE-EXHAUSTED") ||
 		strings.Contains(messageUpper, "INCLUDED FREE USAGE"):
-		// xAI 不提供精确 reset 时间，只承诺滚动 24 小时窗口。账户级
-		// 429 在分类出口会收窄为当前模型，避免误伤同渠道其他模型。
+		if until, ok := parseStructuredCooldownUntil(quotaErr, now); ok {
+			return until, "XAI_FREE_USAGE_EXHAUSTED", ErrorLevelChannel, true
+		}
+		// 没有精确 reset 时沿用滚动 24 小时窗口；分类出口按上游是否
+		// 明确命名模型区分模型额度和整个凭证的共享额度。
 		return now.Add(xaiFreeUsageExhaustedCooldown), "XAI_FREE_USAGE_EXHAUSTED", ErrorLevelChannel, true
 	case code == "API_KEY_QUOTA_EXHAUSTED":
 		return now.Add(30 * time.Minute), "API_KEY_QUOTA_EXHAUSTED", ErrorLevelKey, true
@@ -797,6 +968,12 @@ func parseStructuredQuotaCooldown(quotaErr structuredQuotaError, now time.Time) 
 	case code == "RATE_LIMIT_ERROR":
 		if until, ok := parseRollingFreeAllowanceCooldownUntil(message, now); ok {
 			return until, "ROLLING_FREE_ALLOWANCE_RESET", ErrorLevelKey, true
+		}
+		return time.Time{}, "", ErrorLevelNone, false
+	case code == "INFERENCE_CAP_ERROR":
+		// 文案指向单个模型。解析不到时长时不要编一个 Key 冷却，留给后续模型级处理。
+		if until, ok := parseTryAgainInCooldownUntil(message, now); ok {
+			return until, "INFERENCE_CAP_ERROR", ErrorLevelKey, true
 		}
 		return time.Time{}, "", ErrorLevelNone, false
 	case code == "USAGE_LIMIT_REACHED":
@@ -1045,6 +1222,33 @@ func parseRollingFreeAllowanceCooldownUntil(message string, now time.Time) (time
 	return until, true
 }
 
+// parseTryAgainInCooldownUntil 解析 "Try again in 2h 18m"、"1.5h"、"2 hours 5 minutes" 等时长。
+func parseTryAgainInCooldownUntil(message string, now time.Time) (time.Time, bool) {
+	match := tryAgainInHMRegex.FindStringSubmatch(message)
+	if match == nil {
+		return time.Time{}, false
+	}
+	var total float64
+	for _, part := range tryAgainInPartRegex.FindAllStringSubmatch(match[1], -1) {
+		number, err := strconv.ParseFloat(part[1], 64)
+		if err != nil {
+			return time.Time{}, false
+		}
+		unit := time.Second
+		switch strings.ToLower(part[2])[0] {
+		case 'h':
+			unit = time.Hour
+		case 'm':
+			unit = time.Minute
+		}
+		total += number * float64(unit)
+	}
+	if total <= 0 || total > float64(366*24*time.Hour) {
+		return time.Time{}, false
+	}
+	return now.Add(time.Duration(total)), true
+}
+
 func parseGlobalFixedWindowQuotaCooldownUntil(message string, now time.Time) (time.Time, bool) {
 	matches := globalFixedWindowRetryClockRegex.FindStringSubmatch(message)
 	if matches == nil {
@@ -1165,13 +1369,12 @@ func isModelUnavailableResponse(responseBody []byte) bool {
 // from cooldown classification: a non-model 404 can be a broken base URL or
 // deployment and still means the native protocol probe did not succeed. Some
 // compatible gateways report an unsupported native request shape as a
-// structured 500 instead of an endpoint status. An uncommitted 400 or a
-// Cloudflare block page is also safe to replay through another protocol because
-// the request was rejected before model execution.
+// structured 500 instead of an endpoint status. A 400 needs explicit capability
+// evidence: rejection before execution alone does not establish incompatibility.
 func ShouldFallbackProtocol(statusCode int, responseBody []byte) bool {
 	switch statusCode {
 	case http.StatusBadRequest:
-		return true
+		return isUnsupportedProtocolRequest(responseBody)
 	case http.StatusForbidden:
 		return isCloudflareBlockPage(responseBody)
 	case 405:
@@ -1183,6 +1386,27 @@ func ShouldFallbackProtocol(statusCode int, responseBody []byte) bool {
 	default:
 		return false
 	}
+}
+
+func isUnsupportedProtocolRequest(responseBody []byte) bool {
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return false
+	}
+	if strings.EqualFold(payload.Error.Code, "RESPONSES_MODEL_NOT_SUPPORTED") || isProtocolConversionNotImplemented(responseBody) {
+		return true
+	}
+	message := strings.ToLower(payload.Error.Message)
+	// A malformed beta value is a data error; only an explicitly unsupported
+	// beta capability permits trying another protocol.
+	return strings.Contains(message, "anthropic-beta") &&
+		(strings.Contains(message, "unsupported") || strings.Contains(message, "not supported") ||
+			strings.Contains(message, "不支持"))
 }
 
 // firstHeaderValueFold 大小写无关地取首个 header 值。

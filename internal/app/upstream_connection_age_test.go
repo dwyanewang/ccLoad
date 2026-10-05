@@ -10,11 +10,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 )
@@ -63,15 +67,18 @@ func TestServerUsesStandardHTTP11OnlyForAntigravity(t *testing.T) {
 	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
 
-	base := buildHTTPTransport(true)
+	base := buildHTTPTransport(true, 1)
 	maxAge := 100 * time.Millisecond
 	server := &Server{
-		client:            newUpstreamHTTPClient(base, maxAge),
-		antigravityClient: newAntigravityHTTPClient(base, maxAge, antigravityPoolConfig{}),
+		client:                   newUpstreamHTTPClient(base, maxAge),
+		skipTLSVerify:            true,
+		upstreamConnectionMaxAge: maxAge,
 	}
 	t.Cleanup(func() {
 		closeUpstreamHTTPClient(server.client)
-		closeUpstreamHTTPClient(server.antigravityClient)
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
+		}
 	})
 
 	request := func(config *model.Config, path string) httptrace.GotConnInfo {
@@ -97,7 +104,8 @@ func TestServerUsesStandardHTTP11OnlyForAntigravity(t *testing.T) {
 		return <-gotConn
 	}
 
-	antigravity := &model.Config{AuthType: model.AuthTypeAntigravityOAuth}
+	antigravity := &model.Config{ID: 1, AuthType: model.AuthTypeAntigravityOAuth,
+		OAuthCredential: `{"type":"antigravity","access_token":"access","refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`}
 	first := request(antigravity, "/antigravity-first")
 	second := request(antigravity, "/antigravity-second")
 	if !second.Reused || first.Conn != second.Conn {
@@ -130,62 +138,15 @@ func TestServerUsesStandardHTTP11OnlyForAntigravity(t *testing.T) {
 	}
 }
 
-func TestAntigravityConnectionReuseSettings(t *testing.T) {
-	for _, disabled := range []bool{false, true} {
-		t.Run(fmt.Sprint(disabled), func(t *testing.T) {
-			addresses := make(chan string, 3)
-			closed := make(chan struct{}, 3)
-			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				addresses <- r.RemoteAddr
-				_, _ = io.WriteString(w, "ok")
-			}))
-			upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-				if state == http.StateClosed {
-					select {
-					case closed <- struct{}{}:
-					default:
-					}
-				}
-			}
-			upstream.Start()
-			t.Cleanup(upstream.Close)
-			client := newAntigravityHTTPClient(buildHTTPTransport(false), time.Hour, antigravityPoolConfig{DisableReuse: disabled, IdleTimeout: time.Second, MaxIdleConnsPerHost: 2})
-			t.Cleanup(func() { closeUpstreamHTTPClient(client) })
-			request := func() string {
-				t.Helper()
-				response, err := client.Get(upstream.URL)
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, _ = io.Copy(io.Discard, response.Body)
-				_ = response.Body.Close()
-				return <-addresses
-			}
-			first, second := request(), request()
-			if (first != second) != disabled {
-				t.Fatalf("disabled=%v connections=%s/%s", disabled, first, second)
-			}
-			select {
-			case <-closed:
-			case <-time.After(3 * time.Second):
-				t.Fatal("idle connection was not reclaimed")
-			}
-			if third := request(); third == second {
-				t.Fatal("closed idle connection reused")
-			}
-		})
-	}
-}
-
 func TestServerIsolatesAntigravityHTTP11PoolByRefreshCredential(t *testing.T) {
 	server := &Server{
 		client:            http.DefaultClient,
-		antigravityClient: newAntigravityHTTPClient(buildHTTPTransport(true), 0, antigravityPoolConfig{}),
+		antigravityClient: newAntigravityHTTPClient(buildHTTPTransport(true, 1), 0),
 	}
 	t.Cleanup(func() {
 		closeUpstreamHTTPClient(server.antigravityClient)
-		if server.antigravityTransports != nil {
-			server.antigravityTransports.closeAll()
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
 		}
 	})
 
@@ -206,7 +167,7 @@ func TestServerIsolatesAntigravityHTTP11PoolByRefreshCredential(t *testing.T) {
 	if firstClient == secondClient {
 		t.Fatal("different Antigravity refresh credentials must not share an HTTP client")
 	}
-	if got := server.antigravityTransports.order.Len(); got != 2 {
+	if got := server.credentialTransports.order.Len(); got != 2 {
 		t.Fatalf("cache entries=%d, want 2", got)
 	}
 }
@@ -218,12 +179,12 @@ func TestServerDoesNotReuseAntigravityConnectionAcrossCredentials(t *testing.T) 
 	t.Cleanup(upstream.Close)
 	server := &Server{
 		client:            http.DefaultClient,
-		antigravityClient: newAntigravityHTTPClient(buildHTTPTransport(false), 0, antigravityPoolConfig{}),
+		antigravityClient: newAntigravityHTTPClient(buildHTTPTransport(false, 1), 0),
 	}
 	t.Cleanup(func() {
 		closeUpstreamHTTPClient(server.antigravityClient)
-		if server.antigravityTransports != nil {
-			server.antigravityTransports.closeAll()
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
 		}
 	})
 	credential := func(refresh string) string {
@@ -262,8 +223,470 @@ func TestServerDoesNotReuseAntigravityConnectionAcrossCredentials(t *testing.T) 
 	}
 }
 
-func TestAntigravityHTTPClientCacheIsBounded(t *testing.T) {
-	cache := newAntigravityHTTPClientCache(2)
+func TestServerIsolatesAnthropicConnectionByAccountAndProxy(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 1 {
+			t.Errorf("Anthropic upstream protocol = HTTP/%d, want HTTP/1.1", r.ProtoMajor)
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	upstream.StartTLS()
+	t.Cleanup(upstream.Close)
+
+	var connectCount atomic.Int32
+	newProxy := func() *httptest.Server {
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodConnect || r.Host != "api.anthropic.com:443" {
+				http.Error(w, "unexpected CONNECT target", http.StatusBadRequest)
+				return
+			}
+			connectCount.Add(1)
+			clientConn, buffered, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack proxy connection: %v", err)
+				return
+			}
+			upstreamConn, err := net.Dial("tcp", upstream.Listener.Addr().String())
+			if err != nil {
+				_ = clientConn.Close()
+				t.Errorf("dial upstream: %v", err)
+				return
+			}
+			if _, err = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err == nil {
+				err = buffered.Flush()
+			}
+			if err != nil {
+				_ = clientConn.Close()
+				_ = upstreamConn.Close()
+				t.Errorf("write CONNECT response: %v", err)
+				return
+			}
+			go func() {
+				_, _ = io.Copy(upstreamConn, buffered)
+				_ = upstreamConn.Close()
+			}()
+			_, _ = io.Copy(clientConn, upstreamConn)
+			_ = clientConn.Close()
+		}))
+		t.Cleanup(proxy.Close)
+		return proxy
+	}
+	proxy := newProxy()
+
+	server := &Server{
+		client:        newUpstreamHTTPClient(buildHTTPTransport(true, 2), 0),
+		skipTLSVerify: true,
+	}
+	t.Cleanup(func() {
+		closeUpstreamHTTPClient(server.client)
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
+		}
+	})
+	credential := func(account, access, refresh string) string {
+		return fmt.Sprintf(`{"type":"anthropic","account_uuid":%q,"access_token":%q,"refresh_token":%q,"expired":"2099-01-01T00:00:00Z"}`, account, access, refresh)
+	}
+	first := &model.Config{ID: 1, AuthType: model.AuthTypeAnthropicOAuth, ProxyURL: proxy.URL,
+		OAuthCredential: credential("account-a", "access-a", "refresh-a")}
+	rotated := first.Clone()
+	rotated.OAuthCredential = credential("account-a", "access-b", "refresh-b")
+	second := &model.Config{ID: 2, AuthType: model.AuthTypeAnthropicOAuth, ProxyURL: proxy.URL,
+		OAuthCredential: credential("account-b", "access-c", "refresh-c")}
+	replaced := first.Clone()
+	replaced.OAuthCredential = credential("account-c", "access-d", "refresh-d")
+
+	request := func(cfg *model.Config) httptrace.GotConnInfo {
+		t.Helper()
+		gotConn := make(chan httptrace.GotConnInfo, 1)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			"https://api.anthropic.com/v1/messages", strings.NewReader(`{"messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { gotConn <- info },
+		}))
+		resp, err := server.getClientForChannel(cfg).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return <-gotConn
+	}
+
+	firstConn := request(first)
+	rotatedConn := request(rotated)
+	secondConn := request(second)
+	replacedConn := request(replaced)
+	if !rotatedConn.Reused || rotatedConn.Conn != firstConn.Conn {
+		t.Fatal("same Anthropic account did not reuse its connection after token rotation")
+	}
+	if secondConn.Conn == firstConn.Conn || replacedConn.Conn == firstConn.Conn || replacedConn.Conn == secondConn.Conn {
+		t.Fatal("different Anthropic accounts reused a physical connection through the same proxy")
+	}
+	otherProxy := first.Clone()
+	otherProxy.ProxyURL = newProxy().URL
+	otherProxyConn := request(otherProxy)
+	if otherProxyConn.Conn == firstConn.Conn {
+		t.Fatal("same Anthropic account reused a physical connection through a different proxy")
+	}
+	if got := connectCount.Load(); got != 4 {
+		t.Fatalf("CONNECT count = %d, want one per account and proxy pool", got)
+	}
+}
+
+func TestServerDoesNotReuseAnthropicDirectConnectionAcrossAccounts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(upstream.Close)
+	server := &Server{client: newUpstreamHTTPClient(buildHTTPTransport(false, 2), 0)}
+	t.Cleanup(func() {
+		closeUpstreamHTTPClient(server.client)
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
+		}
+	})
+	request := func(channelID int64) httptrace.GotConnInfo {
+		t.Helper()
+		gotConn := make(chan httptrace.GotConnInfo, 1)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, upstream.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { gotConn <- info },
+		}))
+		cfg := &model.Config{ID: channelID, AuthType: model.AuthTypeAnthropicOAuth,
+			OAuthCredential: fmt.Sprintf(`{"type":"anthropic","account_uuid":"account-%d","access_token":"access","expired":"2099-01-01T00:00:00Z"}`, channelID)}
+		resp, err := server.getClientForChannel(cfg).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return <-gotConn
+	}
+	first := request(1)
+	second := request(2)
+	reused := request(1)
+	if first.Conn == second.Conn {
+		t.Fatal("different direct Anthropic accounts reused a physical connection")
+	}
+	if !reused.Reused || reused.Conn != first.Conn {
+		t.Fatal("same direct Anthropic account did not reuse its physical connection")
+	}
+}
+
+func TestServerIsolatesOtherOAuthConnectionsByAccountAndProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(upstream.Close)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(proxy.Close)
+
+	credential := func(authType, account, access string) string {
+		switch authType {
+		case model.AuthTypeCodexOAuth:
+			return fmt.Sprintf(`{"type":"codex","account_id":%q,"access_token":%q,"refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`, account, access)
+		case model.AuthTypeXAIOAuth:
+			return fmt.Sprintf(`{"type":"xai","sub":%q,"access_token":%q,"refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`, account, access)
+		case model.AuthTypeZAIOAuth:
+			return fmt.Sprintf(`{"type":"zai","user_id":%q,"api_key":"key","access_token":%q}`, account, access)
+		case model.AuthTypeCursorOAuth:
+			return fmt.Sprintf(`{"type":"cursor","user_id":%q,"access_token":%q}`, account, access)
+		case model.AuthTypeZedOAuth:
+			return fmt.Sprintf(`{"type":"zed","user_id":%q,"access_token":%q}`, account, access)
+		case model.AuthTypeCodeBuddyOAuth:
+			return fmt.Sprintf(`{"type":"codebuddy","uid":%q,"access_token":%q}`, account, access)
+		default:
+			t.Fatalf("unexpected OAuth auth type %q", authType)
+			return ""
+		}
+	}
+
+	for _, authType := range []string{
+		model.AuthTypeCodexOAuth,
+		model.AuthTypeXAIOAuth,
+		model.AuthTypeZAIOAuth,
+		model.AuthTypeCursorOAuth,
+		model.AuthTypeZedOAuth,
+		model.AuthTypeCodeBuddyOAuth,
+	} {
+		for _, useProxy := range []bool{false, true} {
+			name := authType + "/direct"
+			if useProxy {
+				name = authType + "/proxy"
+			}
+			t.Run(name, func(t *testing.T) {
+				server := &Server{client: newUpstreamHTTPClient(buildHTTPTransport(false, 2), 0)}
+				t.Cleanup(func() {
+					closeUpstreamHTTPClient(server.client)
+					if server.credentialTransports != nil {
+						server.credentialTransports.closeAll()
+					}
+					server.proxyTransports.Range(func(_, value any) bool {
+						closeUpstreamHTTPClient(value.(*http.Client))
+						return true
+					})
+				})
+				first := &model.Config{ID: 1, AuthType: authType, OAuthCredential: credential(authType, "account-a", "access-a")}
+				rotated := first.Clone()
+				rotated.OAuthCredential = credential(authType, "account-a", "access-rotated")
+				second := &model.Config{ID: 2, AuthType: authType, OAuthCredential: credential(authType, "account-b", "access-b")}
+				replaced := first.Clone()
+				replaced.OAuthCredential = credential(authType, "account-c", "access-c")
+				url := upstream.URL
+				if useProxy {
+					first.ProxyURL, rotated.ProxyURL, second.ProxyURL, replaced.ProxyURL = proxy.URL, proxy.URL, proxy.URL, proxy.URL
+					url = "http://oauth.example.test/resource"
+				}
+				request := func(cfg *model.Config) httptrace.GotConnInfo {
+					t.Helper()
+					gotConn := make(chan httptrace.GotConnInfo, 1)
+					req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+						GotConn: func(info httptrace.GotConnInfo) { gotConn <- info },
+					}))
+					resp, err := server.getClientForChannel(cfg).Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					if err := resp.Body.Close(); err != nil {
+						t.Fatal(err)
+					}
+					return <-gotConn
+				}
+				firstConn := request(first)
+				rotatedConn := request(rotated)
+				secondConn := request(second)
+				replacedConn := request(replaced)
+				if !rotatedConn.Reused || rotatedConn.Conn != firstConn.Conn {
+					t.Fatal("access-token rotation did not reuse the same account connection")
+				}
+				if secondConn.Conn == firstConn.Conn || replacedConn.Conn == firstConn.Conn || replacedConn.Conn == secondConn.Conn {
+					t.Fatal("different OAuth accounts reused a physical connection")
+				}
+			})
+		}
+	}
+}
+
+func TestServerClosedCredentialCacheDoesNotUseSharedClient(t *testing.T) {
+	var requests atomic.Int32
+	respond := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	})
+	upstream := httptest.NewServer(respond)
+	t.Cleanup(upstream.Close)
+	proxy := httptest.NewServer(respond)
+	t.Cleanup(proxy.Close)
+
+	server := &Server{
+		client:               newUpstreamHTTPClient(buildHTTPTransport(false, 1), 0),
+		antigravityClient:    newAntigravityHTTPClient(buildHTTPTransport(false, 1), 0),
+		credentialTransports: newCredentialHTTPClientCache(1),
+	}
+	t.Cleanup(func() {
+		closeUpstreamHTTPClient(server.client)
+		closeUpstreamHTTPClient(server.antigravityClient)
+		server.proxyTransports.Range(func(_, value any) bool {
+			closeUpstreamHTTPClient(value.(*http.Client))
+			return true
+		})
+	})
+	server.credentialTransports.closeAll()
+
+	for _, tt := range []struct {
+		name       string
+		authType   string
+		credential string
+		proxyURL   string
+	}{
+		{name: "Anthropic direct", authType: model.AuthTypeAnthropicOAuth,
+			credential: `{"type":"anthropic","account_uuid":"account-a","access_token":"access","expired":"2099-01-01T00:00:00Z"}`},
+		{name: "Anthropic proxy", authType: model.AuthTypeAnthropicOAuth, proxyURL: proxy.URL,
+			credential: `{"type":"anthropic","account_uuid":"account-b","access_token":"access","expired":"2099-01-01T00:00:00Z"}`},
+		{name: "Antigravity direct", authType: model.AuthTypeAntigravityOAuth,
+			credential: `{"type":"antigravity","access_token":"access","refresh_token":"refresh-a","expired":"2099-01-01T00:00:00Z"}`},
+		{name: "Antigravity proxy", authType: model.AuthTypeAntigravityOAuth, proxyURL: proxy.URL,
+			credential: `{"type":"antigravity","access_token":"access","refresh_token":"refresh-b","expired":"2099-01-01T00:00:00Z"}`},
+		{name: "Codex direct", authType: model.AuthTypeCodexOAuth,
+			credential: `{"type":"codex","account_id":"account-a","access_token":"access","refresh_token":"refresh"}`},
+		{name: "Codex proxy", authType: model.AuthTypeCodexOAuth, proxyURL: proxy.URL,
+			credential: `{"type":"codex","account_id":"account-b","access_token":"access","refresh_token":"refresh"}`},
+		{name: "xAI direct", authType: model.AuthTypeXAIOAuth,
+			credential: `{"type":"xai","sub":"account-a","access_token":"access","refresh_token":"refresh"}`},
+		{name: "Z.ai direct", authType: model.AuthTypeZAIOAuth,
+			credential: `{"type":"zai","user_id":"account-a","api_key":"key"}`},
+		{name: "Cursor direct", authType: model.AuthTypeCursorOAuth,
+			credential: `{"type":"cursor","user_id":"account-a","access_token":"access"}`},
+		{name: "Zed direct", authType: model.AuthTypeZedOAuth,
+			credential: `{"type":"zed","user_id":"account-a","access_token":"access"}`},
+		{name: "CodeBuddy direct", authType: model.AuthTypeCodeBuddyOAuth,
+			credential: `{"type":"codebuddy","uid":"account-a","access_token":"access"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &model.Config{ID: 1, AuthType: tt.authType, OAuthCredential: tt.credential, ProxyURL: tt.proxyURL}
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, upstream.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := server.getClientForChannel(cfg).Do(req)
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			if !errors.Is(err, errCredentialHTTPClientCacheClosed) {
+				t.Fatalf("request after credential cache close: response=%v err=%v", resp, err)
+			}
+		})
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("shared client sent %d request(s) after credential cache close", got)
+	}
+}
+
+func TestServerCodexOAuthCloudflareCookiesPerAccountSharedWithWebsocket(t *testing.T) {
+	server := &Server{client: newUpstreamHTTPClient(buildHTTPTransport(false, 2), 0)}
+	t.Cleanup(func() {
+		closeUpstreamHTTPClient(server.client)
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
+		}
+	})
+	credential := func(account, access string) string {
+		return fmt.Sprintf(`{"type":"codex","account_id":%q,"access_token":%q,"refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`, account, access)
+	}
+	accountA := &model.Config{ID: 1, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credential("account-a", "access-a")}
+	refreshedA := accountA.Clone()
+	refreshedA.OAuthCredential = credential("account-a", "access-refreshed")
+	accountB := &model.Config{ID: 2, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credential("account-b", "access-b")}
+	apiKey := &model.Config{ID: 3, AuthType: model.AuthTypeAPIKey}
+
+	mustURL := func(raw string) *url.URL {
+		t.Helper()
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u
+	}
+	responses := mustURL("https://chatgpt.com/backend-api/codex/responses")
+	cookieNames := func(jar http.CookieJar, u *url.URL) []string {
+		t.Helper()
+		if jar == nil {
+			t.Fatal("Codex OAuth client has no cookie jar")
+		}
+		var names []string
+		for _, cookie := range jar.Cookies(u) {
+			names = append(names, cookie.Name)
+		}
+		slices.Sort(names)
+		return names
+	}
+
+	jarA := server.getClientForChannel(accountA).Jar
+	if jarA == nil {
+		t.Fatal("Codex OAuth client has no cookie jar")
+	}
+	jarA.SetCookies(responses, []*http.Cookie{
+		{Name: "__cf_bm", Value: "bm"},
+		{Name: "cf_chl_rc_m", Value: "challenge"},
+		{Name: "__oailb", Value: "lb"},
+		{Name: "__Secure-next-auth.session-token", Value: "session"},
+		{Name: "oai-did", Value: "device"},
+	})
+	jarA.SetCookies(mustURL("http://chatgpt.com/backend-api/codex/responses"), []*http.Cookie{{Name: "_cfuvid", Value: "plain-http"}})
+	jarA.SetCookies(mustURL("https://api.openai.com/v1/responses"), []*http.Cookie{{Name: "__cflb", Value: "other-host"}})
+
+	want := []string{"__cf_bm", "__oailb", "cf_chl_rc_m"}
+	// gorilla/websocket 在查询 jar 前把 wss 改写为 https；刷新 access token 不换账号池。
+	if got := cookieNames(server.codexWebsocketDialer(refreshedA).Jar, responses); !slices.Equal(got, want) {
+		t.Fatalf("WebSocket cookies for same account = %v, want %v", got, want)
+	}
+	if got := cookieNames(jarA, mustURL("http://chatgpt.com/backend-api/codex/responses")); len(got) != 0 {
+		t.Fatalf("plain-http ChatGPT cookies = %v, want none", got)
+	}
+	if got := cookieNames(jarA, mustURL("https://api.openai.com/v1/responses")); len(got) != 0 {
+		t.Fatalf("non-ChatGPT host cookies = %v, want none", got)
+	}
+	if got := cookieNames(server.getClientForChannel(accountB).Jar, responses); len(got) != 0 {
+		t.Fatalf("another account sees cookies %v", got)
+	}
+	if server.getClientForChannel(apiKey).Jar != nil || server.codexWebsocketDialer(apiKey).Jar != nil {
+		t.Fatal("Codex API key channel must not carry a ChatGPT cookie jar")
+	}
+}
+
+func TestServerCodexOAuthPoolOmitsAcceptEncoding(t *testing.T) {
+	acceptEncoding := make(chan string, 1)
+	respond := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptEncoding <- r.Header.Get("Accept-Encoding")
+		_, _ = io.WriteString(w, "ok")
+	})
+	upstream := httptest.NewServer(respond)
+	t.Cleanup(upstream.Close)
+	proxy := httptest.NewServer(respond)
+	t.Cleanup(proxy.Close)
+
+	server := &Server{client: newUpstreamHTTPClient(buildHTTPTransport(false, 2), 0)}
+	t.Cleanup(func() {
+		closeUpstreamHTTPClient(server.client)
+		if server.credentialTransports != nil {
+			server.credentialTransports.closeAll()
+		}
+	})
+	codexCredential := `{"type":"codex","account_id":"account-a","access_token":"access","refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`
+	for _, tt := range []struct {
+		name string
+		cfg  *model.Config
+		url  string
+		want string
+	}{
+		// 官方 Codex 不发 Accept-Encoding；其他渠道保持 Go 默认的 gzip 协商。
+		{name: "Codex OAuth direct", url: upstream.URL,
+			cfg: &model.Config{ID: 1, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: codexCredential}},
+		{name: "Codex OAuth proxy", url: "http://chatgpt.example.test/backend-api/codex/responses",
+			cfg: &model.Config{ID: 2, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: codexCredential, ProxyURL: proxy.URL}},
+		{name: "API key", url: upstream.URL, want: "gzip",
+			cfg: &model.Config{ID: 3, AuthType: model.AuthTypeAPIKey}},
+		{name: "xAI OAuth", url: upstream.URL, want: "gzip",
+			cfg: &model.Config{ID: 4, AuthType: model.AuthTypeXAIOAuth,
+				OAuthCredential: `{"type":"xai","sub":"account-x","access_token":"access","refresh_token":"refresh","expired":"2099-01-01T00:00:00Z"}`}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, tt.url, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := server.getClientForChannel(tt.cfg).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if got := <-acceptEncoding; got != tt.want {
+				t.Fatalf("Accept-Encoding = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCredentialHTTPClientCacheIsBounded(t *testing.T) {
+	cache := newCredentialHTTPClientCache(2)
 	trackers := make([]*closeIdleTrackingRoundTripper, 0, 3)
 	for _, scope := range []string{"a", "b", "c"} {
 		client, err := cache.getOrCreate(upstreamHTTPClientCacheKey{credentialScope: scope}, func() (*http.Client, error) {
@@ -284,9 +707,9 @@ func TestAntigravityHTTPClientCacheIsBounded(t *testing.T) {
 	if got := trackers[0].closeCount(); got != 1 {
 		t.Fatalf("evicted client CloseIdleConnections calls=%d, want 1", got)
 	}
-	agingCache := newAntigravityHTTPClientCache(1)
+	agingCache := newCredentialHTTPClientCache(1)
 	agingClient, err := agingCache.getOrCreate(upstreamHTTPClientCacheKey{credentialScope: "aging"}, func() (*http.Client, error) {
-		return newAntigravityHTTPClient(buildHTTPTransport(false), time.Hour, antigravityPoolConfig{}), nil
+		return newAntigravityHTTPClient(buildHTTPTransport(false, 1), time.Hour), nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -310,11 +733,11 @@ func TestAntigravityHTTPClientCacheIsBounded(t *testing.T) {
 	cache.closeAll()
 	if _, err := cache.getOrCreate(upstreamHTTPClientCacheKey{credentialScope: "after-close"}, func() (*http.Client, error) {
 		return &http.Client{Transport: &closeIdleTrackingRoundTripper{}}, nil
-	}); !errors.Is(err, errAntigravityHTTPClientCacheClosed) {
+	}); !errors.Is(err, errCredentialHTTPClientCacheClosed) {
 		t.Fatalf("closed cache accepted a new pool: %v", err)
 	}
 
-	closingCache := newAntigravityHTTPClientCache(1)
+	closingCache := newCredentialHTTPClientCache(1)
 	builderStarted := make(chan struct{})
 	releaseBuilder := make(chan struct{})
 	buildResult := make(chan error, 1)
@@ -330,7 +753,7 @@ func TestAntigravityHTTPClientCacheIsBounded(t *testing.T) {
 	<-builderStarted
 	closingCache.closeAll()
 	close(releaseBuilder)
-	if err := <-buildResult; !errors.Is(err, errAntigravityHTTPClientCacheClosed) {
+	if err := <-buildResult; !errors.Is(err, errCredentialHTTPClientCacheClosed) {
 		t.Fatalf("in-flight builder resurrected a closed cache: %v", err)
 	}
 	if got := inFlightTracker.closeCount(); got != 1 {
@@ -338,22 +761,52 @@ func TestAntigravityHTTPClientCacheIsBounded(t *testing.T) {
 	}
 }
 
-func TestAntigravityPoolLimitsMatchNativeReuseProfile(t *testing.T) {
-	base := &http.Transport{MaxIdleConns: 20, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second}
-	client := newAntigravityHTTPClient(base, 0, antigravityPoolConfig{})
+func TestAntigravityPoolMatchesSharedTransportPolicy(t *testing.T) {
+	base := &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: config.HTTPMaxIdleConnsPerHost,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	client := newAntigravityHTTPClient(base, 0)
 	t.Cleanup(func() { closeUpstreamHTTPClient(client) })
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
 	}
-	if transport.MaxIdleConnsPerHost != antigravityMaxIdleConnsPerHost ||
-		transport.MaxIdleConns < transport.MaxIdleConnsPerHost ||
-		transport.IdleConnTimeout != antigravityIdleConnTimeout {
-		t.Fatalf("Antigravity pool limits = idle %d per-host %d timeout %v",
-			transport.MaxIdleConns, transport.MaxIdleConnsPerHost, transport.IdleConnTimeout)
+	if transport.DisableKeepAlives != base.DisableKeepAlives ||
+		transport.MaxIdleConns != base.MaxIdleConns ||
+		transport.MaxIdleConnsPerHost != base.MaxIdleConnsPerHost ||
+		transport.IdleConnTimeout != base.IdleConnTimeout {
+		t.Fatalf("Antigravity pool policy = keepalive-disabled %t, idle %d, per-host %d, timeout %v",
+			transport.DisableKeepAlives, transport.MaxIdleConns, transport.MaxIdleConnsPerHost, transport.IdleConnTimeout)
 	}
-	if base.MaxIdleConnsPerHost != 20 || base.IdleConnTimeout != 90*time.Second {
-		t.Fatal("Antigravity pool tuning mutated the shared base transport")
+	if base.MaxIdleConns != 1000 || base.MaxIdleConnsPerHost != config.HTTPMaxIdleConnsPerHost || base.IdleConnTimeout != 90*time.Second {
+		t.Fatal("Antigravity client mutated the shared base transport")
+	}
+}
+
+func TestBuildHTTPTransportSizesIdlePoolByChannelCount(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		channelCount int
+		want         int
+	}{
+		{name: "empty", channelCount: 0, want: 2},
+		{name: "single", channelCount: 1, want: 2},
+		{name: "five_hundred", channelCount: 500, want: 1000},
+		{name: "at_limit", channelCount: 512, want: 1024},
+		{name: "above_limit", channelCount: 513, want: 1024},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := buildHTTPTransport(false, tt.channelCount)
+			t.Cleanup(transport.CloseIdleConnections)
+			if transport.MaxIdleConns != tt.want {
+				t.Fatalf("MaxIdleConns=%d, want %d", transport.MaxIdleConns, tt.want)
+			}
+			if transport.DisableKeepAlives {
+				t.Fatal("connection reuse is disabled")
+			}
+		})
 	}
 }
 
@@ -490,7 +943,7 @@ func TestUpstreamHTTPTransportClosesIdleConnectionAtMaxAge(t *testing.T) {
 	server.StartTLS()
 	defer server.Close()
 
-	transport := newUpstreamConnectionAgeTransport(buildHTTPTransport(true), 50*time.Millisecond)
+	transport := newUpstreamConnectionAgeTransport(buildHTTPTransport(true, 1), 50*time.Millisecond)
 	client := &http.Client{Transport: transport}
 	t.Cleanup(transport.Close)
 
@@ -547,7 +1000,7 @@ func TestUpstreamHTTPTransportClosesIdleCodexUTLSConnectionAtMaxAge(t *testing.T
 	server.StartTLS()
 	defer server.Close()
 
-	base := buildHTTPTransport(true)
+	base := buildHTTPTransport(true, 1)
 	dialer := &net.Dialer{}
 	base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return dialer.DialContext(ctx, network, server.Listener.Addr().String())
@@ -587,7 +1040,7 @@ func TestUpstreamHTTPTransportClosesIdleCodexUTLSConnectionAtMaxAge(t *testing.T
 }
 
 func TestNewServerAppliesUpstreamConnectionMaxAgeToHTTP(t *testing.T) {
-	t.Setenv("CCLOAD_PASS", "upstream-connection-age-test-password")
+	t.Parallel()
 
 	store, err := storage.CreateSQLiteStore(":memory:")
 	if err != nil {
@@ -665,7 +1118,7 @@ func TestUpstreamHTTPTransportDrainsActiveResponsesAndRotatesNewRequests(t *test
 			server.StartTLS()
 			defer server.Close()
 
-			transport := newUpstreamConnectionAgeTransport(buildHTTPTransport(true), 50*time.Millisecond)
+			transport := newUpstreamConnectionAgeTransport(buildHTTPTransport(true, 1), 50*time.Millisecond)
 			client := &http.Client{Transport: transport}
 			t.Cleanup(transport.Close)
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,7 +101,7 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 	writer := csv.NewWriter(buf)
 	defer writer.Flush()
 
-	header := []string{"id", "name", "api_key", "api_key_allowed_models", "api_key_cost_multipliers", "api_key_priorities", "api_key_model_scope_empty", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "management_daily_checkin_enabled", "management_daily_checkin_time", "websockets", "scheduled_check_interval_minutes", "scheduled_check_start_time"}
+	header := []string{"id", "name", "api_key", "api_key_allowed_models", "api_key_detected_models", "api_key_cost_multipliers", "api_key_priorities", "api_key_model_scope_empty", "urls", "priority", "rpm_limit", "max_concurrency", "model_entries_json", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "management_daily_checkin_enabled", "management_daily_checkin_time", "websockets", "scheduled_check_interval_minutes", "scheduled_check_start_time"}
 	if err := writer.Write(header); err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
@@ -117,14 +118,21 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 		}
 		apiKeyStr := strings.Join(apiKeyStrs, ",")
 		apiKeyAllowedModels := make([][]string, len(apiKeys))
+		apiKeyDetectedModels := make([][]string, len(apiKeys))
 		apiKeyModelScopeEmpty := make([]bool, len(apiKeys))
 		for i, key := range apiKeys {
 			apiKeyAllowedModels[i] = append([]string(nil), key.AllowedModels...)
+			apiKeyDetectedModels[i] = append([]string(nil), key.DetectedModels...)
 			apiKeyModelScopeEmpty[i] = key.ModelScopeEmpty
 		}
 		apiKeyAllowedModelsJSON, err := sonic.Marshal(apiKeyAllowedModels)
 		if err != nil {
 			RespondError(c, http.StatusInternalServerError, fmt.Errorf("serialize API key model scopes for channel %d: %w", cfg.ID, err))
+			return
+		}
+		apiKeyDetectedModelsJSON, err := sonic.Marshal(apiKeyDetectedModels)
+		if err != nil {
+			RespondError(c, http.StatusInternalServerError, fmt.Errorf("serialize API key detected models for channel %d: %w", cfg.ID, err))
 			return
 		}
 		apiKeyModelScopeEmptyJSON, err := sonic.Marshal(apiKeyModelScopeEmpty)
@@ -157,22 +165,10 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 			keyStrategy = apiKeys[0].KeyStrategy
 		}
 
-		// 序列化模型列表和重定向为CSV兼容格式
-		// 格式设计：models用逗号分隔（人类可读+Excel友好），redirects用JSON（结构化数据）
-		models := make([]string, 0, len(cfg.ModelEntries))
-		redirects := make(map[string]string)
-		for _, entry := range cfg.ModelEntries {
-			models = append(models, entry.Model)
-			if entry.RedirectModel != "" {
-				redirects[entry.Model] = entry.RedirectModel
-			}
-		}
-
-		modelRedirectsJSON := "{}"
-		if len(redirects) > 0 {
-			if jsonBytes, err := sonic.Marshal(redirects); err == nil {
-				modelRedirectsJSON = string(jsonBytes)
-			}
+		modelEntriesJSON, err := json.Marshal(cfg.ModelEntries)
+		if err != nil {
+			RespondError(c, http.StatusInternalServerError, fmt.Errorf("serialize model entries for channel %d: %w", cfg.ID, err))
+			return
 		}
 		cooldownDetectionRulesJSON := ""
 		if cfg.CooldownDetectionRules != nil && !cfg.CooldownDetectionRules.IsEmpty() {
@@ -205,6 +201,7 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 			cfg.Name,
 			apiKeyStr,
 			string(apiKeyAllowedModelsJSON),
+			string(apiKeyDetectedModelsJSON),
 			string(apiKeyCostMultipliersJSON),
 			string(apiKeyPrioritiesJSON),
 			string(apiKeyModelScopeEmptyJSON),
@@ -212,8 +209,7 @@ func (s *Server) HandleExportChannelsCSV(c *gin.Context) {
 			strconv.Itoa(cfg.Priority),
 			strconv.Itoa(cfg.RPMLimit),
 			strconv.Itoa(cfg.MaxConcurrency),
-			strings.Join(models, ","),
-			modelRedirectsJSON,
+			string(modelEntriesJSON),
 			cfg.GetProtocolTransformMode(),
 			keyStrategy,
 			strconv.FormatBool(cfg.Enabled),
@@ -278,12 +274,24 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 	}
 
 	columnIndex := buildCSVColumnIndex(headerRow)
-	required := []string{"name", "urls", "models"}
+	required := []string{"name", "urls"}
 	for _, key := range required {
 		if _, ok := columnIndex[key]; !ok {
 			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("缺少必需列: %s", key))
 			return
 		}
+	}
+	_, hasModelEntriesJSON := columnIndex["model_entries_json"]
+	_, hasModels := columnIndex["models"]
+	_, hasRedirects := columnIndex["model_redirects"]
+	_, hasLegacyPricing := columnIndex["model_pricing"]
+	if hasModelEntriesJSON && (hasModels || hasRedirects || hasLegacyPricing) {
+		RespondErrorMsg(c, http.StatusBadRequest, "model_entries_json cannot be combined with legacy model columns")
+		return
+	}
+	if !hasModelEntriesJSON && !hasModels {
+		RespondErrorMsg(c, http.StatusBadRequest, "缺少必需列: models 或 model_entries_json")
+		return
 	}
 
 	_, hasScheduledCheckColumn := columnIndex["scheduled_check_enabled"]
@@ -292,9 +300,11 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 	_, hasRetryOtherKeysOnFailureColumn := columnIndex["retry_other_keys_on_failure"]
 	_, hasWebsocketsColumn := columnIndex["websockets"]
 	_, hasAPIKeyAllowedModelsColumn := columnIndex["api_key_allowed_models"]
+	_, hasAPIKeyDetectedModelsColumn := columnIndex["api_key_detected_models"]
 	_, hasAPIKeyPrioritiesColumn := columnIndex["api_key_priorities"]
 	_, hasAPIKeyCostMultipliersColumn := columnIndex["api_key_cost_multipliers"]
 	_, hasAPIKeyModelScopeEmptyColumn := columnIndex["api_key_model_scope_empty"]
+	_, hasModelPricingColumn := columnIndex["model_pricing"]
 	existingScheduledCheckByName := make(map[string]bool)
 	existingScheduledCheckModelByName := make(map[string]string)
 	existingSchedulesByName := make(map[string]*model.Config)
@@ -304,7 +314,8 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 	existingRetryOtherKeysOnFailureByName := make(map[string]bool)
 	existingWebsocketsByName := make(map[string]bool)
 	existingAPIKeysByName := make(map[string][]*model.APIKey)
-	if !hasInterval || !hasStart || !hasScheduledCheckColumn || !hasScheduledCheckModelColumn || !hasCooldownDetectionRulesColumn || !hasRetryOtherKeysOnFailureColumn || !hasWebsocketsColumn || !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn {
+	existingModelEntriesByName := make(map[string][]model.ModelEntry)
+	if !hasInterval || !hasStart || !hasScheduledCheckColumn || !hasScheduledCheckModelColumn || !hasCooldownDetectionRulesColumn || !hasRetryOtherKeysOnFailureColumn || !hasWebsocketsColumn || !hasAPIKeyAllowedModelsColumn || !hasAPIKeyDetectedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn || !hasModelPricingColumn {
 		existingConfigs, err := s.store.ListConfigs(c.Request.Context())
 		if err != nil {
 			RespondError(c, http.StatusInternalServerError, err)
@@ -317,8 +328,9 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 			existingCooldownDetectionRulesByName[cfg.Name] = cfg.CooldownDetectionRules.Clone()
 			existingRetryOtherKeysOnFailureByName[cfg.Name] = cfg.RetryOtherKeysOnFailure
 			existingWebsocketsByName[cfg.Name] = cfg.Websockets
+			existingModelEntriesByName[cfg.Name] = cfg.ModelEntries
 		}
-		if !hasAPIKeyAllowedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn {
+		if !hasAPIKeyAllowedModelsColumn || !hasAPIKeyDetectedModelsColumn || !hasAPIKeyCostMultipliersColumn || !hasAPIKeyPrioritiesColumn || !hasAPIKeyModelScopeEmptyColumn {
 			allAPIKeys, err := s.store.GetAllAPIKeys(c.Request.Context())
 			if err != nil {
 				RespondError(c, http.StatusInternalServerError, err)
@@ -362,6 +374,7 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 			hasAPIKeyCostMultipliersColumn,
 			hasAPIKeyPrioritiesColumn,
 			hasAPIKeyModelScopeEmptyColumn,
+			hasModelPricingColumn,
 			existingScheduledCheckByName,
 			existingScheduledCheckModelByName,
 			existingCooldownDetectionRulesByName,
@@ -369,6 +382,7 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 			existingWebsocketsByName,
 			existingAPIKeysByName,
 			existingSchedulesByName,
+			existingModelEntriesByName,
 		)
 		if skip {
 			if errMsg != "" {
@@ -425,11 +439,18 @@ func (s *Server) HandleImportChannelsCSV(c *gin.Context) {
 				s.cleanupOrphanedURLStates(c.Request.Context(), channelID, cfg.GetURLs())
 			}
 		}
+		importedIDs := make([]int64, 0, len(validChannels))
 		for _, channel := range validChannels {
-			if channel != nil && channel.Config != nil && channel.Config.UsesOAuth() {
+			if channel == nil || channel.Config == nil {
+				continue
+			}
+			importedIDs = append(importedIDs, channel.Config.ID)
+			if channel.Config.UsesOAuth() {
 				s.invalidateOAuthCredential(channel.Config.ID, channel.Config.GetAuthType())
 			}
 		}
+		// 导入可能覆盖已有渠道的 URL/协议配置，只重新探测被导入的渠道。
+		s.protocolCapabilities.clearChannels(importedIDs...)
 	}
 
 	summary.Processed = summary.Created + summary.Updated + summary.Skipped
@@ -505,6 +526,7 @@ func (s *Server) parseChannelImportRow(
 	hasAPIKeyCostMultipliersColumn bool,
 	hasAPIKeyPrioritiesColumn bool,
 	hasAPIKeyModelScopeEmptyColumn bool,
+	hasModelPricingColumn bool,
 	existingScheduledCheckByName map[string]bool,
 	existingScheduledCheckModelByName map[string]string,
 	existingCooldownDetectionRulesByName map[string]*model.CooldownDetectionRules,
@@ -512,6 +534,7 @@ func (s *Server) parseChannelImportRow(
 	existingWebsocketsByName map[string]bool,
 	existingAPIKeysByName map[string][]*model.APIKey,
 	existingSchedulesByName map[string]*model.Config,
+	existingModelEntriesByName map[string][]model.ModelEntry,
 ) (channel *model.ChannelWithKeys, errMsg string, skip bool) {
 	if isCSVRecordEmpty(record) {
 		return nil, "", true
@@ -528,6 +551,7 @@ func (s *Server) parseChannelImportRow(
 	name := fetch("name")
 	apiKey := fetch("api_key")
 	apiKeyAllowedModelsRaw := fetch("api_key_allowed_models")
+	apiKeyDetectedModelsRaw := fetch("api_key_detected_models")
 	apiKeyCostMultipliersRaw := fetch("api_key_cost_multipliers")
 	apiKeyPrioritiesRaw := fetch("api_key_priorities")
 	apiKeyModelScopeEmptyRaw := fetch("api_key_model_scope_empty")
@@ -540,7 +564,9 @@ func (s *Server) parseChannelImportRow(
 	managementCheckinSet := managementCheckinEnabledColumn || managementCheckinTimeColumn
 	urlsRaw := fetch("urls")
 	modelsRaw := fetch("models")
+	modelEntriesJSONRaw := fetch("model_entries_json")
 	modelRedirectsRaw := fetch("model_redirects")
+	modelPricingRaw := fetch("model_pricing")
 	rawProtocolTransformMode := fetch("protocol_transform_mode")
 	keyStrategy := fetch("key_strategy")
 
@@ -562,7 +588,10 @@ func (s *Server) parseChannelImportRow(
 	if urlsRaw == "" {
 		missing = append(missing, "urls")
 	}
-	if modelsRaw == "" {
+	_, hasModelEntriesJSON := columnIndex["model_entries_json"]
+	if hasModelEntriesJSON && modelEntriesJSONRaw == "" {
+		missing = append(missing, "model_entries_json")
+	} else if !hasModelEntriesJSON && modelsRaw == "" {
 		missing = append(missing, "models")
 	}
 	if len(missing) > 0 {
@@ -629,9 +658,12 @@ func (s *Server) parseChannelImportRow(
 	} else if !model.IsValidKeyStrategy(keyStrategy) {
 		return nil, fmt.Sprintf("第%d行Key使用策略无效: %s(仅支持sequential/round_robin)", lineNo, keyStrategy), true
 	}
-	models := parseImportModels(modelsRaw)
-	if len(models) == 0 {
-		return nil, fmt.Sprintf("第%d行模型格式无效", lineNo), true
+	var models []string
+	if !hasModelEntriesJSON {
+		models = parseImportModels(modelsRaw)
+		if len(models) == 0 {
+			return nil, fmt.Sprintf("第%d行模型格式无效", lineNo), true
+		}
 	}
 
 	// 解析模型重定向(可选字段)
@@ -762,12 +794,31 @@ func (s *Server) parseChannelImportRow(
 
 	// 构建模型条目（合并models和modelRedirects）
 	modelEntries := make([]model.ModelEntry, 0, len(models))
-	for _, m := range models {
-		entry := model.ModelEntry{Model: m}
-		if redirect, ok := modelRedirects[m]; ok {
-			entry.RedirectModel = redirect
+	if hasModelEntriesJSON {
+		if err := json.Unmarshal([]byte(modelEntriesJSONRaw), &modelEntries); err != nil || len(modelEntries) == 0 {
+			return nil, fmt.Sprintf("第%d行 model_entries_json 无效: %v", lineNo, err), true
 		}
-		modelEntries = append(modelEntries, entry)
+	} else {
+		for _, m := range models {
+			entry := model.ModelEntry{Model: m}
+			if redirect, ok := modelRedirects[m]; ok {
+				entry.RedirectModel = redirect
+			}
+			modelEntries = append(modelEntries, entry)
+		}
+		if hasModelPricingColumn {
+			if err := applyImportedModelPricing(modelEntries, modelPricingRaw); err != nil {
+				return nil, fmt.Sprintf("第%d行 model_pricing 无效: %v", lineNo, err), true
+			}
+		} else {
+			// 旧版 CSV 没有价格列：更新已有渠道时沿用同身份模型的渠道价格。
+			modelEntries = model.CarryModelPricing(existingModelEntriesByName[name], modelEntries)
+		}
+	}
+	if normalized, err := model.ValidateModelEntries(modelEntries); err != nil {
+		return nil, fmt.Sprintf("第%d行模型条目无效: %v", lineNo, err), true
+	} else {
+		modelEntries = normalized
 	}
 	if scheduledCheckModel != "" {
 		declared := false
@@ -810,7 +861,26 @@ func (s *Server) parseChannelImportRow(
 	// 解析并构建API Keys
 	apiKeyList := util.ParseAPIKeys(apiKey)
 	apiKeyAllowedModels := make([][]string, len(apiKeyList))
+	apiKeyDetectedModels := make([][]string, len(apiKeyList))
 	apiKeyModelScopeEmpty := make([]bool, len(apiKeyList))
+	_, hasAPIKeyDetectedModelsColumn := columnIndex["api_key_detected_models"]
+	if !hasAPIKeyDetectedModelsColumn {
+		submitted := make([]ChannelAPIKeyRequest, len(apiKeyList))
+		for i, key := range apiKeyList {
+			submitted[i].APIKey = key
+		}
+		preserveOmittedAPIKeyMetadata(submitted, existingAPIKeysByName[name])
+		for i := range submitted {
+			apiKeyDetectedModels[i] = submitted[i].DetectedModels
+		}
+	} else if apiKeyDetectedModelsRaw != "" {
+		if err := sonic.Unmarshal([]byte(apiKeyDetectedModelsRaw), &apiKeyDetectedModels); err != nil {
+			return nil, fmt.Sprintf("第%d行 api_key_detected_models 无效: %v", lineNo, err), true
+		}
+		if len(apiKeyDetectedModels) != len(apiKeyList) {
+			return nil, fmt.Sprintf("第%d行 api_key_detected_models 数量必须与 api_key 一致", lineNo), true
+		}
+	}
 	if !hasAPIKeyAllowedModelsColumn {
 		submitted := make([]ChannelAPIKeyRequest, len(apiKeyList))
 		for i, key := range apiKeyList {
@@ -895,10 +965,9 @@ func (s *Server) parseChannelImportRow(
 	for _, entry := range modelEntries {
 		canonicalModels[strings.ToLower(model.RoutingModelName(entry.Model))] = model.RoutingModelName(entry.Model)
 	}
-	wildcardModels := canonicalModels["*"] != ""
 	apiKeys := make([]model.APIKey, len(apiKeyList))
 	for i, key := range apiKeyList {
-		allowedModels, err := normalizeAPIKeyAllowedModels(apiKeyAllowedModels[i], canonicalModels, wildcardModels)
+		allowedModels, err := normalizeAPIKeyAllowedModels(apiKeyAllowedModels[i], canonicalModels)
 		if err != nil {
 			return nil, fmt.Sprintf("第%d行 api_key_allowed_models[%d] 无效: %v", lineNo, i, err), true
 		}
@@ -909,6 +978,14 @@ func (s *Server) parseChannelImportRow(
 		if len(encodedAllowedModels) > maxAPIKeyAllowedModelsJSONLength {
 			return nil, fmt.Sprintf("第%d行 api_key_allowed_models[%d] 过长（最多 %d 字节）", lineNo, i, maxAPIKeyAllowedModelsJSONLength), true
 		}
+		detectedModels := normalizeDetectedModels(apiKeyDetectedModels[i])
+		encodedDetectedModels, err := sonic.Marshal(detectedModels)
+		if err != nil {
+			return nil, fmt.Sprintf("第%d行 api_key_detected_models[%d] 无效: %v", lineNo, i, err), true
+		}
+		if len(encodedDetectedModels) > maxAPIKeyAllowedModelsJSONLength {
+			return nil, fmt.Sprintf("第%d行 api_key_detected_models[%d] 过长（最多 %d 字节）", lineNo, i, maxAPIKeyAllowedModelsJSONLength), true
+		}
 		if apiKeyModelScopeEmpty[i] && len(allowedModels) != 0 {
 			return nil, fmt.Sprintf("第%d行 api_key_model_scope_empty[%d] 要求 allowed_models 为空", lineNo, i), true
 		}
@@ -916,6 +993,7 @@ func (s *Server) parseChannelImportRow(
 			KeyIndex:        i,
 			APIKey:          key,
 			AllowedModels:   allowedModels,
+			DetectedModels:  detectedModels,
 			ModelScopeEmpty: apiKeyModelScopeEmpty[i],
 			Disabled:        apiKeyModelScopeEmpty[i],
 			KeyStrategy:     keyStrategy,
@@ -1261,6 +1339,58 @@ func buildCSVColumnIndex(header []string) map[string]int {
 		index[norm] = i
 	}
 	return index
+}
+
+// exportChannelModelPricing 把渠道模型价格序列化为 {模型名: 价格} JSON；没有价格时输出 "{}"。
+func exportChannelModelPricing(entries []model.ModelEntry) (string, error) {
+	pricing := make(map[string]*util.CustomModelPrice)
+	for _, entry := range entries {
+		if !entry.Pricing.IsEmpty() {
+			pricing[entry.Model] = entry.Pricing
+		}
+	}
+	if len(pricing) == 0 {
+		return "{}", nil
+	}
+	encoded, err := sonic.Marshal(pricing)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+// applyImportedModelPricing 解析 model_pricing 列并写入对应模型条目；键必须是本行 models 中的模型。
+func applyImportedModelPricing(entries []model.ModelEntry, raw string) error {
+	if raw == "" || raw == "{}" {
+		return nil
+	}
+	var byModel map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &byModel); err != nil {
+		return fmt.Errorf("JSON 无效: %w", err)
+	}
+	indexByModel := make(map[string]int, len(entries))
+	for i, entry := range entries {
+		indexByModel[entry.Model] = i
+	}
+	for modelName, rawPricing := range byModel {
+		index, ok := indexByModel[modelName]
+		if !ok {
+			return fmt.Errorf("模型 %q 不在 models 中", modelName)
+		}
+		decoder := json.NewDecoder(bytes.NewReader(rawPricing))
+		decoder.DisallowUnknownFields()
+		var pricing util.CustomModelPrice
+		if err := decoder.Decode(&pricing); err != nil {
+			return fmt.Errorf("模型 %q: %w", modelName, err)
+		}
+		entry := entries[index]
+		entry.Pricing = &pricing
+		if err := entry.Validate(); err != nil {
+			return fmt.Errorf("模型 %q: %w", modelName, err)
+		}
+		entries[index] = entry
+	}
+	return nil
 }
 
 // normalizeCSVHeader 规范化CSV列名

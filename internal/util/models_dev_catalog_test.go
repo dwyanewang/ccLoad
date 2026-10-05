@@ -15,6 +15,7 @@ func TestParseModelsDevCatalogNormalizesOfficialPrices(t *testing.T) {
 	now := time.Date(2026, 7, 10, 6, 0, 0, 0, time.UTC)
 	raw := validModelsDevFixture(t, "openai", "gpt-next", map[string]any{
 		"id":           "openai/gpt-next",
+		"family":       "gpt",
 		"release_date": "2026-07-09",
 		"last_updated": "2026-07-10",
 		"status":       "active",
@@ -39,7 +40,7 @@ func TestParseModelsDevCatalogNormalizesOfficialPrices(t *testing.T) {
 	if !ok || entry.Provider != "openai" {
 		t.Fatalf("entry = %#v", entry)
 	}
-	if entry.ReleaseDate != "2026-07-09" || entry.LastUpdated != "2026-07-10" || entry.Status != "active" || !reflect.DeepEqual(entry.OutputModalities, []string{"text"}) {
+	if entry.ReleaseDate != "2026-07-09" || entry.LastUpdated != "2026-07-10" || entry.Status != "active" || entry.Family != "gpt" || !reflect.DeepEqual(entry.OutputModalities, []string{"text"}) {
 		t.Fatalf("metadata = %#v", entry)
 	}
 	if entry.Pricing.InputPrice != 2.5 || entry.Pricing.OutputPrice != 15 || entry.Pricing.CacheReadPrice != 0.25 || !entry.Pricing.HasCacheReadPrice {
@@ -69,7 +70,32 @@ func TestParseModelsDevCatalogNormalizesOfficialPrices(t *testing.T) {
 	}
 }
 
-func TestParseModelsDevCatalogNonOpenAIContextTierDoesNotCountCacheRead(t *testing.T) {
+func TestParseModelsDevCatalogGoogleContextTierDoesNotCountCacheRead(t *testing.T) {
+	raw := validModelsDevFixture(t, "google", "gemini-next", map[string]any{
+		"cost": map[string]any{
+			"input": 3.0, "output": 15.0, "cache_read": 0.3,
+			"tiers": []any{map[string]any{
+				"input": 6.0, "output": 22.5, "cache_read": 0.6,
+				"tier": map[string]any{"type": "context", "size": 200000},
+			}},
+		},
+	})
+
+	snapshot, err := util.ParseModelsDevCatalog(bytes.NewReader(raw), "", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := snapshot.Model("gemini-next")
+	if !ok {
+		t.Fatalf("entry not found: %#v", snapshot)
+	}
+	if entry.Pricing.CacheReadCountsTowardTier {
+		t.Fatalf("Gemini context tier counted cache reads: %#v", entry.Pricing)
+	}
+}
+
+// Anthropic 长上下文按 input + cache_read + cache_creation 判定 200K：目录同步后仍须如此。
+func TestParseModelsDevCatalogAnthropicContextTierCountsPromptCache(t *testing.T) {
 	raw := validModelsDevFixture(t, "anthropic", "claude-next", map[string]any{
 		"cost": map[string]any{
 			"input": 3.0, "output": 15.0, "cache_read": 0.3,
@@ -84,12 +110,15 @@ func TestParseModelsDevCatalogNonOpenAIContextTierDoesNotCountCacheRead(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, ok := snapshot.Model("claude-next")
-	if !ok {
-		t.Fatalf("entry not found: %#v", snapshot)
+	t.Cleanup(util.RestoreEmbeddedModelCatalog)
+	if err := util.InstallModelCatalog(snapshot, "models.dev"); err != nil {
+		t.Fatal(err)
 	}
-	if entry.Pricing.CacheReadCountsTowardTier {
-		t.Fatalf("non-OpenAI context tier counted cache reads: %#v", entry.Pricing)
+	// 1K 非缓存输入 + 150K 缓存读 + 60K 缓存写 = 211K > 200K，整单走高档价。
+	got := util.CalculateCostDetailed("claude-next", 1_000, 1_000, 150_000, 60_000, 0)
+	want := (1_000*6.0 + 1_000*22.5 + 150_000*0.6 + 60_000*6.0*1.25) / 1_000_000
+	if math.Abs(got-want) > 0.000001 {
+		t.Fatalf("installed Anthropic tiered cost = %v, want %v", got, want)
 	}
 }
 

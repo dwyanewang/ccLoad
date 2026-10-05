@@ -477,13 +477,12 @@ function buildLogModelDisplay(model, actualModel, thinkingEffort, reasoningToken
     return '<span style="color: var(--neutral-500);">-</span>';
   }
 
-  const redirected = actualModel && actualModel !== model && !isPrefixOrSuffixVariant(model, actualModel);
+  const redirected = !window.shouldHideChannels?.() && actualModel && actualModel !== model && !isPrefixOrSuffixVariant(model, actualModel);
   const effort = normalizeThinkingEffortDisplay(thinkingEffort);
   const tokens = normalizeReasoningTokens(reasoningTokens);
   const classes = ['model-tag'];
   const titleParts = [];
   if (redirected) {
-    classes.push('model-redirected');
     titleParts.push(`请求模型: ${escapeHtml(model)}`);
     titleParts.push(`实际模型: ${escapeHtml(actualModel)}`);
   }
@@ -496,14 +495,14 @@ function buildLogModelDisplay(model, actualModel, thinkingEffort, reasoningToken
     titleParts.push(`思考/推理Token: ${tokens}`);
   }
   const title = titleParts.length > 0 ? ` title="${titleParts.join('&#10;')}"` : '';
-  const redirectBadge = redirected ? '<sup class="redirect-badge">↪</sup>' : '';
-  const badgeHtml = redirectBadge || effort || tokens > 0
-    ? `<span class="model-badges">${redirectBadge}${buildThinkingEffortBadge(effort, tokens)}</span>`
+  const badgeHtml = effort || tokens > 0
+    ? `<span class="model-badges">${buildThinkingEffortBadge(effort, tokens)}</span>`
     : '';
 
   return `<span class="model-display">
       <span class="${classes.join(' ')}"${title}>
         <span class="model-text">${escapeHtml(model)}</span>
+        ${redirected ? `<span class="model-actual"><span class="model-actual-arrow" aria-hidden="true">↳</span><span class="model-text">${escapeHtml(actualModel)}</span></span>` : ''}
       </span>
       ${badgeHtml}
     </span>`;
@@ -557,6 +556,8 @@ function buildLogTokenDescDisplay(label) {
 
 function renderLogSourceBadge(logSource) {
   switch (logSource) {
+    case 'jev':
+      return '<span class="log-source-badge log-source-badge--manual">Jev</span>';
     case 'scheduled_check':
       return `<span class="log-source-badge log-source-badge--scheduled">${escapeHtml(t('logs.sourceScheduledCheckBadge'))}</span>`;
     case 'manual_test':
@@ -565,6 +566,8 @@ function renderLogSourceBadge(logSource) {
       return `<span class="log-source-badge log-source-badge--manual">${escapeHtml(t('logs.sourceManualChatBadge'))}</span>`;
     case 'checkin':
       return `<span class="log-source-badge log-source-badge--checkin">${escapeHtml(t('logs.sourceCheckinBadge'))}</span>`;
+    case 'count_tokens':
+      return `<span class="log-source-badge log-source-badge--scheduled">${escapeHtml(t('logs.sourceCountTokensBadge'))}</span>`;
     default:
       return '';
   }
@@ -572,12 +575,23 @@ function renderLogSourceBadge(logSource) {
 
 function canInspectDebugLog(entry) {
   const isTokenSession = typeof window.isAPITokenRole === 'function' && window.isAPITokenRole();
-  return !isTokenSession && Number(entry?.channel_id) > 0;
+  // Jev 审计与 count_tokens 本地估算没有渠道，但同样可能带 debug 记录。
+  const isChannelless = entry?.log_source === 'jev' || entry?.log_source === 'count_tokens';
+  return !isTokenSession && (Number(entry?.channel_id) > 0 || (isChannelless && Number(entry?.id) > 0));
 }
 
 function buildLogMessageContent(entry) {
   const sourceBadge = renderLogSourceBadge(entry.log_source || 'proxy');
-  const messageText = escapeHtml(entry.message || '');
+  let messageText = entry.message || '';
+  if (entry.log_source === 'jev') {
+    try {
+      const audit = JSON.parse(messageText);
+      const adopted = Object.entries(audit.adopted || {}).map(([key, value]) => `${key}=${value}`).join(', ');
+      const fallback = Object.entries(audit.fallback || {}).map(([key, value]) => `fallback.${key}=${value}`).join(', ');
+      messageText = [audit.call_id && `call_id=${audit.call_id}`, adopted, fallback].filter(Boolean).join(', ');
+    } catch (_) { /* keep the stored message when old audit data is not JSON */ }
+  }
+  messageText = escapeHtml(messageText);
   if (!sourceBadge && !messageText) {
     return '';
   }
@@ -1045,7 +1059,8 @@ function getTableColspan() {
   const table = document.getElementById('tbody')?.closest('table')
     || document.querySelector('.logs-table');
   const headerCells = table ? table.querySelectorAll('thead th') : [];
-  return headerCells.length || 16; // fallback到16列（日志页默认列数）
+  const visibleCount = Array.from(headerCells).filter(cell => !window.getComputedStyle || window.getComputedStyle(cell).display !== 'none').length;
+  return visibleCount || 16; // fallback到16列（日志页默认列数）
 }
 
 function formatCacheUtilRate(inputTokens, cacheReadTokens, cacheCreationTokens) {

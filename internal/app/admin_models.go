@@ -2,17 +2,20 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"ccLoad/internal/codebuddyauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cursorauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
@@ -29,6 +32,14 @@ var fetchModelsHTTPStatusPattern = regexp.MustCompile(`HTTP\s+(\d{3})`)
 // but cannot hold an admin request indefinitely when keys or endpoints hang.
 const batchModelRefreshTimeout = 30 * time.Second
 
+type modelFetchKeyMode int
+
+const (
+	modelFetchFirstAvailableKey modelFetchKeyMode = iota
+	modelFetchPerAvailableKey
+	modelFetchAllKeys
+)
+
 // ============================================================
 // Admin API: 获取渠道可用模型列表
 // ============================================================
@@ -38,6 +49,7 @@ type FetchModelsRequest struct {
 	URLs                   model.ChannelURLs `json:"urls" binding:"required,min=1"`
 	Protocol               string            `json:"protocol,omitempty"`
 	APIKeys                []string          `json:"api_keys" binding:"required,min=1"`
+	ProxyURL               string            `json:"proxy_url,omitempty"`
 	PerKey                 bool              `json:"per_key,omitempty"`
 	LowercaseModels        bool              `json:"lowercase_models,omitempty"`
 	StripModelSourcePrefix bool              `json:"strip_model_source_prefix,omitempty"`
@@ -121,7 +133,11 @@ func (s *Server) HandleFetchModels(c *gin.Context) {
 			return
 		}
 	}
-	response, err := s.fetchModelsForChannel(c.Request.Context(), channel, c.Query("protocol"), perKey)
+	keyMode := modelFetchFirstAvailableKey
+	if perKey {
+		keyMode = modelFetchPerAvailableKey
+	}
+	response, err := s.fetchModelsForChannel(c.Request.Context(), channel, c.Query("protocol"), keyMode)
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
 		RespondErrorMsg(c, http.StatusOK, err.Error())
@@ -163,12 +179,18 @@ func (s *Server) HandleFetchModelsPreview(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "urls无效: "+err.Error())
 		return
 	}
+	req.ProxyURL, err = normalizeChannelProxyURL(req.ProxyURL)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	var response *FetchModelsResponse
+	client := s.modelDiscoveryClient(&model.Config{ProxyURL: req.ProxyURL})
 	if req.PerKey {
-		response, err = s.fetchModelsPerKeyWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, perKeyAPIKeys)
+		response, err = s.fetchModelsPerKeyWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, perKeyAPIKeys, client)
 	} else {
-		response, err = s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKeys)
+		response, err = s.fetchModelsWithURLFallback(c.Request.Context(), 0, req.URLs, req.Protocol, req.APIKeys, client)
 	}
 	if err != nil {
 		// [INFO] 修复：统一返回200，通过success字段区分成功/失败（上游错误是预期内的）
@@ -241,7 +263,11 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 		}
 		item.ChannelName = cfg.Name
 
-		resp, err := s.fetchModelsForChannel(fetchCtx, cfg, overrideProtocol, true)
+		keyMode := modelFetchPerAvailableKey
+		if mode == "replace" {
+			keyMode = modelFetchAllKeys
+		}
+		resp, err := s.fetchModelsForChannel(fetchCtx, cfg, overrideProtocol, keyMode)
 		if err != nil {
 			item.Status = "failed"
 			item.Error = err.Error()
@@ -263,79 +289,22 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 			continue
 		}
 		item.Fetched = len(fetched)
-
-		modelEntriesChanged := false
-		if (req.LowercaseModels || req.StripModelSourcePrefix) && mode == "merge" {
-			normalizedExisting := normalizeModelEntriesForSave(cfg.ModelEntries, normalization)
-			modelEntriesChanged = !modelEntriesEqual(cfg.ModelEntries, normalizedExisting)
-			cfg.ModelEntries = normalizedExisting
+		item, persisted := s.applyFetchedModels(ctx, item, fetched, resp.KeyModels, mode, normalization)
+		if partialKeyFailure {
+			item.Warning = "部分 API Key 模型探测失败，失败 Key 保留原范围，其已有模型仍留在渠道中"
 		}
-
-		switch mode {
-		case "replace":
-			if partialKeyFailure {
-				item.Warning = "部分 API Key 模型探测失败，已使用成功 Key 的模型结果覆盖"
-			}
-			removed, hasChange := replaceModelEntries(cfg, fetched, normalization)
-			item.Removed = removed
-			item.Total = len(cfg.ModelEntries)
-			modelEntriesChanged = hasChange
-		default: // merge
-			added, hasChange := mergeModelEntries(cfg, fetched)
-			item.Added = added
-			item.Total = len(cfg.ModelEntries)
-			modelEntriesChanged = modelEntriesChanged || hasChange
-		}
-
-		scheduledCheckChanged := reconcileScheduledCheckModel(cfg, normalization)
-		var scopeUpdates map[int]model.APIKeyModelScope
-		if mode == "replace" && cfg.GetAuthType() == model.AuthTypeAPIKey {
-			keys, keyErr := s.store.GetAPIKeys(ctx, channelID)
-			if keyErr != nil {
-				item.Status = "failed"
-				item.Error = "读取 API Key 失败: " + keyErr.Error()
-				failed++
-				results = append(results, item)
-				continue
-			}
-			scopeUpdates = buildFetchedAPIKeyModelScopes(keys, cfg.ModelEntries, resp.KeyModels)
-		}
-		scopeChanged := len(scopeUpdates) > 0
-		configChanged := modelEntriesChanged || scheduledCheckChanged
-		if !configChanged && !scopeChanged {
-			item.Status = "unchanged"
+		switch item.Status {
+		case "updated":
+			updated++
+		case "unchanged":
 			unchanged++
-			results = append(results, item)
-			continue
+		default:
+			failed++
 		}
-
-		if configChanged {
-			if _, err := s.store.UpdateConfig(ctx, channelID, cfg); err != nil {
-				item.Status = "failed"
-				item.Error = "保存模型失败: " + err.Error()
-				failed++
-				results = append(results, item)
-				continue
-			}
+		if persisted {
+			changed = true
+			changedChannelIDs = append(changedChannelIDs, channelID)
 		}
-		if scopeChanged {
-			if err := s.store.UpdateAPIKeyModelScopes(ctx, channelID, scopeUpdates); err != nil {
-				item.Status = "failed"
-				item.Error = "保存 API Key 模型范围失败: " + err.Error()
-				failed++
-				if configChanged {
-					changed = true
-					changedChannelIDs = append(changedChannelIDs, channelID)
-				}
-				results = append(results, item)
-				continue
-			}
-		}
-
-		item.Status = "updated"
-		updated++
-		changed = true
-		changedChannelIDs = append(changedChannelIDs, channelID)
 		results = append(results, item)
 	}
 
@@ -356,6 +325,186 @@ func (s *Server) HandleBatchRefreshModels(c *gin.Context) {
 	})
 }
 
+// modelsRetainedFromFailedProbes 把探测失败的 Key 仍被允许的渠道模型留在覆盖结果里。
+// 失败不代表这些模型消失；丢掉它们会让只有该 Key 能提供的模型从渠道中被删掉。
+// 不受限的失败 Key 可能提供任意渠道模型，此时保留全部现有模型。
+// 保留条目与 fetched 走同一归一化；同名条目指向不同上游时拒绝覆盖，避免失败 Key 被错误重定向。
+func modelsRetainedFromFailedProbes(
+	keys []*model.APIKey,
+	channelModels []model.ModelEntry,
+	alreadyFetched []model.ModelEntry,
+	keyModels []FetchKeyModelsItem,
+	normalization modelNormalizationOptions,
+) ([]model.ModelEntry, error) {
+	failed := make(map[int]struct{})
+	for _, result := range keyModels {
+		if strings.TrimSpace(result.Error) != "" {
+			failed[result.KeyIndex] = struct{}{}
+		}
+	}
+	if len(failed) == 0 {
+		return nil, nil
+	}
+	allowed := make(map[string]struct{})
+	keepAll := false
+	for _, key := range keys {
+		if key == nil || key.ModelScopeEmpty {
+			continue
+		}
+		if _, ok := failed[key.KeyIndex]; !ok {
+			continue
+		}
+		if len(key.AllowedModels) == 0 {
+			keepAll = true
+			break
+		}
+		for _, name := range key.AllowedModels {
+			allowed[strings.ToLower(strings.TrimSpace(model.RoutingModelName(name)))] = struct{}{}
+		}
+	}
+	candidates := make([]model.ModelEntry, 0, len(channelModels))
+	for _, entry := range channelModels {
+		name := strings.ToLower(model.RoutingModelName(entry.Model))
+		if _, ok := allowed[name]; keepAll || ok {
+			candidates = append(candidates, entry)
+		}
+	}
+	seen := make(map[model.ModelEntryIdentity]struct{}, len(alreadyFetched))
+	for _, entry := range alreadyFetched {
+		seen[entry.Identity()] = struct{}{}
+	}
+	retained := make([]model.ModelEntry, 0, len(candidates))
+	for _, entry := range normalizeExistingModelEntriesForRefresh(candidates, normalization) {
+		identity := entry.Identity()
+		if _, exists := seen[identity]; exists {
+			continue
+		}
+		seen[identity] = struct{}{}
+		retained = append(retained, entry)
+	}
+	// Validate the final replacement, including preserved multi-target groups.
+	previous := &model.Config{ModelEntries: channelModels}
+	final := previous.Clone()
+	combined := append(model.CloneModelEntries(alreadyFetched), retained...)
+	replaceModelEntries(final, combined, normalization)
+	candidateConfig := &model.Config{ModelEntries: candidates}
+	names := candidateConfig.GetModels()
+	upstreams := func(cfg *model.Config, name string) []string {
+		entries := cfg.EnabledModelEntries(name)
+		result := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			result = append(result, resolveActualModel(cfg, modelRoutingSelection{logicalModel: name, entry: entry}))
+		}
+		slices.Sort(result)
+		return slices.Compact(result)
+	}
+	groupCounts := make(map[string]int, len(channelModels))
+	for _, entry := range channelModels {
+		groupCounts[strings.ToLower(entry.Model)]++
+	}
+	for _, name := range names {
+		alias, _ := normalizeModelAlias(name, normalization)
+		// Existing multi-target groups retain their names, including disabled rows.
+		if groupCounts[strings.ToLower(name)] > 1 {
+			alias = name
+		}
+		before, after := upstreams(previous, name), upstreams(final, alias)
+		if !slices.Equal(before, after) {
+			return nil, fmt.Errorf("模型刷新冲突: %q 对应不同上游模型 %q 和 %q", alias, after, before)
+		}
+	}
+	return retained, nil
+}
+
+func (s *Server) applyFetchedModels(
+	ctx context.Context, item BatchRefreshModelsItem, fetched []model.ModelEntry,
+	keyModels []FetchKeyModelsItem, mode string, normalization modelNormalizationOptions,
+) (BatchRefreshModelsItem, bool) {
+	for {
+		cfg, err := s.store.GetConfig(ctx, item.ChannelID)
+		if err != nil {
+			item.Status, item.Error = "failed", "读取渠道失败: "+err.Error()
+			return item, false
+		}
+		expected := cfg.Clone()
+		var keys []*model.APIKey
+		if cfg.GetAuthType() == model.AuthTypeAPIKey &&
+			(mode == "replace" || normalization.lowercaseModels || normalization.stripModelSourcePrefix) {
+			keys, err = s.store.GetAPIKeys(ctx, item.ChannelID)
+			if err != nil {
+				item.Status, item.Error = "failed", "读取 API Key 失败: "+err.Error()
+				return item, false
+			}
+		}
+		modelEntriesChanged := false
+		if (normalization.lowercaseModels || normalization.stripModelSourcePrefix) && mode == "merge" {
+			normalizedExisting := normalizeExistingModelEntriesForRefresh(cfg.ModelEntries, normalization)
+			modelEntriesChanged = !modelEntriesEqual(cfg.ModelEntries, normalizedExisting)
+			cfg.ModelEntries = normalizedExisting
+		}
+		if mode == "replace" {
+			replacement := model.CloneModelEntries(fetched)
+			retained, retainErr := modelsRetainedFromFailedProbes(keys, cfg.ModelEntries, replacement, keyModels, normalization)
+			if retainErr != nil {
+				item.Status, item.Error = "failed", retainErr.Error()
+				return item, false
+			}
+			replacement = append(replacement, retained...)
+			item.Removed, modelEntriesChanged = replaceModelEntries(cfg, replacement, normalization)
+		} else {
+			var added bool
+			item.Added, added = mergeModelEntries(cfg, fetched)
+			modelEntriesChanged = modelEntriesChanged || added
+		}
+		item.Total = len(cfg.ModelEntries)
+		scheduledCheckChanged := reconcileScheduledCheckModel(cfg, normalization)
+		scopeUpdates := s.remapNormalizedAPIKeyScopes(keys, expected, cfg, normalization)
+		if mode == "replace" {
+			for _, result := range keyModels {
+				if strings.TrimSpace(result.Error) == "" {
+					delete(scopeUpdates, result.KeyIndex)
+				}
+			}
+			fetchedScopes, scopeErr := buildFetchedAPIKeyModelScopes(keys, cfg.ModelEntries, keyModels)
+			if scopeErr != nil {
+				item.Status, item.Error = "failed", scopeErr.Error()
+				return item, false
+			}
+			for index, scope := range fetchedScopes {
+				if scopeUpdates == nil {
+					scopeUpdates = make(map[int]model.APIKeyModelScope)
+				}
+				scopeUpdates[index] = scope
+			}
+		}
+		configChanged := modelEntriesChanged || scheduledCheckChanged
+		if !configChanged && len(scopeUpdates) == 0 {
+			item.Status = "unchanged"
+			return item, false
+		}
+		if configChanged {
+			matched, saveErr := s.store.UpdateModelStateIfSnapshotMatches(
+				ctx, expected, cfg.ModelEntries, cfg.ScheduledCheckModel, nil,
+			)
+			if saveErr != nil {
+				item.Status, item.Error = "failed", "保存模型失败: "+saveErr.Error()
+				return item, false
+			}
+			if !matched {
+				continue
+			}
+		}
+		if len(scopeUpdates) > 0 {
+			if err := s.store.UpdateAPIKeyModelScopes(ctx, item.ChannelID, scopeUpdates); err != nil {
+				item.Status, item.Error = "failed", "保存 API Key 模型范围失败: "+err.Error()
+				return item, configChanged
+			}
+		}
+		item.Status = "updated"
+		return item, true
+	}
+}
+
 func fetchModelsResponseHasKeyErrors(response *FetchModelsResponse) bool {
 	if response == nil {
 		return true
@@ -368,15 +517,149 @@ func fetchModelsResponseHasKeyErrors(response *FetchModelsResponse) bool {
 	return false
 }
 
+// remapNormalizedAPIKeyScopes keeps restricted Keys attached to existing
+// logical models when batch normalization changes their names. A target is
+// safe only when the final row still points at the same upstream model.
+func (s *Server) remapNormalizedAPIKeyScopes(
+	keys []*model.APIKey,
+	previousConfig, currentConfig *model.Config,
+	options modelNormalizationOptions,
+) map[int]model.APIKeyModelScope {
+	if !options.lowercaseModels && !options.stripModelSourcePrefix {
+		return nil
+	}
+	previous, current := previousConfig.ModelEntries, currentConfig.ModelEntries
+	currentByName := make(map[string][]model.ModelEntry, len(current))
+	configured := make(map[string]struct{}, len(current))
+	for _, entry := range current {
+		currentByName[strings.ToLower(entry.Model)] = append(currentByName[strings.ToLower(entry.Model)], entry)
+		name := strings.ToLower(model.RoutingModelName(entry.Model))
+		configured[name] = struct{}{}
+	}
+	upstreamModel := func(entry model.ModelEntry) string {
+		name := entry.RedirectModel
+		if name == "" {
+			name = entry.Model
+		}
+		return model.RoutingModelName(name)
+	}
+	renamed := make(map[string]string, len(previous))
+	for _, entry := range previous {
+		alias, _ := normalizeModelAlias(entry.Model, options)
+		if alias == entry.Model {
+			continue
+		}
+		unchanged := slices.ContainsFunc(currentByName[strings.ToLower(entry.Model)], func(candidate model.ModelEntry) bool {
+			return candidate.Model == entry.Model && upstreamModel(entry) == upstreamModel(candidate)
+		})
+		if unchanged {
+			continue
+		}
+		matches := currentByName[strings.ToLower(alias)]
+		index := slices.IndexFunc(matches, func(candidate model.ModelEntry) bool {
+			return upstreamModel(entry) == upstreamModel(candidate)
+		})
+		if index < 0 {
+			continue
+		}
+		after := matches[index]
+		oldName := strings.ToLower(model.RoutingModelName(entry.Model))
+		target := model.RoutingModelName(after.Model)
+		if existing, exists := renamed[oldName]; exists && !strings.EqualFold(existing, target) {
+			renamed[oldName] = ""
+		} else if !exists {
+			renamed[oldName] = target
+		}
+	}
+	if len(renamed) == 0 {
+		return nil
+	}
+
+	upstreams := func(cfg *model.Config, entry model.ModelEntry) []string {
+		selected := modelRoutingSelection{logicalModel: entry.Model, entry: entry}
+		return []string{
+			s.resolveFinalUpstreamModel(cfg, selected, string(protocol.OpenAI)),
+			s.resolveFinalUpstreamModel(cfg, selected, string(protocol.Gemini)),
+		}
+	}
+	updates := make(map[int]model.APIKeyModelScope)
+	for _, key := range keys {
+		if key == nil || key.ModelScopeEmpty || len(key.AllowedModels) == 0 {
+			continue
+		}
+		allowed := make([]string, 0, len(key.AllowedModels))
+		changed := false
+		for _, name := range key.AllowedModels {
+			identity := strings.ToLower(strings.TrimSpace(model.RoutingModelName(name)))
+			if replacement := renamed[identity]; replacement != "" {
+				changed = changed || name != replacement
+				name = replacement
+				identity = strings.ToLower(model.RoutingModelName(name))
+			}
+			if _, exists := configured[identity]; exists {
+				allowed = append(allowed, name)
+			}
+		}
+		// A renamed group may now contain targets that this Key's old logical
+		// scope excluded. Preserve that boundary even for an unchanged group
+		// name when another normalized group merges into it.
+		oldTargets := make([]string, 0, len(previous))
+		for _, entry := range previous {
+			if !key.AllowsModel(entry.Model) {
+				continue
+			}
+			for _, actual := range upstreams(previousConfig, entry) {
+				if key.AllowsUpstreamModel(actual) {
+					oldTargets = append(oldTargets, actual)
+				}
+			}
+		}
+		detected := slices.Clone(key.DetectedModels)
+		candidateKey := *key
+		candidateKey.AllowedModels = allowed
+		for _, entry := range current {
+			if !candidateKey.AllowsModel(entry.Model) {
+				continue
+			}
+			for _, actual := range upstreams(currentConfig, entry) {
+				if key.AllowsUpstreamModel(actual) && !slices.ContainsFunc(oldTargets, func(old string) bool {
+					return strings.EqualFold(old, actual)
+				}) {
+					detected = normalizeDetectedModels(oldTargets)
+					changed = true
+					break
+				}
+			}
+		}
+		if !changed {
+			continue
+		}
+		scopeEmpty := len(allowed) == 0 || len(oldTargets) == 0
+		if scopeEmpty {
+			allowed = nil
+		}
+		scope := model.APIKeyModelScope{
+			AllowedModels: allowed, DetectedModels: detected, ModelScopeEmpty: scopeEmpty,
+			Disabled: key.Disabled || scopeEmpty,
+		}
+		if !apiKeyModelScopeEqual(key, scope) {
+			updates[key.KeyIndex] = scope
+		}
+	}
+	return updates
+}
+
 // buildFetchedAPIKeyModelScopes converts per-Key discovery results into the
-// persisted scope state. A successful Key with no configured-model match is
-// explicitly marked empty; an empty allowlist without ModelScopeEmpty means
-// unrestricted and would silently route that Key to every model.
+// persisted scope state. A probe error leaves the Key unchanged: a 429 or
+// timeout must not wipe a cooling Key's scope. A successful Key with no
+// configured-model match is explicitly marked empty; an empty allowlist
+// without ModelScopeEmpty means unrestricted and would silently route that
+// Key to every model.
 func buildFetchedAPIKeyModelScopes(
 	keys []*model.APIKey,
 	modelEntries []model.ModelEntry,
 	keyModels []FetchKeyModelsItem,
-) map[int]model.APIKeyModelScope {
+) (map[int]model.APIKeyModelScope, error) {
 	keysByIndex := make(map[int]*model.APIKey, len(keys))
 	for _, key := range keys {
 		if key != nil {
@@ -387,21 +670,29 @@ func buildFetchedAPIKeyModelScopes(
 	updates := make(map[int]model.APIKeyModelScope)
 	for _, result := range keyModels {
 		key := keysByIndex[result.KeyIndex]
-		if key == nil {
+		if key == nil || strings.TrimSpace(result.Error) != "" {
 			continue
 		}
 
 		allowedModels := []string(nil)
-		scopeEmpty := strings.TrimSpace(result.Error) != "" || len(result.Models) == 0
+		detectedModels := []string(nil)
+		scopeEmpty := len(result.Models) == 0
 		if !scopeEmpty {
-			allowedModels = detectedChannelModelNames(modelEntries, result.Models)
+			allowedModels, detectedModels = detectedChannelModelScope(modelEntries, result.Models)
 			scopeEmpty = len(allowedModels) == 0
 		}
 		if scopeEmpty {
 			allowedModels = nil
 		}
+		if encoded, err := json.Marshal(detectedModels); err != nil || len(encoded) > maxAPIKeyAllowedModelsJSONLength {
+			return nil, fmt.Errorf("api key %d detected_models is too long (max %d bytes)", key.KeyIndex, maxAPIKeyAllowedModelsJSONLength)
+		}
+		if encoded, err := json.Marshal(allowedModels); err != nil || len(encoded) > maxAPIKeyAllowedModelsJSONLength {
+			return nil, fmt.Errorf("api key %d allowed_models is too long (max %d bytes)", key.KeyIndex, maxAPIKeyAllowedModelsJSONLength)
+		}
 		scope := model.APIKeyModelScope{
 			AllowedModels:   allowedModels,
+			DetectedModels:  detectedModels,
 			ModelScopeEmpty: scopeEmpty,
 			// A manually disabled Key is never probed, but preserve that
 			// state if a caller supplies one in a future fetch path.
@@ -412,12 +703,12 @@ func buildFetchedAPIKeyModelScopes(
 		}
 		updates[result.KeyIndex] = scope
 	}
-	return updates
+	return updates, nil
 }
 
 func apiKeyModelScopeEqual(key *model.APIKey, scope model.APIKeyModelScope) bool {
 	if key == nil || key.ModelScopeEmpty != scope.ModelScopeEmpty || key.Disabled != scope.Disabled ||
-		len(key.AllowedModels) != len(scope.AllowedModels) {
+		!slices.Equal(key.DetectedModels, scope.DetectedModels) || len(key.AllowedModels) != len(scope.AllowedModels) {
 		return false
 	}
 	for i := range key.AllowedModels {
@@ -428,39 +719,36 @@ func apiKeyModelScopeEqual(key *model.APIKey, scope model.APIKeyModelScope) bool
 	return true
 }
 
-func detectedChannelModelNames(modelRows, fetched []model.ModelEntry) []string {
-	detectedNames := make([]string, 0, len(fetched)*2)
+func detectedChannelModelScope(modelRows, fetched []model.ModelEntry) ([]string, []string) {
 	detected := make(map[string]struct{}, len(fetched)*2)
 	for _, entry := range fetched {
-		for _, value := range []string{entry.Model, entry.RedirectModel} {
-			name := strings.TrimSpace(value)
-			key := strings.ToLower(name)
-			if name == "" {
-				continue
-			}
-			if _, exists := detected[key]; exists {
-				continue
-			}
-			detected[key] = struct{}{}
-			detectedNames = append(detectedNames, name)
+		value := entry.RedirectModel
+		if value == "" {
+			value = entry.Model
+		}
+		if name := model.RoutingModelName(strings.TrimSpace(value)); name != "" {
+			detected[strings.ToLower(name)] = struct{}{}
 		}
 	}
 
 	matched := make([]string, 0, len(modelRows))
+	actualModels := make([]string, 0, len(modelRows))
 	seen := make(map[string]struct{}, len(modelRows))
+	seenActual := make(map[string]struct{}, len(modelRows))
+	lookup := &model.Config{ModelEntries: modelRows}
 	for _, row := range modelRows {
 		logicalModel := strings.TrimSpace(row.Model)
-		if logicalModel == "" || logicalModel == "*" {
+		if logicalModel == "" {
 			continue
 		}
-		upstreamModel := strings.TrimSpace(row.RedirectModel)
-		if upstreamModel == "" {
-			upstreamModel = logicalModel
+		actual := resolveActualModel(lookup, modelRoutingSelection{logicalModel: logicalModel, entry: row})
+		if _, ok := detected[strings.ToLower(actual)]; !ok {
+			continue
 		}
-		if _, ok := detected[strings.ToLower(logicalModel)]; !ok {
-			if _, ok := detected[strings.ToLower(upstreamModel)]; !ok {
-				continue
-			}
+		actualKey := strings.ToLower(actual)
+		if _, exists := seenActual[actualKey]; !exists {
+			seenActual[actualKey] = struct{}{}
+			actualModels = append(actualModels, actual)
 		}
 		key := strings.ToLower(logicalModel)
 		if _, exists := seen[key]; exists {
@@ -469,20 +757,12 @@ func detectedChannelModelNames(modelRows, fetched []model.ModelEntry) []string {
 		seen[key] = struct{}{}
 		matched = append(matched, logicalModel)
 	}
-	if len(matched) > 0 {
-		return matched
-	}
-	for _, row := range modelRows {
-		if strings.TrimSpace(row.Model) == "*" {
-			return detectedNames
-		}
-	}
-	return nil
+	return matched, actualModels
 }
 
-// availableModelFetchAPIKeys 选出可用于只读模型探测的 Key。
+// availableModelFetchAPIKeys 选出单结果模型探测（逐个尝试、首个成功即返回）的候选 Key。
 // 手动禁用的 Key 始终排除；作用域被裁剪空而自动禁用的 Key（model_scope_empty=true）
-// 凭据仍有效，降级参与探测，使其分组模型能回到并集。正常可用 Key 优先。
+// 凭据仍有效，降级作为后备。正常可用 Key 优先，全部冷却时只取最早恢复的一个。
 func availableModelFetchAPIKeys(keys []*model.APIKey, now time.Time) []*model.APIKey {
 	available := make([]*model.APIKey, 0, len(keys))
 	scopeEmpty := make([]*model.APIKey, 0, len(keys))
@@ -517,6 +797,26 @@ func availableModelFetchAPIKeys(keys []*model.APIKey, now time.Time) []*model.AP
 	return scopeEmpty
 }
 
+// modelScopeProbeAPIKeys 选出逐 Key 模型探测的 Key。探测结果会写回每个 Key 的作用域，
+// 覆盖刷新还以结果并集删除渠道模型，所以除手动禁用外的 Key 都必须参与：冷却只影响路由，
+// 跳过冷却 Key 会让它的作用域停留在旧值，且只有它能提供的模型被删掉。
+// 可路由的 Key 先探测，批量刷新的共享超时不会先耗在冷却或作用域为空的 Key 上。
+func modelScopeProbeAPIKeys(keys []*model.APIKey, now time.Time) []*model.APIKey {
+	ready := make([]*model.APIKey, 0, len(keys))
+	deferred := make([]*model.APIKey, 0, len(keys))
+	for _, key := range keys {
+		if key == nil || strings.TrimSpace(key.APIKey) == "" || (key.Disabled && !key.ModelScopeEmpty) {
+			continue
+		}
+		if key.Disabled || key.IsCoolingDown(now) {
+			deferred = append(deferred, key)
+			continue
+		}
+		ready = append(ready, key)
+	}
+	return append(ready, deferred...)
+}
+
 func availableModelFetchKeys(keys []*model.APIKey, now time.Time) []string {
 	available := availableModelFetchAPIKeys(keys, now)
 	apiKeys := make([]string, 0, len(available))
@@ -547,7 +847,7 @@ func (s *Server) fetchModelsForChannel(
 	ctx context.Context,
 	cfg *model.Config,
 	overrideProtocol string,
-	perKey bool,
+	keyMode modelFetchKeyMode,
 ) (*FetchModelsResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("渠道不存在")
@@ -583,18 +883,24 @@ func (s *Server) fetchModelsForChannel(
 	if err != nil {
 		return nil, fmt.Errorf("该渠道没有可用的API Key")
 	}
-	if perKey {
-		availableKeys := availableModelFetchAPIKeys(keys, time.Now())
-		if len(availableKeys) == 0 {
+	client := s.modelDiscoveryClient(cfg)
+	if keyMode != modelFetchFirstAvailableKey {
+		var probeKeys []*model.APIKey
+		if keyMode == modelFetchAllKeys {
+			probeKeys = modelScopeProbeAPIKeys(keys, time.Now())
+		} else {
+			probeKeys = availableModelFetchAPIKeys(keys, time.Now())
+		}
+		if len(probeKeys) == 0 {
 			return nil, fmt.Errorf("该渠道没有可用的API Key")
 		}
-		return s.fetchModelsPerKeyWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, availableKeys)
+		return s.fetchModelsPerKeyWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, probeKeys, client)
 	}
 	apiKeys := availableModelFetchKeys(keys, time.Now())
 	if len(apiKeys) == 0 {
 		return nil, fmt.Errorf("该渠道没有可用的API Key")
 	}
-	return s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKeys)
+	return s.fetchModelsWithURLFallback(ctx, cfg.ID, cfg.URLs, overrideProtocol, apiKeys, client)
 }
 
 // OAuth 模型目录由系统生成，不能把上游或静态表的偶然顺序当成展示顺序。
@@ -730,7 +1036,7 @@ func (s *Server) fetchZAIOAuthModels(
 	if err != nil {
 		return nil, fmt.Errorf("模型发现: 解析 Z.ai 凭证失败: %w", err)
 	}
-	if live, listErr := s.zaiCodingPlanModels(ctx, credential.APIKey); listErr != nil {
+	if live, listErr := s.zaiCodingPlanModels(ctx, cfg, credential.APIKey); listErr != nil {
 		log.Printf("[WARN] Z.ai 模型目录不可用，回退内置列表 (channel=%d): %v", cfg.ID, listErr)
 	} else {
 		names, source = live, "api"
@@ -756,16 +1062,18 @@ func (s *Server) fetchZAIOAuthModels(
 // zaiCodingPlanModels resolves the Coding Plan lineup, newest source first:
 // the account catalog (authoritative), then models.dev (keyless, tracks the
 // plan without a ccLoad release), and only then the built-in lineup.
-func (s *Server) zaiCodingPlanModels(ctx context.Context, apiKey string) ([]string, error) {
+func (s *Server) zaiCodingPlanModels(ctx context.Context, cfg *model.Config, apiKey string) ([]string, error) {
 	if s == nil || s.zaiService == nil {
 		return nil, errors.New("z.ai model discovery is unavailable")
 	}
-	models, err := s.zaiService.ListModels(ctx, apiKey)
+	service := *s.zaiService
+	service.Client = s.getClientForChannel(cfg)
+	models, err := service.ListModels(ctx, apiKey)
 	if err == nil && len(models) > 0 {
 		return models, nil
 	}
 	accountErr := err
-	models, err = s.zaiService.ListCommunityModels(ctx)
+	models, err = service.ListCommunityModels(ctx)
 	if err == nil && len(models) > 0 {
 		log.Printf("[INFO] Z.ai 账号目录不可用，改用 models.dev 目录: %v", accountErr)
 		return models, nil
@@ -901,23 +1209,62 @@ func (s *Server) fetchCodexOAuthModels(
 	if err != nil {
 		return nil, fmt.Errorf("获取 Codex 凭证失败: %w", err)
 	}
-	catalog := codexOAuthModelEntries(credential.PlanType)
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	sampledAt := time.Now().UnixNano()
+	var catalog []codexauth.ManifestModel
+	var endpoint string
+	var fetchErr error
+	refreshed := false
+	for _, route := range s.codexResponsesRoutes(cfg) {
+		if route.upstream != protocol.Codex {
+			continue
+		}
+		endpoint, fetchErr = codexauth.ModelsEndpoint(route.url.URL)
+		if fetchErr != nil {
+			continue
+		}
+		catalog, fetchErr = codexauth.FetchModelManifest(requestCtx, s.getClientForChannel(cfg), endpoint, credential)
+		var statusError interface{ StatusCode() int }
+		if errors.As(fetchErr, &statusError) && statusError.StatusCode() == http.StatusUnauthorized && !refreshed {
+			refreshed = true
+			credential, err = s.codexCredentials.credentialAfterUnauthorized(requestCtx, cfg, credential.AccessToken)
+			if err != nil {
+				return nil, fmt.Errorf("模型发现: 刷新 Codex 凭证失败: %w", err)
+			}
+			catalog, fetchErr = codexauth.FetchModelManifest(requestCtx, s.getClientForChannel(cfg), endpoint, credential)
+		}
+		if fetchErr == nil {
+			break
+		}
+	}
 	if len(catalog) == 0 {
-		return nil, fmt.Errorf("模型发现: Codex 订阅计划没有可用模型")
+		if fetchErr == nil {
+			fetchErr = errors.New("没有可尝试的 Codex 上游 URL")
+		}
+		return nil, fmt.Errorf("模型发现: 获取 Codex 账号目录失败: %w", fetchErr)
+	}
+	manifest := &codexauth.ModelManifest{
+		AccountID: credential.AccountID, UserID: credential.ChatGPTUserID, PlanType: credential.PlanType,
+		Endpoint: endpoint, SampledAt: sampledAt, Models: catalog,
+	}
+	if err := s.codexCredentials.persistModelManifest(ctx, cfg, credential, manifest); err != nil {
+		return nil, err
 	}
 	models := make([]model.ModelEntry, len(catalog))
 	for i, entry := range catalog {
-		models[i] = model.ModelEntry{Model: entry.Model, RedirectModel: entry.Model}
+		models[i] = model.ModelEntry{Model: entry.Slug, RedirectModel: entry.Slug}
 	}
+	models = model.CarryModelPricing(cfg.ModelEntries, models)
 	channelURL := ""
 	if len(cfg.URLs) > 0 {
 		channelURL = cfg.URLs[0].RuntimeURL()
 	}
 	return &FetchModelsResponse{
-		Models: models, Protocol: util.ProtocolCodex, Source: "predefined",
+		Models: models, Protocol: util.ProtocolCodex, Source: "api",
 		Debug: &FetchModelsDebug{
 			NormalizedProtocol: util.ProtocolCodex,
-			Fetcher:            "codex_oauth_catalog",
+			Fetcher:            "codex_oauth_manifest",
 			ChannelURL:         channelURL,
 		},
 	}, nil
@@ -1021,6 +1368,14 @@ func (s *Server) fetchAntigravityModelsWithURLFallback(
 	return nil, fmt.Errorf("获取模型列表失败: 未找到可用URL")
 }
 
+// modelDiscoveryClient 返回渠道代理客户端。未配置代理时返回 nil，调用方继续使用默认客户端。
+func (s *Server) modelDiscoveryClient(cfg *model.Config) *http.Client {
+	if s == nil || cfg == nil || strings.TrimSpace(cfg.ProxyURL) == "" {
+		return nil
+	}
+	return s.getClientForChannel(cfg)
+}
+
 // fetchModelsWithURLFallback 按URL排序顺序抓取模型列表。
 // 设计目标：多URL渠道下，单个URL异常不应导致整个管理操作失败。
 func (s *Server) fetchModelsWithURLFallback(
@@ -1029,6 +1384,7 @@ func (s *Server) fetchModelsWithURLFallback(
 	configuredURLs model.ChannelURLs,
 	overrideProtocol string,
 	apiKeys []string,
+	client *http.Client,
 ) (*FetchModelsResponse, error) {
 	if len(configuredURLs) == 0 {
 		return nil, fmt.Errorf("渠道URL为空")
@@ -1077,7 +1433,7 @@ func (s *Server) fetchModelsWithURLFallback(
 		for _, upstreamProtocol := range protocols {
 			for _, apiKey := range apiKeys {
 				start := time.Now()
-				resp, err := fetchModelsForConfig(ctx, upstreamProtocol, sorted.url, apiKey)
+				resp, err := fetchModelsForConfig(ctx, upstreamProtocol, sorted.url, apiKey, client)
 				if err == nil {
 					if selectorEnabled {
 						latency := time.Since(start)
@@ -1116,6 +1472,7 @@ func (s *Server) fetchModelsPerKeyWithURLFallback(
 	configuredURLs model.ChannelURLs,
 	overrideProtocol string,
 	apiKeys []*model.APIKey,
+	client *http.Client,
 ) (*FetchModelsResponse, error) {
 	if len(apiKeys) == 0 {
 		return nil, fmt.Errorf("API Key为空")
@@ -1134,7 +1491,7 @@ func (s *Server) fetchModelsPerKeyWithURLFallback(
 		}
 		item := FetchKeyModelsItem{KeyIndex: apiKey.KeyIndex, Models: make([]model.ModelEntry, 0)}
 		fetched, err := s.fetchModelsWithURLFallback(
-			ctx, channelID, configuredURLs, overrideProtocol, []string{apiKey.APIKey},
+			ctx, channelID, configuredURLs, overrideProtocol, []string{apiKey.APIKey}, client,
 		)
 		if err != nil {
 			item.Error = publicFetchModelsError(err)
@@ -1256,7 +1613,7 @@ func parseFetchModelsStatus(errMsg string) (statusCode int, body string, ok bool
 	return code, strings.TrimSpace(body), true
 }
 
-func fetchModelsForConfig(ctx context.Context, upstreamProtocol, channelURL, apiKey string) (*FetchModelsResponse, error) {
+func fetchModelsForConfig(ctx context.Context, upstreamProtocol, channelURL, apiKey string, client *http.Client) (*FetchModelsResponse, error) {
 	normalizedProtocol := util.NormalizeProtocol(upstreamProtocol)
 	source := determineSource(upstreamProtocol)
 
@@ -1277,7 +1634,7 @@ func fetchModelsForConfig(ctx context.Context, upstreamProtocol, channelURL, api
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
-		fetcher := util.NewModelsFetcher(upstreamProtocol)
+		fetcher := util.NewModelsFetcher(upstreamProtocol, client)
 		fetcherStr = fmt.Sprintf("%T", fetcher)
 
 		modelNames, err = fetcher.FetchModels(ctx, channelURL, apiKey)
@@ -1336,7 +1693,8 @@ func normalizeModelEntriesForSave(entries []model.ModelEntry, options modelNorma
 		return nil
 	}
 
-	seen := make(map[string]int, len(entries))
+	seen := make(map[model.ModelEntryIdentity]int, len(entries))
+	spelling := make(map[string]string, len(entries))
 	candidates := make([]normalizedModelCandidate, 0, len(entries))
 	normalized := make([]model.ModelEntry, 0, len(entries))
 	for _, entry := range entries {
@@ -1353,6 +1711,12 @@ func normalizeModelEntriesForSave(entries []model.ModelEntry, options modelNorma
 			upstreamModel = clean.Model
 		}
 		alias, sourcePrefixed := normalizeModelAlias(clean.Model, options)
+		group := strings.ToLower(alias)
+		if chosen, exists := spelling[group]; exists {
+			alias = chosen
+		} else {
+			spelling[group] = alias
+		}
 		clean.Model = alias
 		if upstreamModel == alias {
 			clean.RedirectModel = ""
@@ -1365,7 +1729,7 @@ func normalizeModelEntriesForSave(entries []model.ModelEntry, options modelNorma
 			sourcePrefixed:  sourcePrefixed,
 			exactAliasMatch: upstreamModel == alias,
 		}
-		key := strings.ToLower(clean.Model)
+		key := clean.Identity()
 		if index, exists := seen[key]; exists {
 			if preferNormalizedModelCandidate(candidate, candidates[index]) {
 				candidates[index] = candidate
@@ -1410,7 +1774,7 @@ func modelEntriesEqual(left, right []model.ModelEntry) bool {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if !left[i].Equal(right[i]) {
 			return false
 		}
 	}
@@ -1439,27 +1803,26 @@ func reconcileScheduledCheckModel(cfg *model.Config, options modelNormalizationO
 }
 
 func mergeModelEntries(cfg *model.Config, fetched []model.ModelEntry) (added int, changed bool) {
-	occupied := make(map[string]struct{}, len(cfg.ModelEntries)*2)
+	configured := make(map[string]struct{}, len(cfg.ModelEntries)*2)
+	seen := make(map[model.ModelEntryIdentity]struct{}, len(cfg.ModelEntries)+len(fetched))
 	for _, entry := range cfg.ModelEntries {
-		occupied[strings.ToLower(entry.Model)] = struct{}{}
+		configured[strings.ToLower(entry.Model)] = struct{}{}
 		if entry.RedirectModel != "" {
-			occupied[strings.ToLower(entry.RedirectModel)] = struct{}{}
+			configured[strings.ToLower(entry.RedirectModel)] = struct{}{}
 		}
+		seen[entry.Identity()] = struct{}{}
 	}
 
 	for _, entry := range fetched {
-		modelKey := strings.ToLower(entry.Model)
-		_, modelExists := occupied[modelKey]
-		redirectKey := strings.ToLower(entry.RedirectModel)
-		_, redirectExists := occupied[redirectKey]
-		if modelExists || (entry.RedirectModel != "" && redirectExists) {
+		if _, exists := configured[strings.ToLower(entry.Model)]; exists {
+			continue
+		}
+		key := entry.Identity()
+		if _, exists := seen[key]; exists {
 			continue
 		}
 		cfg.ModelEntries = append(cfg.ModelEntries, entry)
-		occupied[modelKey] = struct{}{}
-		if entry.RedirectModel != "" {
-			occupied[redirectKey] = struct{}{}
-		}
+		seen[key] = struct{}{}
 		added++
 	}
 
@@ -1497,20 +1860,69 @@ func replaceModelEntries(cfg *model.Config, fetched []model.ModelEntry, options 
 		return false
 	}
 
+	// A normalized alias can contain several upstream targets. Carry row state by
+	// target first; alias fallback is safe only for one-to-one groups.
+	pricingByIdentity := make(map[string]*util.CustomModelPrice, len(oldEntries))
+	pricingByRow := make(map[model.ModelEntryIdentity]*util.CustomModelPrice, len(oldEntries))
+	disabledByRow := make(map[model.ModelEntryIdentity]bool, len(oldEntries))
+	oldAliasCounts := make(map[string]int, len(oldEntries))
+	fetchedGroupCounts := make(map[string]int, len(fetched))
+	oldRoutingCounts := make(map[string]int, len(oldEntries))
+	fetchedRoutingCounts := make(map[string]int, len(fetched))
+	for _, entry := range fetched {
+		fetchedGroupCounts[strings.ToLower(entry.Model)]++
+		fetchedRoutingCounts[strings.ToLower(model.RoutingModelName(entry.Model))]++
+	}
 	for _, entry := range oldEntries {
 		key := strings.ToLower(entry.Model)
 		oldSet[key] = struct{}{}
+		alias, _ := normalizeModelAlias(entry.Model, options)
+		oldAliasCounts[strings.ToLower(alias)]++
+		oldRoutingCounts[strings.ToLower(model.RoutingModelName(alias))]++
+		rowIdentity := entry.Identity()
+		rowIdentity.Model = strings.ToLower(alias)
+		if entry.Pricing != nil {
+			pricingByRow[rowIdentity] = entry.Pricing
+			for _, identity := range modelIdentities(entry.Model) {
+				if _, exists := pricingByIdentity[identity]; !exists {
+					pricingByIdentity[identity] = entry.Pricing
+				}
+			}
+		}
 		if !entry.Disabled {
 			continue
 		}
+		disabledByRow[rowIdentity] = true
 		rememberDisabled(entry.Model)
 		rememberDisabled(entry.RedirectModel)
 	}
 	for i := range fetched {
 		key := strings.ToLower(fetched[i].Model)
 		newSet[key] = struct{}{}
-		disabled := isDisabled(fetched[i].Model) || isDisabled(fetched[i].RedirectModel)
+		rowIdentity := fetched[i].Identity()
+		disabled := disabledByRow[rowIdentity]
+		routingKey := strings.ToLower(model.RoutingModelName(fetched[i].Model))
+		oneToOne := (oldAliasCounts[key] == 1 && fetchedGroupCounts[key] == 1) ||
+			(oldRoutingCounts[routingKey] == 1 && fetchedRoutingCounts[routingKey] == 1)
+		if oneToOne {
+			disabled = disabled || isDisabled(fetched[i].Model) || isDisabled(fetched[i].RedirectModel)
+		}
 		fetched[i].Disabled = fetched[i].Disabled || disabled
+		if fetched[i].Pricing == nil {
+			fetched[i].Pricing = pricingByRow[rowIdentity]
+			if fetched[i].Pricing == nil && oneToOne {
+				for _, identity := range modelIdentities(fetched[i].Model) {
+					if pricing := pricingByIdentity[identity]; pricing != nil {
+						fetched[i].Pricing = pricing
+						break
+					}
+				}
+			}
+		}
+	}
+	fetched = preserveConfiguredVariants(oldEntries, fetched)
+	for _, entry := range fetched {
+		newSet[strings.ToLower(entry.Model)] = struct{}{}
 	}
 	for key := range oldSet {
 		if _, exists := newSet[key]; !exists {
@@ -1524,4 +1936,111 @@ func replaceModelEntries(cfg *model.Config, fetched []model.ModelEntry, options 
 
 	cfg.ModelEntries = fetched
 	return removed, true
+}
+
+// A discovery response cannot express an administrator's multi-target group.
+// Keep those groups intact through replacement refreshes, including their order.
+func preserveConfiguredVariants(existing, fetched []model.ModelEntry) []model.ModelEntry {
+	counts := make(map[string]int, len(existing))
+	for _, entry := range existing {
+		counts[strings.ToLower(entry.Model)]++
+	}
+	protected := make(map[string]bool, len(counts))
+	for name, count := range counts {
+		protected[name] = count > 1
+	}
+	// A preserved variant can depend on one exact second-hop redirect. Keep that
+	// bridge as configured, even when discovery lists its name as a direct model.
+	lookup := &model.Config{ModelEntries: existing}
+	for _, entry := range existing {
+		if counts[strings.ToLower(entry.Model)] < 2 || entry.RedirectModel == "" {
+			continue
+		}
+		if next := lookup.EnabledModelEntries(entry.RedirectModel); len(next) > 0 && next[0].RedirectModel != "" {
+			protected[strings.ToLower(next[0].Model)] = true
+		}
+	}
+	groups := make(map[string][]model.ModelEntry)
+	order := make([]string, 0)
+	for _, entry := range existing {
+		key := strings.ToLower(entry.Model)
+		if !protected[key] {
+			continue
+		}
+		if len(groups[key]) == 0 {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], entry)
+	}
+	result := make([]model.ModelEntry, 0, len(existing)+len(fetched))
+	inserted := make(map[string]bool, len(groups))
+	for _, entry := range fetched {
+		key := strings.ToLower(entry.Model)
+		if group := groups[key]; len(group) > 0 {
+			if !inserted[key] {
+				result = append(result, group...)
+				inserted[key] = true
+			}
+			continue
+		}
+		result = append(result, entry)
+	}
+	for _, key := range order {
+		if !inserted[key] {
+			result = append(result, groups[key]...)
+		}
+	}
+	return result
+}
+
+// Existing single rows that normalize into a configured group remain distinct by target.
+// Only newly discovered rows may be replaced wholesale by that group's configuration.
+func normalizeExistingModelEntriesForRefresh(existing []model.ModelEntry, options modelNormalizationOptions) []model.ModelEntry {
+	counts := make(map[string]int, len(existing))
+	for _, entry := range existing {
+		counts[strings.ToLower(entry.Model)]++
+	}
+	singles := make([]model.ModelEntry, 0, len(existing))
+	groupSpelling := make(map[string]string)
+	groupRows := make(map[model.ModelEntryIdentity]struct{})
+	for _, entry := range existing {
+		key := strings.ToLower(entry.Model)
+		if counts[key] == 1 {
+			singles = append(singles, entry)
+		} else {
+			groupSpelling[key] = entry.Model
+			groupRows[entry.Identity()] = struct{}{}
+		}
+	}
+	normalizedSingles := make(map[model.ModelEntryIdentity]model.ModelEntry, len(singles))
+	for _, entry := range normalizeModelEntriesForSave(singles, options) {
+		if spelling, exists := groupSpelling[strings.ToLower(entry.Model)]; exists {
+			entry.Model = spelling
+		}
+		normalizedSingles[entry.Identity()] = entry
+	}
+	result := make([]model.ModelEntry, 0, len(existing))
+	seenSingles := make(map[model.ModelEntryIdentity]struct{}, len(singles))
+	for _, entry := range existing {
+		if counts[strings.ToLower(entry.Model)] > 1 {
+			result = append(result, entry)
+			continue
+		}
+		one := normalizeModelEntriesForSave([]model.ModelEntry{entry}, options)
+		if len(one) == 0 {
+			continue
+		}
+		identity := one[0].Identity()
+		if _, exists := groupRows[identity]; exists {
+			continue
+		}
+		if _, exists := seenSingles[identity]; exists {
+			continue
+		}
+		if normalized, exists := normalizedSingles[identity]; exists {
+			result = append(result, normalized)
+			seenSingles[identity] = struct{}{}
+		}
+	}
+	return result
 }

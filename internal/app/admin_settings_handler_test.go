@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/model"
+	"ccLoad/internal/storage"
 	"ccLoad/internal/util"
 
 	"github.com/gin-gonic/gin"
@@ -428,32 +432,36 @@ func TestAdminCooldownBoundsUseFreshAtomicSnapshot(t *testing.T) {
 	}
 }
 
-func TestAdminSettingsHandlers(t *testing.T) {
+// newAdminSettingsTestServer 为每个子测试提供独立的 Store、配置缓存和重启信号，使子测试可并行。
+func newAdminSettingsTestServer(t *testing.T) (*Server, storage.Store, <-chan struct{}) {
+	t.Helper()
 	server, store, cleanup := setupAdminTestServer(t)
-	defer cleanup()
+	t.Cleanup(cleanup)
 
 	server.configService = NewConfigService(store)
 	if err := server.configService.LoadDefaults(context.Background()); err != nil {
 		t.Fatalf("LoadDefaults failed: %v", err)
 	}
-
 	restartCh := make(chan struct{}, 10)
 	server.SetRestartFunc(func() { restartCh <- struct{}{} })
-	drainRestarts := func() {
-		for len(restartCh) > 0 {
-			<-restartCh
-		}
+	return server, store, restartCh
+}
+
+func assertNoRestart(t *testing.T, restartCh <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-restartCh:
+		t.Fatal("unexpected restart triggered")
+	case <-time.After(200 * time.Millisecond):
 	}
-	assertNoRestart := func(t *testing.T) {
-		t.Helper()
-		select {
-		case <-restartCh:
-			t.Fatal("unexpected restart triggered")
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
+}
+
+func TestAdminSettingsHandlers(t *testing.T) {
+	t.Parallel()
 
 	t.Run("AdminGetSetting_missing_key", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/", nil))
 
 		server.AdminGetSetting(c)
@@ -464,6 +472,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminGetSetting_not_found", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/no_such_key", nil))
 		c.Params = gin.Params{{Key: "key", Value: "no_such_key"}}
 
@@ -475,6 +485,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminGetSetting_ok", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/log_retention_days", nil))
 		c.Params = gin.Params{{Key: "key", Value: "log_retention_days"}}
 
@@ -497,6 +509,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_invalid_json", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/log_retention_days", []byte("{")))
 		c.Params = gin.Params{{Key: "key", Value: "log_retention_days"}}
 
@@ -508,6 +522,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_not_found", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/no_such_key", []byte(`{"value":"1"}`)))
 		c.Params = gin.Params{{Key: "key", Value: "no_such_key"}}
 
@@ -519,6 +535,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_invalid_value", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/log_retention_days", []byte(`{"value":"0"}`)))
 		c.Params = gin.Params{{Key: "key", Value: "log_retention_days"}}
 
@@ -530,6 +548,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_rejects_duplicated_oauth_url_scheme", func(t *testing.T) {
+		t.Parallel()
+		server, store, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(
 			http.MethodPut,
 			"/admin/settings/ANTIGRAVITY_URL",
@@ -555,6 +575,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_ok_triggers_restart", func(t *testing.T) {
+		t.Parallel()
+		server, _, restartCh := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/settings/log_retention_days", []byte(`{"value":"30"}`)))
 		c.Params = gin.Params{{Key: "key", Value: "log_retention_days"}}
 
@@ -572,7 +594,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminUpdateSetting_multimodal_fallback_hot_reloads_without_restart", func(t *testing.T) {
-		drainRestarts()
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		mapping := `{"gpt-text":"gpt-vision-update"}`
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/settings/"+modelMultimodalFallbackSettingKey, map[string]string{
 			"value": mapping,
@@ -597,10 +620,12 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		if persisted.Value != mapping {
 			t.Fatalf("persisted mapping=%q, want %q", persisted.Value, mapping)
 		}
-		assertNoRestart(t)
+		assertNoRestart(t, restartCh)
 	})
 
 	t.Run("AdminGetSetting_returns_latest_db_value_before_restart", func(t *testing.T) {
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		if err := store.UpdateSetting(context.Background(), "model_catalog_sync_interval_hours", "1"); err != nil {
 			t.Fatalf("failed to seed setting in db: %v", err)
 		}
@@ -652,6 +677,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminResetSetting_ok_triggers_restart", func(t *testing.T) {
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		// 先更新为一个不同值，再reset，最后验证数据库里变回默认值。
 		if err := store.UpdateSetting(context.Background(), "log_retention_days", "30"); err != nil {
 			t.Fatalf("UpdateSetting failed: %v", err)
@@ -684,7 +711,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminResetSetting_multimodal_fallback_hot_clears_without_restart", func(t *testing.T) {
-		drainRestarts()
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		mapping := `{"gpt-text":"gpt-vision-reset"}`
 		if err := store.UpdateSetting(context.Background(), modelMultimodalFallbackSettingKey, mapping); err != nil {
 			t.Fatalf("seed multimodal fallback: %v", err)
@@ -711,10 +739,12 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		if persisted.Value != "{}" {
 			t.Fatalf("persisted mapping after reset=%q, want {}", persisted.Value)
 		}
-		assertNoRestart(t)
+		assertNoRestart(t, restartCh)
 	})
 
 	t.Run("AdminBatchUpdateSettings_empty_body_reject", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/settings/batch", []byte(`{}`)))
 
 		server.AdminBatchUpdateSettings(c)
@@ -725,6 +755,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_unknown_key_reject", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/settings/batch", []byte(`{"no_such_key":"1"}`)))
 
 		server.AdminBatchUpdateSettings(c)
@@ -735,6 +767,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_invalid_value_reject", func(t *testing.T) {
+		t.Parallel()
+		server, _, _ := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/settings/batch", []byte(`{"log_retention_days":"0"}`)))
 
 		server.AdminBatchUpdateSettings(c)
@@ -745,6 +779,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_invalid_global_cooldown_rules_reject", func(t *testing.T) {
+		t.Parallel()
+		server, store, _ := newAdminSettingsTestServer(t)
 		before, err := store.GetSetting(context.Background(), globalCooldownDetectionRulesSettingKey)
 		if err != nil {
 			t.Fatalf("GetSetting before update failed: %v", err)
@@ -769,11 +805,12 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_invalid_multimodal_fallback_reject", func(t *testing.T) {
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		before, err := store.GetSetting(context.Background(), modelMultimodalFallbackSettingKey)
 		if err != nil {
 			t.Fatalf("GetSetting before update failed: %v", err)
 		}
-		drainRestarts()
 		server.setMultimodalFallbackModels(map[string]string{"existing-text": "existing-vision"})
 
 		invalidMapping := `{"gpt-5.6-luna":"gpt-5.6-luna"}`
@@ -796,11 +833,12 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		if got := server.multimodalFallbackModel("existing-text", true); got != "existing-vision" {
 			t.Fatalf("runtime fallback=%q, want unchanged existing-vision", got)
 		}
-		assertNoRestart(t)
+		assertNoRestart(t, restartCh)
 	})
 
 	t.Run("AdminBatchUpdateSettings_multimodal_fallback_hot_reloads_without_restart", func(t *testing.T) {
-		drainRestarts()
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		mapping := `{"gpt-text":"gpt-vision-batch"}`
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
 			modelMultimodalFallbackSettingKey: mapping,
@@ -824,11 +862,12 @@ func TestAdminSettingsHandlers(t *testing.T) {
 		if persisted.Value != mapping {
 			t.Fatalf("persisted mapping=%q, want %q", persisted.Value, mapping)
 		}
-		assertNoRestart(t)
+		assertNoRestart(t, restartCh)
 	})
 
 	t.Run("AdminBatchUpdateSettings_mixed_multimodal_update_still_restarts", func(t *testing.T) {
-		drainRestarts()
+		t.Parallel()
+		server, _, restartCh := newAdminSettingsTestServer(t)
 		mapping := `{"gpt-text":"gpt-vision-mixed"}`
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/settings/batch", map[string]string{
 			modelMultimodalFallbackSettingKey: mapping,
@@ -851,6 +890,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_responses_websocket_zero_uses_defaults", func(t *testing.T) {
+		t.Parallel()
+		server, store, restartCh := newAdminSettingsTestServer(t)
 		updates := map[string]string{
 			responsesWebsocketMaxSessionsSetting:            "0",
 			responsesWebsocketSessionTTLSetting:             "0",
@@ -882,6 +923,8 @@ func TestAdminSettingsHandlers(t *testing.T) {
 	})
 
 	t.Run("AdminBatchUpdateSettings_ok_triggers_restart", func(t *testing.T) {
+		t.Parallel()
+		server, _, restartCh := newAdminSettingsTestServer(t)
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/settings/batch", []byte(`{"log_retention_days":"14","max_key_retries":"5"}`)))
 
 		server.AdminBatchUpdateSettings(c)
@@ -896,4 +939,170 @@ func TestAdminSettingsHandlers(t *testing.T) {
 			t.Fatal("expected restart triggered")
 		}
 	})
+}
+
+func TestTypeSafeSettingsSecretAndRestartContract(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := make(chan struct{}, 8)
+	server.SetRestartFunc(func() { restarted <- struct{}{} })
+	save := func(payload string, want int) {
+		t.Helper()
+		c, w := newTestContext(t, newRequest(http.MethodPost, "/admin/settings/batch", strings.NewReader(payload)))
+		server.AdminBatchUpdateSettings(c)
+		if w.Code != want {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	save(`{"TypeSafe_enabled":"true"}`, http.StatusBadRequest)
+	save(`{"TypeSafe_enabled":"true","TypeSafe_api_key":"typesafe-private-value"}`, http.StatusOK)
+	select {
+	case <-restarted:
+	case <-time.After(time.Second):
+		t.Fatal("no restart requested")
+	}
+	if server.configService.GetBool("TypeSafe_enabled", false) {
+		t.Fatal("setting hot reloaded")
+	}
+	for _, key := range []string{"", "TypeSafe_api_key"} {
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/settings/"+key, nil))
+		if key == "" {
+			server.AdminListSettings(c)
+		} else {
+			c.Params = gin.Params{{Key: "key", Value: key}}
+			server.AdminGetSetting(c)
+		}
+		if strings.Contains(w.Body.String(), "typesafe-private-value") {
+			t.Fatal("secret exposed")
+		}
+		if key != "" {
+			view := mustParseAPIResponse[map[string]any](t, w.Body.Bytes()).Data
+			if view["configured"] != true || view["value"] != "" {
+				t.Fatalf("secret view=%v", view)
+			}
+		}
+	}
+	save(`{"TypeSafe_enabled":"false"}`, http.StatusOK)
+	key, err := store.GetSetting(context.Background(), "TypeSafe_api_key")
+	if err != nil || key.Value != "typesafe-private-value" {
+		t.Fatal("omitted secret lost")
+	}
+	// A single-key update response must also hide the secret.
+	c, w := newTestContext(t, newRequest(http.MethodPut, "/admin/settings/TypeSafe_api_key", strings.NewReader(`{"value":"replacement-private-value"}`)))
+	c.Params = gin.Params{{Key: "key", Value: "TypeSafe_api_key"}}
+	server.AdminUpdateSetting(c)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "replacement-private-value") {
+		t.Fatalf("secret update response=%s", w.Body.String())
+	}
+	save(`{"TypeSafe_enabled":"true"}`, http.StatusOK)
+	c, w = newTestContext(t, newRequest(http.MethodPost, "/admin/settings/TypeSafe_api_key/reset", nil))
+	c.Params = gin.Params{{Key: "key", Value: "TypeSafe_api_key"}}
+	server.AdminResetSetting(c)
+	if w.Code != 200 {
+		t.Fatalf("reset=%s", w.Body.String())
+	}
+	enabled, err := store.GetSetting(context.Background(), "TypeSafe_enabled")
+	if err != nil || enabled.Value != "false" {
+		t.Fatal("clear did not disable TypeSafe")
+	}
+	key, err = store.GetSetting(context.Background(), "TypeSafe_api_key")
+	if err != nil || key.Value != "" {
+		t.Fatal("secret not cleared")
+	}
+}
+
+func TestAdminTestTypeSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, wantKey, reply string
+		upstream, wantStatus       int
+		valid, call                bool
+	}{
+		{"entered", `{"api_key":" entered-key "}`, "entered-key", "", 200, 200, true, true},
+		{"saved", `{}`, "saved-key", "", 200, 200, true, true},
+		{"empty", `{"api_key":""}`, "", "", 0, 400, false, false},
+		{"bad JSON", `{`, "", "", 0, 400, false, false},
+		{"rejected", `{"api_key":"entered-key"}`, "entered-key", `{"error":"entered-key"}`, 401, 200, false, true},
+		{"limited", `{}`, "saved-key", `{}`, 429, 200, false, true},
+		{"invalid response", `{}`, "saved-key", `{}`, 200, 502, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jevAdmission.Lock()
+			jevAdmission.starts = nil
+			jevAdmission.Unlock()
+			srv := newInMemoryServerWithSettings(t, map[string]string{config.TypeSafeAPIKeySettingKey: "saved-key", config.TypeSafeEnabledSettingKey: "false"})
+			var calls int
+			srv.jevClient = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Header.Get("Authorization") != "Bearer "+tc.wantKey || r.URL.String() != jevEndpoint {
+					t.Fatal("wrong credentials or endpoint")
+				}
+				if deadline, ok := r.Context().Deadline(); !ok || time.Until(deadline) > jevWaitBudget {
+					t.Fatal("missing call timeout")
+				}
+				var req jevRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model != "jev-latest" || len(req.Questions) != 1 {
+					t.Fatalf("invalid request: %+v %v", req, err)
+				}
+				reply := tc.reply
+				if reply == "" {
+					reply = `{"model":"jev-latest","answers":{"connection":{"type":"choice","choice":"ok","probabilities":{"ok":1,"other":0},"confidence":1}}}`
+				}
+				return &http.Response{StatusCode: tc.upstream, Body: io.NopCloser(strings.NewReader(reply)), Header: make(http.Header)}, nil
+			})}
+			c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/typesafe/test", []byte(tc.body)))
+			srv.AdminTestTypeSafe(c)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			if (calls == 1) != tc.call {
+				t.Fatalf("calls=%d", calls)
+			}
+			if w.Code == 200 {
+				result := mustParseAPIResponse[struct {
+					Valid bool `json:"valid"`
+				}](t, w.Body.Bytes())
+				if result.Data.Valid != tc.valid {
+					t.Fatalf("result: %s", w.Body.String())
+				}
+			}
+			if tc.call {
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					logs, err := srv.store.ListLogs(context.Background(), time.Now().Add(-time.Minute), 10, 0, &model.LogFilter{LogSource: model.LogSourceJev})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(logs) > 0 {
+						var audit jevAudit
+						if len(logs) != 1 || json.Unmarshal([]byte(logs[0].Message), &audit) != nil || audit.Purpose != "credential_test" || audit.CallID == "" {
+							t.Fatal("missing test audit")
+						}
+						debug, debugErr := srv.store.GetDebugLogByLogID(context.Background(), logs[0].ID)
+						if debugErr != nil || debug == nil || debug.ReqURL != jevEndpoint || !strings.Contains(string(debug.RespBody), audit.CallID) {
+							t.Fatalf("missing TypeSafe debug audit: debug=%+v err=%v", debug, debugErr)
+						}
+						if strings.Contains(logs[0].Message, tc.wantKey) {
+							t.Fatal("key leaked to audit")
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("audit not persisted")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+			if strings.Contains(w.Body.String(), "entered-key") || strings.Contains(w.Body.String(), "saved-key") {
+				t.Fatal("key echoed")
+			}
+			saved, err := srv.configService.GetSettingFresh(context.Background(), config.TypeSafeAPIKeySettingKey)
+			if err != nil || saved.Value != "saved-key" || srv.configService.GetBool(config.TypeSafeEnabledSettingKey, true) {
+				t.Fatal("test changed settings")
+			}
+		})
+	}
 }

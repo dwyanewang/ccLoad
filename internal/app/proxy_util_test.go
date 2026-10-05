@@ -1026,6 +1026,18 @@ func TestPrepareRequestBody_FuzzyMatch(t *testing.T) {
 			wantModel:     "gemini-3-flash-preview-0719", // 模糊匹配后再重定向
 			wantBodyModel: "gemini-3-flash-preview-0719",
 		},
+		{
+			name:            "模糊匹配后不多跟随一层重定向",
+			modelFuzzyMatch: true,
+			configModels: []model.ModelEntry{
+				{Model: "provider-alias", RedirectModel: "middle"},
+				{Model: "middle", RedirectModel: "final"},
+			},
+			originalModel: "alias",
+			requestBody:   `{"model":"alias","messages":[]}`,
+			wantModel:     "middle",
+			wantBodyModel: "middle",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1084,9 +1096,6 @@ func TestAPIKeyModelScopeUsesLogicalModelBeforeRedirect(t *testing.T) {
 	logicalModel := s.resolveChannelRoutingModel(cfg, "gemini-3-flash")
 	if logicalModel != "gemini-3-flash-preview" {
 		t.Fatalf("logical model=%q, want gemini-3-flash-preview", logicalModel)
-	}
-	if actualModel := s.resolveActualModel(cfg, "gemini-3-flash"); actualModel != "alias" {
-		t.Fatalf("actual model=%q, want historical single redirect to alias", actualModel)
 	}
 	filtered, scoped := filterAPIKeysForModel(keys, logicalModel)
 	if !scoped || len(filtered) != 1 || filtered[0].APIKey != "sk-logical" {
@@ -1591,10 +1600,11 @@ func TestInjectAnyrouterClaudeCodeFallbackTools(t *testing.T) {
 
 	cfg := anyrouterAnthropicCfg()
 	nativeHeaders := http.Header{
-		"User-Agent":     {"claude-cli/2.1.236 (external, cli)"},
+		"User-Agent":     {"claude-cli/" + anthropicCLIVersion + " (external, cli)"},
 		"X-App":          {"cli"},
 		"Anthropic-Beta": {"claude-code-20250219"},
 	}
+	nativeCallerBody := []byte(`{"metadata":{"user_id":"{\"device_id\":\"device\",\"session_id\":\"session\"}"}}`)
 	toolNames := func(body []byte) []string {
 		tools := gjson.GetBytes(body, "tools")
 		if !tools.IsArray() {
@@ -1674,14 +1684,14 @@ func TestInjectAnyrouterClaudeCodeFallbackTools(t *testing.T) {
 			if path == "" {
 				path = "/v1/messages"
 			}
-			got := injectAnyrouterClaudeCodeFallbackTools(testCfg, proto, path, headers, []byte(tt.body))
+			got := injectAnyrouterClaudeCodeFallbackTools(testCfg, proto, path, headers, nativeCallerBody, []byte(tt.body))
 			if names := toolNames(got); !slices.Equal(names, tt.want) {
 				t.Fatalf("tool names = %v, want %v; body = %s", names, tt.want, got)
 			}
 		})
 	}
 
-	first := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, []byte(`{"model":"claude-fable-5-1","tools":[]}`))
+	first := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, nativeCallerBody, []byte(`{"model":"claude-fable-5-1","tools":[]}`))
 	tools := gjson.GetBytes(first, "tools")
 	expectedRequired := map[string][]string{
 		"Edit":  {"file_path", "old_string", "new_string"},
@@ -1702,7 +1712,7 @@ func TestInjectAnyrouterClaudeCodeFallbackTools(t *testing.T) {
 			t.Fatalf("%s required = %v, want %v", name, required, expectedRequired[name])
 		}
 	}
-	second := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, first)
+	second := injectAnyrouterClaudeCodeFallbackTools(cfg, protocol.Anthropic, "/v1/messages", nativeHeaders, nativeCallerBody, first)
 	if string(second) != string(first) {
 		t.Fatalf("fallback injection is not idempotent:\nfirst:  %s\nsecond: %s", first, second)
 	}

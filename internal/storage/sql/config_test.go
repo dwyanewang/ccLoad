@@ -2,6 +2,7 @@ package sql_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 	sqlstore "ccLoad/internal/storage/sql"
+	"ccLoad/internal/util"
 
 	_ "modernc.org/sqlite"
 )
@@ -131,14 +133,14 @@ func TestConfig_CreateAndGet(t *testing.T) {
 
 func TestConfig_OAuthCredentialRoundTripAndPrivateJSON(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "codex-credential.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"at-secret","refresh_token":"rt-secret","expired":"2030-01-01T00:00:00Z"}`
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name: "codex-user@example.com", AuthType: model.AuthTypeCodexOAuth,
 		OAuthCredential: credential, URLs: model.ChannelURLs{{URL: "https://chatgpt.com/backend-api/codex", Protocols: []string{"codex"}}},
-		Websockets: true, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "*"}},
+		Websockets: true, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "gpt-5"}},
 	})
 	if err != nil {
 		t.Fatalf("CreateConfig() error = %v", err)
@@ -208,7 +210,7 @@ func TestConfig_OAuthCredentialRoundTripAndPrivateJSON(t *testing.T) {
 
 func TestConfig_DisableOAuthChannelIfCredentialMatches(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "disable-rejected-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	original := `{"type":"codex","access_token":"rejected-at","refresh_token":"rejected-rt"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -295,7 +297,7 @@ func TestConfig_DisableOAuthChannelIfCredentialMatches(t *testing.T) {
 }
 
 func TestConfig_CreateWithExistingExplicitOAuthIDCannotReplaceCredential(t *testing.T) {
-	store := newTestStore(t, "explicit-oauth-credential.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	winner := `{"type":"codex","access_token":"at-winner","refresh_token":"rt-winner","expired":"2031-01-01T00:00:00Z"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -325,7 +327,7 @@ func TestConfig_CreateWithExistingExplicitOAuthIDCannotReplaceCredential(t *test
 }
 
 func TestConfig_DeleteConfigIfOAuthSnapshotMatches(t *testing.T) {
-	store := newTestStore(t, "conditional-oauth-delete.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	original := `{"type":"codex","access_token":"old-at","refresh_token":"old-rt"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -385,7 +387,7 @@ func TestConfig_DeleteConfigIfOAuthSnapshotMatches(t *testing.T) {
 }
 
 func TestConfig_CreateWithExplicitIDRejectsOAuthAcrossExistingAPIKey(t *testing.T) {
-	store := newTestStore(t, "explicit-api-key-to-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name: "api-key-winner", AuthType: model.AuthTypeAPIKey,
@@ -415,7 +417,7 @@ func TestConfig_CreateWithExplicitIDRejectsOAuthAcrossExistingAPIKey(t *testing.
 func TestConfig_ListConfigs(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "list.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -461,7 +463,7 @@ func TestConfig_ListConfigs(t *testing.T) {
 func TestConfig_UpdateChannelEnabledOnlyTouchesEnabled(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "update-enabled.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1020,7 +1022,7 @@ func TestConfig_DeleteConfig_AllowsRecreateWithSameIDAndKeyIndicesInMemoryStore(
 func TestConfig_GetEnabledChannelsByModel(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "model_query.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1118,7 +1120,7 @@ func TestConfig_GetEnabledChannelsByModel(t *testing.T) {
 func TestConfig_GetEnabledChannelsByModelUsesRoutingModelName(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "routing_model_query.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	for _, entry := range []struct {
@@ -1151,7 +1153,7 @@ func TestConfig_GetEnabledChannelsByModelUsesRoutingModelName(t *testing.T) {
 func TestConfig_GetEnabledChannelsIncludesCooledEnabledChannels(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "enabled_includes_cooled.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cooled, err := store.CreateConfig(ctx, &model.Config{
@@ -1216,7 +1218,7 @@ func TestConfig_GetEnabledChannelsIncludesCooledEnabledChannels(t *testing.T) {
 func TestConfig_BatchUpdatePriority(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "priority.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1265,7 +1267,7 @@ func TestConfig_BatchUpdatePriority(t *testing.T) {
 func TestConfig_BatchPatchConfigs(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "batch-patch.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	create := func(name, mode, scheduledModel string, models []model.ModelEntry) *model.Config {
 		t.Helper()
@@ -1318,7 +1320,7 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 		ProtocolTransformMode: &mode,
 		ModelImportMode:       model.ModelImportModeAppend,
 		ModelEntries: []model.ModelEntry{
-			{Model: "ALIAS-A", RedirectModel: "ignored-duplicate"},
+			{Model: "alias-a", RedirectModel: "upstream-a"},
 			{Model: "model-b", RedirectModel: "upstream-b"},
 		},
 	})
@@ -1357,7 +1359,7 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 			if len(got.ModelEntries) != 2 || got.ModelEntries[0].Model != "alias-a" || !got.ModelEntries[0].Disabled || got.ModelEntries[1].Model != "model-b" {
 				t.Fatalf("channel %d models=%+v", channelID, got.ModelEntries)
 			}
-		} else if len(got.ModelEntries) != 3 || got.ModelEntries[1].Model != "ALIAS-A" || got.ModelEntries[2].Model != "model-b" || got.ModelEntries[2].RedirectModel != "upstream-b" {
+		} else if len(got.ModelEntries) != 3 || got.ModelEntries[1].Model != "alias-a" || got.ModelEntries[2].Model != "model-b" || got.ModelEntries[2].RedirectModel != "upstream-b" {
 			t.Fatalf("channel %d models=%+v", channelID, got.ModelEntries)
 		}
 	}
@@ -1449,7 +1451,7 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "prune-key-model-scopes.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name: "prune-key-model-scopes", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
@@ -1488,22 +1490,15 @@ func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 		t.Fatalf("UpdateAPIKeyModelScopes: %v", err)
 	}
 	cfg.ModelEntries = []model.ModelEntry{{Model: "*"}}
-	if _, err := store.UpdateConfig(ctx, cfg.ID, cfg); err != nil {
-		t.Fatalf("UpdateConfig wildcard: %v", err)
-	}
-	key, err := store.GetAPIKey(ctx, cfg.ID, 0)
-	if err != nil {
-		t.Fatalf("GetAPIKey wildcard: %v", err)
-	}
-	if !slices.Equal(key.AllowedModels, []string{"dynamic-model"}) {
-		t.Fatalf("wildcard key model scope=%v, want preserved dynamic model", key.AllowedModels)
+	if _, err := store.UpdateConfig(ctx, cfg.ID, cfg); err == nil || !strings.Contains(err.Error(), "wildcard model is not supported") {
+		t.Fatalf("UpdateConfig wildcard error = %v, want rejection", err)
 	}
 }
 
 func TestConfig_BatchPatchConfigsUpdatesOAuthModelsWithoutCredentialMutation(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "batch-patch-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"winner","refresh_token":"winner-rt"}`
 	oauth, err := store.CreateConfig(ctx, &model.Config{
@@ -1553,7 +1548,7 @@ func TestConfig_BatchPatchConfigsUpdatesOAuthModelsWithoutCredentialMutation(t *
 func TestConfig_SyncOAuthConfigReplicaIsAtomicAndProviderRestricted(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "sync-oauth-replica.db")
+	store := newTestStore(t)
 	replica := store.(*sqlstore.SQLStore)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"old","refresh_token":"old-rt"}`
@@ -1602,7 +1597,7 @@ func TestConfig_SyncOAuthConfigReplicaIsAtomicAndProviderRestricted(t *testing.T
 func TestConfig_ModelRedirect(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "redirect.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1642,7 +1637,7 @@ func TestConfig_ModelRedirect(t *testing.T) {
 
 func TestConfig_ChannelManagementCompareAndSwap(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "channel-management-cas.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1701,7 +1696,7 @@ func TestConfig_ChannelManagementCompareAndSwap(t *testing.T) {
 
 func TestConfig_ChannelManagementCompareAndSwapRejectsOAuthChannel(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "channel-management-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"oauth-private-token","refresh_token":"oauth-refresh-token"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1719,5 +1714,110 @@ func TestConfig_ChannelManagementCompareAndSwapRejectsOAuthChannel(t *testing.T)
 	got, err := store.GetConfig(ctx, created.ID)
 	if err != nil || got.OAuthCredential != credential || !got.UsesCodexOAuth() {
 		t.Fatalf("OAuth channel changed = (%#v, %v)", got, err)
+	}
+}
+
+func TestConfig_ModelPricingPersistsAcrossWritePaths(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t)
+	ctx := context.Background()
+	price := func(value float64) *float64 { return &value }
+	sonnetPrice := &util.CustomModelPrice{InputPrice: price(1.5), OutputPrice: price(7.5), CacheReadPrice: price(0)}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "pricing-channel", URLs: model.ChannelURLs{{URL: "https://pricing.example.com"}}, Enabled: true,
+		ModelEntries: []model.ModelEntry{{Model: "claude-sonnet", Pricing: sonnetPrice}, {Model: "gpt-5"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	got, err := store.GetConfig(ctx, created.ID)
+	if err != nil || !got.ModelEntries[0].Pricing.Equal(sonnetPrice) || got.ModelEntries[1].Pricing != nil {
+		t.Fatalf("created pricing = (%+v, %v)", got, err)
+	}
+
+	// 批量替换导入不表达价格：保留下来的模型沿用原渠道价格，新模型没有价格。
+	result, err := store.BatchPatchConfigs(ctx, []int64{created.ID}, model.BatchConfigPatch{
+		ModelImportMode: model.ModelImportModeReplace,
+		ModelEntries:    []model.ModelEntry{{Model: "CLAUDE-SONNET"}, {Model: "new-model"}},
+	})
+	if err != nil || result.Updated != 1 {
+		t.Fatalf("BatchPatchConfigs replace = (%+v, %v)", result, err)
+	}
+	replaced, err := store.GetConfig(ctx, created.ID)
+	if err != nil || !replaced.ModelEntries[0].Pricing.Equal(sonnetPrice) || replaced.ModelEntries[1].Pricing != nil {
+		t.Fatalf("replaced pricing = (%+v, %v)", replaced, err)
+	}
+
+	// 损坏的价格必须让读取失败，不能静默按全局价格计费。
+	if _, err := store.(*sqlstore.SQLStore).ExecContext(ctx,
+		`UPDATE channel_models SET pricing = ? WHERE channel_id = ? AND model = ?`,
+		`{"input_price":-1}`, created.ID, "new-model"); err != nil {
+		t.Fatalf("corrupt pricing: %v", err)
+	}
+	if _, err := store.GetConfig(ctx, created.ID); err == nil || !strings.Contains(err.Error(), "new-model") {
+		t.Fatalf("GetConfig with corrupt pricing error = %v, want model-scoped failure", err)
+	}
+}
+
+func TestConfig_ModelVariantsPersistAndProject(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	ctx := context.Background()
+	priceValue := 3.0
+	price := &util.CustomModelPrice{InputPrice: &priceValue, OutputPrice: &priceValue}
+	entries := []model.ModelEntry{
+		{Model: "auto", RedirectModel: "upstream-a", Disabled: true},
+		{Model: "auto", RedirectModel: "upstream-b", Pricing: price},
+		{Model: "auto", RedirectModel: "upstream-c"},
+	}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "variants", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+		ModelEntries: entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(want []model.ModelEntry, redirect string, disabled bool, wantVariants bool) {
+		t.Helper()
+		got, err := store.GetConfig(ctx, created.ID)
+		if err != nil || len(got.ModelEntries) != len(want) {
+			t.Fatalf("GetConfig = (%+v, %v), want %d rows", got, err, len(want))
+		}
+		for i := range want {
+			if !got.ModelEntries[i].Equal(want[i]) {
+				t.Fatalf("row %d = %+v, want %+v", i, got.ModelEntries[i], want[i])
+			}
+		}
+		var actualRedirect string
+		var actualDisabled bool
+		var variants sql.NullString
+		err = store.(*sqlstore.SQLStore).QueryRowContext(ctx,
+			`SELECT redirect_model, disabled, model_variants FROM channel_models WHERE channel_id = ? AND model = ?`,
+			created.ID, "auto").Scan(&actualRedirect, &actualDisabled, &variants)
+		if err != nil || actualRedirect != redirect || actualDisabled != disabled || variants.Valid != wantVariants {
+			t.Fatalf("projection = (%q, %v, variants=%v, %v), want (%q, %v, variants=%v)", actualRedirect, actualDisabled, variants.Valid, err, redirect, disabled, wantVariants)
+		}
+	}
+	check(entries, "upstream-b", false, true)
+	for i := range entries {
+		entries[i].Disabled = true
+	}
+	if _, err := store.UpdateConfig(ctx, created.ID, &model.Config{Name: "variants", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true, ModelEntries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	check(entries, "upstream-a", true, true)
+	entries = []model.ModelEntry{{Model: "auto", RedirectModel: "upstream-c"}}
+	if _, err := store.UpdateConfig(ctx, created.ID, &model.Config{Name: "variants", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true, ModelEntries: entries}); err != nil {
+		t.Fatal(err)
+	}
+	check(entries, "upstream-c", false, false)
+	if _, err := store.(*sqlstore.SQLStore).ExecContext(ctx,
+		`UPDATE channel_models SET model_variants = ? WHERE channel_id = ? AND model = ?`,
+		`[{"model":"other"},{"model":"other"}]`, created.ID, "auto"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetConfig(ctx, created.ID); err == nil {
+		t.Fatal("mismatched model_variants must fail to load")
 	}
 }

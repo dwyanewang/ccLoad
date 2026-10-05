@@ -9,7 +9,6 @@ import (
 	cliproxysignature "ccLoad/internal/protocol/cliproxy/signature"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Anthropic 线协议改写全程以 []byte 为唯一表示：gjson 读、sjson 就地写。
@@ -39,8 +38,7 @@ func isAnthropicJSONObject(body []byte) bool {
 // 入口守卫由调用方（normalizeAnthropicMessagesBody / 最终化边界）负责，这里三步
 // 都不会失败，所以不返回 error。
 //
-// CCH 不在这里签：它按凭证与上游 origin 条件化，必须由持有这两项上下文的最终发送
-// 边界处理，判据见 anthropicCCHSigningEnabled。
+// CCH 不在这里签：模拟请求省略它；旧版结构化 Haiku helper 在专用分支处理。
 func encodeNormalizedAnthropicRequest(body []byte) []byte {
 	body = normalizeAnthropicMessagesRequest(body)
 	body = orderAnthropicCacheControlWireShape(body)
@@ -59,7 +57,7 @@ func normalizeAnthropicMessagesRequest(body []byte) []byte {
 		body = ensureAnthropicCacheControls(body)
 	}
 	body = normalizeAnthropicCacheControlTTL(body)
-	return enforceAnthropicCacheControlLimit(body, 4)
+	return enforceAnthropicCacheControlLimit(body, anthropicMaxCacheControls)
 }
 
 func validateAnthropicLegacySystemMessages(body []byte) error {
@@ -163,6 +161,47 @@ func normalizeAnthropicSampling(body []byte) []byte {
 	return body
 }
 
+// sanitizeAnthropicBodyForBetaTokens keeps beta-gated request fields in sync
+// with the final upstream header, including channel Header rules.
+func sanitizeAnthropicBodyForBetaTokens(body []byte, betaHeader string) []byte {
+	activeBetas := make(map[string]bool)
+	for _, part := range strings.Split(betaHeader, ",") {
+		if token := strings.TrimSpace(part); token != "" {
+			activeBetas[token] = true
+		}
+	}
+	hasBeta := func(tokens ...string) bool {
+		for _, token := range tokens {
+			if activeBetas[token] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, field := range []struct {
+		path  string
+		betas []string
+	}{
+		{"context_management", []string{"context-management-2025-06-27"}},
+		{"thinking.block_binding", []string{"thinking-binding-controls-2026-08-01"}},
+		{"fallbacks", []string{"server-side-fallback-2026-07-01"}},
+		{"fallback_credit_token", []string{"server-side-fallback-2026-07-01", "fallback-credit-2026-07-01", "fallback-credit-2026-06-01"}},
+	} {
+		if !hasBeta(field.betas...) && gjson.GetBytes(body, field.path).Exists() {
+			body = deleteJSONPath(body, field.path)
+		}
+	}
+	// 2.1.283 起消息级 output_config 由 per-turn-control 承载；旧 beta 名保留给旧客户端。
+	if !hasBeta("per-turn-control-2026-07-01", "mid-conversation-output-config-2026-07-01") {
+		for index, message := range gjson.GetBytes(body, "messages").Array() {
+			if message.Get("output_config").Exists() {
+				body = deleteJSONPath(body, "messages."+strconv.Itoa(index)+".output_config")
+			}
+		}
+	}
+	return body
+}
+
 func ensureAnthropicCacheControls(body []byte) []byte {
 	body = ensureAnthropicToolCacheControl(body)
 	body = ensureAnthropicSystemCacheControl(body)
@@ -182,7 +221,7 @@ func ensureAnthropicToolCacheControl(body []byte) []byte {
 		if tool.Get("cache_control").Exists() {
 			return body
 		}
-		if tool.Get("defer_loading").Type != gjson.True {
+		if !isAnthropicDeferredTool(tool) {
 			lastEligible = index
 		}
 	}
@@ -269,33 +308,18 @@ func ensureAnthropicMessageCacheControl(body []byte) []byte {
 func anthropicEphemeralCacheControl() string { return `{"type":"ephemeral"}` }
 
 // anthropicTextBlockRaw 按原生键序拼一个 text 块：type → text → cache_control。
-// 字符串转义交给 sjson，与 encoding/json 完全一致（`<`、`>`、`&` 同样转义）。
+// 文本按 JS JSON.stringify 转义（`<`、`>`、`&` 原样），与 Claude Code 线上字节一致。
 func anthropicTextBlockRaw(text, cacheControlRaw string) string {
-	block, err := sjson.Set(`{"type":"text"}`, "text", text)
-	if err != nil {
-		return `{"type":"text","text":""}`
+	block := `{"type":"text","text":` + jsonStringifyString(text)
+	if cacheControlRaw != "" {
+		block += `,"cache_control":` + cacheControlRaw
 	}
-	if cacheControlRaw == "" {
-		return block
-	}
-	withCache, err := sjson.SetRaw(block, "cache_control", cacheControlRaw)
-	if err != nil {
-		return block
-	}
-	return withCache
+	return block + "}"
 }
 
 // anthropicTextMessageRaw 按原生键序拼一条纯文本消息：role → content。
 func anthropicTextMessageRaw(role, content string) string {
-	message, err := sjson.Set(`{"role":""}`, "role", role)
-	if err != nil {
-		return `{"role":"user","content":""}`
-	}
-	message, err = sjson.Set(message, "content", content)
-	if err != nil {
-		return `{"role":"user","content":""}`
-	}
-	return message
+	return `{"role":` + jsonStringifyString(role) + `,"content":` + jsonStringifyString(content) + "}"
 }
 
 func normalizeAnthropicCacheControlTTL(body []byte) []byte {

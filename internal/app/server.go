@@ -64,6 +64,7 @@ type Server struct {
 	healthCache                   *HealthCache               // 渠道健康度缓存
 	costCache                     *CostCache                 // 渠道每日成本缓存
 	channelRPMLimiter             *channelRPMLimiter         // 渠道RPM限制器（内存滑动窗口）
+	sessionAffinity               *sessionAffinityStore      // Anthropic/Codex 会话 → 渠道/Key 绑定
 	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道并发限制器（内存计数）
 	statsCache                    *StatsCache                // 统计结果缓存层
 	updateManager                 *version.UpdateManager     // 版本检查与可选自动应用的唯一状态源
@@ -75,8 +76,8 @@ type Server struct {
 	antigravityClient             *http.Client // Antigravity 专用标准 HTTP/1.1 客户端
 	xaiSSOClient                  *http.Client // xAI Web SSO 专用 HTTP/1.1 客户端
 	proxyTransports               sync.Map     // upstreamHTTPClientCacheKey → *http.Client（渠道级代理缓存）
-	antigravityTransports         *antigravityHTTPClientCache
-	antigravityTransportMu        sync.Mutex
+	credentialTransports          *credentialHTTPClientCache
+	credentialTransportMu         sync.Mutex
 	protocolCapabilities          protocolCapabilityCache
 	skipTLSVerify                 bool                  // 透传给渠道级 Transport
 	activeRequests                *activeRequestManager // 进行中请求（内存状态，不持久化）
@@ -89,6 +90,7 @@ type Server struct {
 	codexService                  *codexauth.Service
 	codexCredentials              *codexCredentialManager
 	codexQuotaResetInFlight       sync.Map
+	anthropicQuotaResetInFlight   sync.Map
 	antigravityOAuth              *codexOAuthManager
 	antigravityCredentials        *antigravityCredentialManager
 	antigravityService            *antigravityauth.Service
@@ -133,25 +135,35 @@ type Server struct {
 	firstByteTimeout time.Duration // 上游首字节超时（流式请求）
 	httpReadTimeout  time.Duration // 下游请求读取超时（HTTP Server ReadTimeout）
 	streamTimeout    time.Duration // 流式请求总超时
-	nonStreamTimeout time.Duration // 非流式请求超时
+	// 流式请求上游连续无数据超时（可按协议覆盖）
+	streamIdleTimeout time.Duration
+	nonStreamTimeout  time.Duration // 非流式请求超时
 	// 上游 HTTP/1.1、HTTP/2 和 WebSocket 物理连接最长复用时间；0 表示不限制。
 	upstreamConnectionMaxAge time.Duration
-	antigravityPool          antigravityPoolConfig
+	upstreamChannelCount     int // 启动时持久化渠道数，用于后续隔离 Transport 的连接池容量
 	// 仅供测试注入（缩短下游与上游 WebSocket 的 idle/ping 间隔以覆盖保活路径）；
 	// 生产始终为零值，实际取值回退到各自的默认常量。
 	responsesWebsocketIdleTimeoutOverride  time.Duration
 	responsesWebsocketPingIntervalOverride time.Duration
 	protocolTimeouts                       map[string]protocolTimeoutConfig // 按运行时上游协议覆盖超时，0=回退全局
 	// 模型匹配配置（启动时从数据库加载，修改后重启生效）
-	modelFuzzyMatch           bool // 未命中时启用模糊匹配（子串匹配+版本排序）
-	activeRequestTitleEnabled bool
-	codexMap429To503          bool
+	modelFuzzyMatch  bool // 未命中时启用模糊匹配（子串匹配+版本排序）
+	codexMap429To503 bool
 	// 渠道未配置专属规则时使用的进程级默认规则。
 	globalCooldownDetectionRules *model.CooldownDetectionRules
+	// anthropicOAuthFingerprints keeps the account-level Claude Code header
+	// fingerprint used by native OAuth requests; the private credential is durable.
+	anthropicOAuthFingerprintMu      sync.Mutex
+	anthropicOAuthFingerprints       map[string]anthropicOAuthFingerprint
+	anthropicOAuthFingerprintDirty   map[string]bool
+	anthropicOAuthFingerprintSaving  map[string]bool
+	anthropicOAuthFingerprintRetryAt map[string]time.Time
 	// 多模态回退映射使用不可变快照热更新；更新锁保证持久化顺序与运行态发布顺序一致。
 	multimodalFallbackModels   atomic.Pointer[multimodalFallbackSnapshot]
 	multimodalFallbackUpdateMu sync.Mutex
 	modelPricingUpdateMu       sync.Mutex
+	settingsUpdateMu           sync.Mutex
+	jevClient                  *http.Client
 
 	// 登录速率限制器（用于传递给AuthService）
 	loginRateLimiter *util.LoginRateLimiter
@@ -161,14 +173,15 @@ type Server struct {
 	maxConcurrency int           // 最大并发数（默认1000）
 
 	// 优雅关闭机制
-	baseCtx                 context.Context    // server生命周期context，Shutdown时取消
-	baseCancel              context.CancelFunc // 取消baseCtx
-	shutdownCh              chan struct{}      // 关闭信号channel
-	shutdownDone            chan struct{}      // Shutdown完成信号（幂等）
-	isShuttingDown          atomic.Bool        // shutdown标志，防止向已关闭channel写入
-	modelCatalogSyncMu      sync.Mutex         // 串行化模型目录启动和关闭，保护 WaitGroup
-	modelCatalogSyncStarted atomic.Bool
-	wg                      sync.WaitGroup // 等待所有后台goroutine结束
+	baseCtx                     context.Context    // server生命周期context，Shutdown时取消
+	baseCancel                  context.CancelFunc // 取消baseCtx
+	shutdownCh                  chan struct{}      // 关闭信号channel
+	shutdownDone                chan struct{}      // Shutdown完成信号（幂等）
+	isShuttingDown              atomic.Bool        // shutdown标志，防止向已关闭channel写入
+	modelCatalogSyncMu          sync.Mutex         // 串行化模型目录启动和关闭，保护 WaitGroup
+	modelCatalogSyncStarted     atomic.Bool
+	anthropicCLIVersionSyncOnce sync.Once
+	wg                          sync.WaitGroup // 等待所有后台goroutine结束
 
 	oauthCredentialImportRunMu   sync.Mutex
 	oauthCredentialImportJobsMu  sync.Mutex
@@ -235,9 +248,17 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 		log.Print("[WARN] 已禁用上游 TLS 证书校验（InsecureSkipVerify=true）：仅用于临时排障/受控内网环境")
 	}
 
-	// 构建HTTP Transport（使用统一函数，消除DRY违反）
-	transport := buildHTTPTransport(skipTLSVerify)
-	log.Print("[INFO] HTTP/2已启用（HTTPS自动协商）；Antigravity 固定使用 HTTP/1.1")
+	channelLoadCtx, channelLoadCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	channels, err := store.ListConfigs(channelLoadCtx)
+	channelLoadCancel()
+	if err != nil {
+		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
+	}
+	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
+
+	// 所有上游 Transport 使用同一连接池策略；按启动时渠道数为每个池预留容量。
+	transport := buildHTTPTransport(skipTLSVerify, len(channels))
+	log.Printf("[INFO] HTTP/2已启用（HTTPS自动协商）；Antigravity 固定使用 HTTP/1.1；单 Transport 空闲连接上限=%d", transport.MaxIdleConns)
 	logHostOverrides(getHostOverrides())
 
 	baseCtx, baseCancel := context.WithCancel(context.Background())
@@ -254,22 +275,22 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 		firstByteTimeout:         runtimeCfg.FirstByteTimeout,
 		httpReadTimeout:          runtimeCfg.HTTPReadTimeout,
 		streamTimeout:            runtimeCfg.StreamTimeout,
+		streamIdleTimeout:        runtimeCfg.StreamIdleTimeout,
 		nonStreamTimeout:         runtimeCfg.NonStreamTimeout,
 		upstreamConnectionMaxAge: runtimeCfg.UpstreamConnectionMaxAge,
-		antigravityPool:          runtimeCfg.AntigravityPool,
+		upstreamChannelCount:     len(channels),
 		protocolTimeouts:         runtimeCfg.ProtocolTimeouts,
 		// 模型匹配配置（启动时加载，修改后重启生效）
 		modelFuzzyMatch:              runtimeCfg.ModelFuzzyMatch,
-		activeRequestTitleEnabled:    runtimeCfg.ActiveRequestTitleEnabled,
 		codexMap429To503:             runtimeCfg.CodexMap429To503,
 		globalCooldownDetectionRules: runtimeCfg.GlobalCooldownDetectionRules,
 
 		// HTTP客户端：不设置请求总超时，连接复用时限只轮换连接池，不中断在途请求。
-		client:                newUpstreamHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge),
-		antigravityClient:     newAntigravityHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge, runtimeCfg.AntigravityPool),
-		antigravityTransports: newAntigravityHTTPClientCache(antigravityHTTPClientCacheCapacity),
-		xaiSSOClient:          newXAISSOHTTPClient(transport),
-		skipTLSVerify:         skipTLSVerify,
+		client:               newUpstreamHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge),
+		antigravityClient:    newAntigravityHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge),
+		credentialTransports: newCredentialHTTPClientCache(credentialHTTPClientCacheCapacity),
+		xaiSSOClient:         newXAISSOHTTPClient(transport),
+		skipTLSVerify:        skipTLSVerify,
 
 		// 并发控制：使用信号量限制最大并发请求数
 		concurrencySem: make(chan struct{}, maxConcurrency),
@@ -304,6 +325,7 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 		),
 		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
+		sessionAffinity:           newSessionAffinityStore(),
 	}
 	s.setMultimodalFallbackModels(runtimeCfg.MultimodalFallbackModels)
 
@@ -314,13 +336,6 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 
 	// 初始化高性能缓存层（60秒TTL，避免数据库性能杀手查询）
 	s.channelCache = storage.NewChannelCache(store, 60*time.Second)
-	channelLoadCtx, channelLoadCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	channels, err := store.ListConfigs(channelLoadCtx)
-	channelLoadCancel()
-	if err != nil {
-		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
-	}
-	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
 	s.cursorBridgeRequired.Store(hasCursorChannel(channels))
 
 	codexOAuthService := codexauth.NewService(s.client)
@@ -459,6 +474,7 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 		password,
 		s.loginRateLimiter,
 		store, // 传入store用于热更新令牌
+		s.configService,
 	)
 	s.authService.RegisterWebSessionRevokeHook(s.xaiOAuth.cancelByAdmin)
 
@@ -639,9 +655,10 @@ func (s *Server) StartModelCatalogSync() {
 }
 
 type protocolTimeoutConfig struct {
-	FirstByteTimeout time.Duration
-	StreamTimeout    time.Duration
-	NonStreamTimeout time.Duration
+	FirstByteTimeout  time.Duration
+	StreamTimeout     time.Duration
+	StreamIdleTimeout time.Duration
+	NonStreamTimeout  time.Duration
 }
 
 // serverRuntimeConfig 启动期从数据库读取的运行时配置（修改后重启生效）
@@ -653,13 +670,12 @@ type serverRuntimeConfig struct {
 	HTTPReadTimeout              time.Duration
 	FirstByteTimeout             time.Duration
 	StreamTimeout                time.Duration
+	StreamIdleTimeout            time.Duration
 	NonStreamTimeout             time.Duration
 	UpstreamConnectionMaxAge     time.Duration
-	AntigravityPool              antigravityPoolConfig
 	ProtocolTimeouts             map[string]protocolTimeoutConfig
 	LogRetentionDays             int
 	ModelFuzzyMatch              bool
-	ActiveRequestTitleEnabled    bool
 	CodexMap429To503             bool
 	GlobalCooldownDetectionRules *model.CooldownDetectionRules
 	MultimodalFallbackModels     map[string]string
@@ -760,10 +776,16 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 		streamTimeout = 0
 	}
 
-	nonStreamTimeout := cs.GetDuration("non_stream_timeout", 120*time.Second)
+	streamIdleTimeout := cs.GetDuration("stream_idle_timeout", 0)
+	if streamIdleTimeout < 0 {
+		log.Printf("[WARN] 无效的 stream_idle_timeout=%v（必须 >= 0，0=禁用），已设为 0", streamIdleTimeout)
+		streamIdleTimeout = 0
+	}
+
+	nonStreamTimeout := cs.GetDuration("non_stream_timeout", config.DefaultNonStreamTimeout)
 	if nonStreamTimeout < 0 {
-		log.Printf("[WARN] 无效的 non_stream_timeout=%v（必须 >= 0，0=禁用），已使用默认值 %v", nonStreamTimeout, 120*time.Second)
-		nonStreamTimeout = 120 * time.Second
+		log.Printf("[WARN] 无效的 non_stream_timeout=%v（必须 >= 0，0=禁用），已使用默认值 %v", nonStreamTimeout, config.DefaultNonStreamTimeout)
+		nonStreamTimeout = config.DefaultNonStreamTimeout
 	}
 
 	upstreamConnectionMaxAge := cs.GetDuration("upstream_connection_reuse_limit_seconds", 0)
@@ -782,24 +804,19 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 	}
 
 	return serverRuntimeConfig{
-		MaxKeyRetries:            maxKeyRetries,
-		MaxConcurrency:           loadPositiveInt(cs, "max_concurrency", config.DefaultMaxConcurrency),
-		MaxBodyBytes:             loadPositiveInt(cs, "max_body_bytes", config.DefaultMaxBodyBytes),
-		MaxImageBodyBytes:        loadPositiveInt(cs, "max_image_body_bytes", config.DefaultMaxImageBodyBytes),
-		HTTPReadTimeout:          loadHTTPReadTimeout(cs),
-		FirstByteTimeout:         firstByteTimeout,
-		StreamTimeout:            streamTimeout,
-		NonStreamTimeout:         nonStreamTimeout,
-		UpstreamConnectionMaxAge: upstreamConnectionMaxAge,
-		AntigravityPool: (antigravityPoolConfig{
-			DisableReuse:        !cs.GetBool("antigravity_connection_reuse_enabled", true),
-			MaxIdleConnsPerHost: cs.GetInt("antigravity_max_idle_conns_per_host", antigravityMaxIdleConnsPerHost),
-			IdleTimeout:         cs.GetDuration("antigravity_idle_conn_timeout_seconds", antigravityIdleConnTimeout),
-		}).normalized(),
+		MaxKeyRetries:                maxKeyRetries,
+		MaxConcurrency:               loadPositiveInt(cs, "max_concurrency", config.DefaultMaxConcurrency),
+		MaxBodyBytes:                 loadPositiveInt(cs, "max_body_bytes", config.DefaultMaxBodyBytes),
+		MaxImageBodyBytes:            loadPositiveInt(cs, "max_image_body_bytes", config.DefaultMaxImageBodyBytes),
+		HTTPReadTimeout:              loadHTTPReadTimeout(cs),
+		FirstByteTimeout:             firstByteTimeout,
+		StreamTimeout:                streamTimeout,
+		StreamIdleTimeout:            streamIdleTimeout,
+		NonStreamTimeout:             nonStreamTimeout,
+		UpstreamConnectionMaxAge:     upstreamConnectionMaxAge,
 		ProtocolTimeouts:             protocolTimeouts,
 		LogRetentionDays:             logRetentionDays,
 		ModelFuzzyMatch:              modelFuzzyMatch,
-		ActiveRequestTitleEnabled:    cs.GetBool(config.ActiveRequestTitleEnabledSettingKey, false),
 		CodexMap429To503:             cs.GetBool(config.CodexMap429To503SettingKey, false),
 		GlobalCooldownDetectionRules: loadGlobalCooldownDetectionRules(cs),
 		MultimodalFallbackModels:     loadMultimodalFallbackModels(cs),
@@ -826,9 +843,17 @@ func loadProtocolTimeouts(cs *ConfigService) map[string]protocolTimeoutConfig {
 			nonStreamTimeout = 0
 		}
 
+		streamIdleTimeout := cs.GetDuration(protocolStreamIdleTimeoutSettingKey(name), 0)
+		if streamIdleTimeout < 0 {
+			log.Printf("[WARN] 无效的 %s=%v（必须 >= 0），已设为 0（回退全局流空闲超时）",
+				protocolStreamIdleTimeoutSettingKey(name), streamIdleTimeout)
+			streamIdleTimeout = 0
+		}
+
 		timeouts[name] = protocolTimeoutConfig{
-			FirstByteTimeout: firstByteTimeout,
-			NonStreamTimeout: nonStreamTimeout,
+			FirstByteTimeout:  firstByteTimeout,
+			StreamIdleTimeout: streamIdleTimeout,
+			NonStreamTimeout:  nonStreamTimeout,
 		}
 	}
 	return timeouts
@@ -866,6 +891,10 @@ func protocolFirstByteTimeoutSettingKey(upstreamProtocol string) string {
 
 func protocolNonStreamTimeoutSettingKey(upstreamProtocol string) string {
 	return util.NormalizeProtocol(upstreamProtocol) + "_non_stream_timeout"
+}
+
+func protocolStreamIdleTimeoutSettingKey(upstreamProtocol string) string {
+	return util.NormalizeProtocol(upstreamProtocol) + "_stream_idle_timeout"
 }
 
 // loadHealthScoreConfig 从 ConfigService 加载健康度配置，无效值兜底为默认值
@@ -1050,11 +1079,16 @@ var getHostOverrides = sync.OnceValue(func() map[string]string {
 	return overrides
 })
 
-// buildHTTPTransport 构建HTTP Transport（DRY：统一配置逻辑）
-// 参数:
-//   - skipTLSVerify: 是否跳过TLS证书验证
-func buildHTTPTransport(skipTLSVerify bool) *http.Transport {
+// buildHTTPTransport 构建统一连接池策略的 HTTP Transport。
+func buildHTTPTransport(skipTLSVerify bool, channelCount int) *http.Transport {
 	overrides := getHostOverrides()
+	if channelCount < 1 {
+		channelCount = 1
+	}
+	maxIdleConns := config.HTTPMaxIdleConnsLimit
+	if channelCount <= config.HTTPMaxIdleConnsLimit/config.HTTPIdleConnsPerChannel {
+		maxIdleConns = channelCount * config.HTTPIdleConnsPerChannel
+	}
 	dialer := &net.Dialer{
 		Timeout:   config.HTTPDialTimeout,
 		KeepAlive: config.HTTPKeepAliveInterval,
@@ -1071,7 +1105,7 @@ func buildHTTPTransport(skipTLSVerify bool) *http.Transport {
 
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment, // 支持 HTTPS_PROXY/HTTP_PROXY/NO_PROXY
-		MaxIdleConns:        config.HTTPMaxIdleConns,
+		MaxIdleConns:        maxIdleConns,
 		MaxIdleConnsPerHost: config.HTTPMaxIdleConnsPerHost,
 		IdleConnTimeout:     90 * time.Second, // 空闲连接90秒后关闭，避免僵尸连接
 		MaxConnsPerHost:     config.HTTPMaxConnsPerHost,
@@ -1094,14 +1128,22 @@ func buildHTTPTransport(skipTLSVerify bool) *http.Transport {
 	return transport // HTTP/2 已通过 ForceAttemptHTTP2 启用
 }
 
-const antigravityHTTPClientCacheCapacity = 8192
+const credentialHTTPClientCacheCapacity = 8192
 
-var errAntigravityHTTPClientCacheClosed = errors.New("antigravity HTTP client cache is closed")
+var errCredentialHTTPClientCacheClosed = errors.New("credential HTTP client cache is closed")
 
-// antigravityHTTPClientCache is a bounded LRU of Antigravity clients. A client
+type credentialCacheClosedTransport struct{}
+
+func (credentialCacheClosedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errCredentialHTTPClientCacheClosed
+}
+
+var closedCredentialHTTPClient = &http.Client{Transport: credentialCacheClosedTransport{}}
+
+// credentialHTTPClientCache is a bounded LRU of OAuth clients. A client
 // owns a transport and therefore a physical connection pool; evicting it must
 // close idle connections or credential/proxy churn would retain sockets forever.
-type antigravityHTTPClientCache struct {
+type credentialHTTPClientCache struct {
 	mu       sync.Mutex
 	capacity int
 	entries  map[upstreamHTTPClientCacheKey]*list.Element
@@ -1109,23 +1151,23 @@ type antigravityHTTPClientCache struct {
 	closed   bool
 }
 
-type antigravityHTTPClientCacheEntry struct {
+type credentialHTTPClientCacheEntry struct {
 	key    upstreamHTTPClientCacheKey
 	client *http.Client
 }
 
-func newAntigravityHTTPClientCache(capacity int) *antigravityHTTPClientCache {
+func newCredentialHTTPClientCache(capacity int) *credentialHTTPClientCache {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &antigravityHTTPClientCache{
+	return &credentialHTTPClientCache{
 		capacity: capacity,
 		entries:  make(map[upstreamHTTPClientCacheKey]*list.Element, capacity),
 		order:    list.New(),
 	}
 }
 
-func (c *antigravityHTTPClientCache) getOrCreate(
+func (c *credentialHTTPClientCache) getOrCreate(
 	key upstreamHTTPClientCacheKey,
 	create func() (*http.Client, error),
 ) (*http.Client, error) {
@@ -1135,11 +1177,11 @@ func (c *antigravityHTTPClientCache) getOrCreate(
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, errAntigravityHTTPClientCacheClosed
+		return nil, errCredentialHTTPClientCacheClosed
 	}
 	if element := c.entries[key]; element != nil {
 		c.order.MoveToFront(element)
-		client := element.Value.(antigravityHTTPClientCacheEntry).client
+		client := element.Value.(credentialHTTPClientCacheEntry).client
 		c.mu.Unlock()
 		return client, nil
 	}
@@ -1154,24 +1196,24 @@ func (c *antigravityHTTPClientCache) getOrCreate(
 	if c.closed {
 		c.mu.Unlock()
 		closeUpstreamHTTPClient(client)
-		return nil, errAntigravityHTTPClientCacheClosed
+		return nil, errCredentialHTTPClientCacheClosed
 	}
 	// Another goroutine may have populated the same key while the transport
 	// was being built. Keep one client and immediately discard the duplicate.
 	if element := c.entries[key]; element != nil {
 		c.order.MoveToFront(element)
-		actual := element.Value.(antigravityHTTPClientCacheEntry).client
+		actual := element.Value.(credentialHTTPClientCacheEntry).client
 		c.mu.Unlock()
 		closeUpstreamHTTPClient(client)
 		return actual, nil
 	}
-	element := c.order.PushFront(antigravityHTTPClientCacheEntry{key: key, client: client})
+	element := c.order.PushFront(credentialHTTPClientCacheEntry{key: key, client: client})
 	c.entries[key] = element
 	var evicted *http.Client
 	if c.order.Len() > c.capacity {
 		oldest := c.order.Back()
 		if oldest != nil {
-			entry := oldest.Value.(antigravityHTTPClientCacheEntry)
+			entry := oldest.Value.(credentialHTTPClientCacheEntry)
 			delete(c.entries, entry.key)
 			c.order.Remove(oldest)
 			evicted = entry.client
@@ -1184,7 +1226,7 @@ func (c *antigravityHTTPClientCache) getOrCreate(
 	return client, nil
 }
 
-func (c *antigravityHTTPClientCache) closeAll() {
+func (c *credentialHTTPClientCache) closeAll() {
 	if c == nil {
 		return
 	}
@@ -1192,7 +1234,7 @@ func (c *antigravityHTTPClientCache) closeAll() {
 	c.closed = true
 	clients := make([]*http.Client, 0, len(c.entries))
 	for _, element := range c.entries {
-		clients = append(clients, element.Value.(antigravityHTTPClientCacheEntry).client)
+		clients = append(clients, element.Value.(credentialHTTPClientCacheEntry).client)
 	}
 	c.entries = make(map[upstreamHTTPClientCacheKey]*list.Element, c.capacity)
 	c.order.Init()
@@ -1208,13 +1250,13 @@ type upstreamHTTPClientCacheKey struct {
 	credentialScope       string
 }
 
-func (s *Server) getAntigravityHTTPClientCache() *antigravityHTTPClientCache {
-	s.antigravityTransportMu.Lock()
-	defer s.antigravityTransportMu.Unlock()
-	if s.antigravityTransports == nil {
-		s.antigravityTransports = newAntigravityHTTPClientCache(antigravityHTTPClientCacheCapacity)
+func (s *Server) getCredentialHTTPClientCache() *credentialHTTPClientCache {
+	s.credentialTransportMu.Lock()
+	defer s.credentialTransportMu.Unlock()
+	if s.credentialTransports == nil {
+		s.credentialTransports = newCredentialHTTPClientCache(credentialHTTPClientCacheCapacity)
 	}
-	return s.antigravityTransports
+	return s.credentialTransports
 }
 
 // antigravityCredentialPoolScope deliberately uses the refresh token rather
@@ -1228,12 +1270,121 @@ func antigravityCredentialPoolScope(cfg *model.Config) string {
 		digest := sha256.Sum256([]byte(credential.RefreshToken))
 		return "refresh:" + hex.EncodeToString(digest[:])
 	}
-	// A malformed/incomplete credential must not make unrelated channels share
-	// a pool. Channel ID is stable and is only a defensive fallback.
-	if cfg.ID != 0 {
-		return fmt.Sprintf("channel:%d", cfg.ID)
+	// Incomplete credentials cannot provide a stable account identity. Include
+	// their payload so replacing the account on the same channel splits the pool.
+	digest := sha256.Sum256([]byte(cfg.OAuthCredential))
+	return fmt.Sprintf("antigravity:channel:%d:credential:%x", cfg.ID, digest)
+}
+
+// anthropicCredentialPoolScope follows the account identity used for Claude
+// Code requests. Include the channel ID so separate account records never
+// share a physical connection, even if their credential metadata is incomplete.
+// Access and refresh token rotation must not churn a known account's pool.
+func anthropicCredentialPoolScope(cfg *model.Config) string {
+	if cfg == nil || !cfg.UsesAnthropicOAuth() {
+		return ""
 	}
-	return ""
+	identity := strings.TrimSpace(cfg.OAuthCredential)
+	if credential, err := anthropicauth.ParseCredential([]byte(identity)); err == nil {
+		switch {
+		case credential.AccountUUID != "":
+			identity = "uuid:" + credential.AccountUUID
+		case credential.EmailAddress != "":
+			identity = "email:" + strings.ToLower(credential.EmailAddress)
+		case credential.RefreshToken != "":
+			identity = "refresh:" + credential.RefreshToken
+		case credential.AccessToken != "":
+			identity = "access:" + credential.AccessToken
+		}
+	}
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("anthropic:channel:%d:%x", cfg.ID, digest)
+}
+
+// otherOAuthCredentialPoolScope isolates one OAuth account's connections from
+// other accounts, including when a channel is reauthorized for a new account.
+// Prefer account identifiers over rotating access tokens to preserve reuse.
+func otherOAuthCredentialPoolScope(cfg *model.Config) string {
+	if cfg == nil || !cfg.UsesOAuth() {
+		return ""
+	}
+	var credential struct {
+		AccountID     string `json:"account_id"`
+		ChatGPTUserID string `json:"chatgpt_user_id"`
+		Email         string `json:"email"`
+		Subject       string `json:"sub"`
+		TeamID        string `json:"team_id"`
+		UserID        string `json:"user_id"`
+		SystemID      string `json:"system_id"`
+		UID           string `json:"uid"`
+		EnterpriseID  string `json:"enterprise_id"`
+		Domain        string `json:"domain"`
+		BaseURL       string `json:"base_url"`
+		APIKey        string `json:"api_key"`
+		RefreshToken  string `json:"refresh_token"`
+		AccessToken   string `json:"access_token"`
+	}
+	identity := "raw:" + cfg.OAuthCredential
+	if json.Unmarshal([]byte(cfg.OAuthCredential), &credential) == nil {
+		first := func(options ...[2]string) string {
+			for _, option := range options {
+				if value := strings.TrimSpace(option[1]); value != "" {
+					return option[0] + ":" + value
+				}
+			}
+			return ""
+		}
+		switch cfg.GetAuthType() {
+		case model.AuthTypeCodexOAuth:
+			if credential.ChatGPTUserID != "" || credential.Email != "" {
+				identity = fmt.Sprintf("account:%q:user:%q:email:%q", credential.AccountID,
+					credential.ChatGPTUserID, strings.ToLower(credential.Email))
+			} else if credential.AccountID != "" {
+				// An account ID alone may identify a workspace shared by users.
+				// Keep the credential as a discriminator until user identity is known.
+				identity = fmt.Sprintf("account:%q:%s", credential.AccountID, first(
+					[2]string{"refresh", credential.RefreshToken},
+					[2]string{"access", credential.AccessToken},
+				))
+			} else if value := first(
+				[2]string{"email", strings.ToLower(credential.Email)},
+				[2]string{"refresh", credential.RefreshToken},
+				[2]string{"access", credential.AccessToken},
+			); value != "" {
+				identity = value
+			}
+		case model.AuthTypeXAIOAuth:
+			if value := first(
+				[2]string{"subject", credential.Subject},
+				[2]string{"email", strings.ToLower(credential.Email)},
+				[2]string{"refresh", credential.RefreshToken},
+			); value != "" {
+				identity = fmt.Sprintf("%s:team:%q", value, credential.TeamID)
+			}
+		case model.AuthTypeZAIOAuth, model.AuthTypeCursorOAuth:
+			if value := first(
+				[2]string{"user", credential.UserID},
+				[2]string{"email", strings.ToLower(credential.Email)},
+				[2]string{"api-key", credential.APIKey},
+				[2]string{"refresh", credential.RefreshToken},
+			); value != "" {
+				identity = value
+			}
+		case model.AuthTypeZedOAuth:
+			if credential.UserID != "" {
+				identity = fmt.Sprintf("user:%q:system:%q", credential.UserID, credential.SystemID)
+			}
+		case model.AuthTypeCodeBuddyOAuth:
+			if credential.UID != "" {
+				identity = fmt.Sprintf("uid:%q:enterprise:%q:domain:%q:base:%q",
+					credential.UID, credential.EnterpriseID, credential.Domain, credential.BaseURL)
+			} else if credential.RefreshToken != "" {
+				identity = "refresh:" + credential.RefreshToken
+			}
+		}
+	}
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("oauth:%s:channel:%d:%x", cfg.GetAuthType(), cfg.ID, digest)
 }
 
 func (s *Server) getClientForChannel(cfg *model.Config) *http.Client {
@@ -1243,58 +1394,78 @@ func (s *Server) getClientForChannel(cfg *model.Config) *http.Client {
 	defaultClient := s.client
 	clientFactory := newUpstreamHTTPClient
 	antigravityHTTP11Only := cfg.UsesAntigravityOAuth()
+	credentialScope := ""
 	if antigravityHTTP11Only {
 		defaultClient = s.antigravityClient
-		clientFactory = func(base *http.Transport, maxAge time.Duration) *http.Client {
-			return newAntigravityHTTPClient(base, maxAge, s.antigravityPool)
-		}
+		clientFactory = newAntigravityHTTPClient
+		credentialScope = antigravityCredentialPoolScope(cfg)
+	} else if cfg.UsesAnthropicOAuth() {
+		credentialScope = anthropicCredentialPoolScope(cfg)
+	} else if cfg.UsesOAuth() {
+		credentialScope = otherOAuthCredentialPoolScope(cfg)
+	}
+	if credentialScope != "" {
 		// Tests and embedders may inject a semantic RoundTripper. It already is
 		// the transport boundary; replacing it with a network transport would
 		// silently bypass the injected behavior.
 		if defaultClient != nil {
 			switch defaultClient.Transport.(type) {
-			case *http.Transport, *upstreamConnectionAgeTransport:
+			case *http.Transport, *codexUTLSRoundTripper, *upstreamConnectionAgeTransport:
 			default:
 				return defaultClient
 			}
 		}
-		credentialScope := antigravityCredentialPoolScope(cfg)
-		// Channels without a parseable credential are retained on the legacy
-		// global client. Real OAuth credentials always receive their own scope.
-		if credentialScope != "" {
-			proxyURL := strings.TrimSpace(cfg.ProxyURL)
-			key := upstreamHTTPClientCacheKey{
-				proxyURL:              proxyURL,
-				antigravityHTTP11Only: true,
-				credentialScope:       credentialScope,
-			}
-			cache := s.getAntigravityHTTPClientCache()
-			client, err := cache.getOrCreate(key, func() (*http.Client, error) {
-				var transport *http.Transport
-				var err error
-				if proxyURL == "" {
-					transport = buildHTTPTransport(s.skipTLSVerify)
-				} else {
-					transport, err = buildChannelProxyTransport(proxyURL, s.skipTLSVerify)
-				}
-				if err != nil {
-					return nil, err
-				}
-				return clientFactory(transport, s.upstreamConnectionMaxAge), nil
-			})
-			if err == nil {
-				return client
-			}
-			log.Printf("[WARN] 渠道 %d 代理 %q 无效，回退凭证隔离的直连池: %v", cfg.ID, cfg.ProxyURL, err)
-			fallbackKey := key
-			fallbackKey.proxyURL = ""
-			fallback, fallbackErr := cache.getOrCreate(fallbackKey, func() (*http.Client, error) {
-				return clientFactory(buildHTTPTransport(s.skipTLSVerify), s.upstreamConnectionMaxAge), nil
-			})
-			if fallbackErr == nil {
-				return fallback
-			}
+		proxyURL := strings.TrimSpace(cfg.ProxyURL)
+		key := upstreamHTTPClientCacheKey{
+			proxyURL:              proxyURL,
+			antigravityHTTP11Only: antigravityHTTP11Only,
+			credentialScope:       credentialScope,
 		}
+		// Codex OAuth 的 Cloudflare Cookie 跟随账号与出口代理：换代理即换出口 IP，
+		// 旧 Cookie 随旧连接池一起淘汰。WebSocket 握手经 codexWebsocketDialer 共用同一 jar。
+		// 官方 reqwest 未编入任何解压 feature，不发 Accept-Encoding；Go 默认会补 gzip，
+		// 这里关掉，uTLS 的 H2/H1 与代际轮换都从该 Transport 继承。
+		newCredentialClient := func(transport *http.Transport) *http.Client {
+			codexOAuth := cfg.UsesCodexOAuth()
+			if codexOAuth {
+				transport.DisableCompression = true
+			}
+			client := clientFactory(transport, s.upstreamConnectionMaxAge)
+			if codexOAuth {
+				client.Jar = newCodexCloudflareCookieJar()
+			}
+			return client
+		}
+		cache := s.getCredentialHTTPClientCache()
+		client, err := cache.getOrCreate(key, func() (*http.Client, error) {
+			var transport *http.Transport
+			var err error
+			if proxyURL == "" {
+				transport = buildHTTPTransport(s.skipTLSVerify, s.upstreamChannelCount)
+			} else {
+				transport, err = buildChannelProxyTransport(proxyURL, s.skipTLSVerify, s.upstreamChannelCount)
+			}
+			if err != nil {
+				return nil, err
+			}
+			return newCredentialClient(transport), nil
+		})
+		if err == nil {
+			return client
+		}
+		if errors.Is(err, errCredentialHTTPClientCacheClosed) {
+			return closedCredentialHTTPClient
+		}
+		log.Printf("[WARN] 渠道 %d 代理 %q 无效，回退凭证隔离的直连池: %v", cfg.ID, cfg.ProxyURL, err)
+		fallbackKey := key
+		fallbackKey.proxyURL = ""
+		fallback, fallbackErr := cache.getOrCreate(fallbackKey, func() (*http.Client, error) {
+			return newCredentialClient(buildHTTPTransport(s.skipTLSVerify, s.upstreamChannelCount)), nil
+		})
+		if fallbackErr == nil {
+			return fallback
+		}
+		return closedCredentialHTTPClient
 	}
 	if cfg.ProxyURL == "" {
 		return defaultClient
@@ -1307,7 +1478,7 @@ func (s *Server) getClientForChannel(cfg *model.Config) *http.Client {
 		return v.(*http.Client)
 	}
 
-	t, err := buildChannelProxyTransport(cfg.ProxyURL, s.skipTLSVerify)
+	t, err := buildChannelProxyTransport(cfg.ProxyURL, s.skipTLSVerify, s.upstreamChannelCount)
 	if err != nil {
 		log.Printf("[WARN] 渠道 %d 代理 %q 无效，回退全局: %v", cfg.ID, cfg.ProxyURL, err)
 		return defaultClient
@@ -1322,13 +1493,13 @@ func (s *Server) getClientForChannel(cfg *model.Config) *http.Client {
 }
 
 // buildChannelProxyTransport 构建带代理的 Transport（HTTP/HTTPS 直连，SOCKS5 用自定义 Dialer）。
-func buildChannelProxyTransport(rawProxyURL string, skipTLSVerify bool) (*http.Transport, error) {
+func buildChannelProxyTransport(rawProxyURL string, skipTLSVerify bool, channelCount int) (*http.Transport, error) {
 	u, err := neturl.Parse(rawProxyURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse proxy url: %w", err)
 	}
 
-	base := buildHTTPTransport(skipTLSVerify)
+	base := buildHTTPTransport(skipTLSVerify, channelCount)
 
 	switch u.Scheme {
 	case "http", "https":
@@ -1383,6 +1554,18 @@ func (s *Server) getEnabledChannelsSnapshotByModel(ctx context.Context, modelNam
 	)
 }
 
+func (s *Server) getAPIKeysSnapshot(ctx context.Context, channelID int64) ([]*model.APIKey, error) {
+	return readThroughChannelCache(
+		s,
+		func(cache *storage.ChannelCache) ([]*model.APIKey, error) {
+			return cache.GetAPIKeysSnapshot(ctx, channelID)
+		},
+		func() ([]*model.APIKey, error) {
+			return s.store.GetAPIKeys(ctx, channelID)
+		},
+	)
+}
+
 func (s *Server) getAPIKeys(ctx context.Context, channelID int64) ([]*model.APIKey, error) {
 	return readThroughChannelCache(
 		s,
@@ -1432,7 +1615,10 @@ func (s *Server) getAllModelCooldowns(ctx context.Context) (map[int64]map[string
 }
 
 // InvalidateChannelListCache 使渠道列表缓存失效
-// 在渠道CRUD操作后调用，确保缓存一致性
+// 在渠道CRUD操作后调用，确保缓存一致性。
+// 不清协议能力学习结果：OAuth 刷新、额度元数据等运行时写库也走这里，全局清空会让
+// 所有渠道反复重新探测；URL/协议相关配置变更须用 protocolCapabilities.clearChannels
+// 只清受影响渠道。
 func (s *Server) InvalidateChannelListCache() {
 	if cache := s.getChannelCache(); cache != nil {
 		cache.InvalidateCache()
@@ -1441,8 +1627,6 @@ func (s *Server) InvalidateChannelListCache() {
 	if s.channelBalancer != nil {
 		s.channelBalancer.ResetAll()
 	}
-	// URL 或上游协议配置可能已变化，丢弃运行时学习结果。
-	s.protocolCapabilities.clear()
 }
 
 // InvalidateAPIKeysCache 使指定渠道的 API Keys 缓存失效
@@ -1507,9 +1691,10 @@ func (s *Server) GetWriteTimeout() time.Duration {
 
 func (s *Server) resolveProtocolTimeouts(plan protocol.TransformPlan) protocolTimeoutConfig {
 	timeouts := protocolTimeoutConfig{
-		FirstByteTimeout: s.firstByteTimeout,
-		StreamTimeout:    s.streamTimeout,
-		NonStreamTimeout: s.nonStreamTimeout,
+		FirstByteTimeout:  s.firstByteTimeout,
+		StreamTimeout:     s.streamTimeout,
+		StreamIdleTimeout: s.streamIdleTimeout,
+		NonStreamTimeout:  s.nonStreamTimeout,
 	}
 
 	protocolKey := string(plan.UpstreamProtocol)
@@ -1523,6 +1708,9 @@ func (s *Server) resolveProtocolTimeouts(plan protocol.TransformPlan) protocolTi
 	}
 	if override.FirstByteTimeout > 0 {
 		timeouts.FirstByteTimeout = override.FirstByteTimeout
+	}
+	if override.StreamIdleTimeout > 0 {
+		timeouts.StreamIdleTimeout = override.StreamIdleTimeout
 	}
 	if override.NonStreamTimeout > 0 {
 		timeouts.NonStreamTimeout = override.NonStreamTimeout
@@ -1612,6 +1800,8 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/codex/credentials/import", s.HandleImportCodexCredential)
 		admin.POST("/channels/:id/codex-credential/refresh", s.HandleRefreshCodexCredential)
 		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
+		admin.GET("/channels/:id/anthropic-reset-credits", s.HandleAnthropicResetCredits)
+		admin.POST("/channels/:id/anthropic-reset-credits/redeem", s.HandleRedeemAnthropicResetCredits)
 		admin.POST("/channels/:id/codex-quota-reset", s.HandleResetCodexQuota)
 		admin.POST("/channels/oauth-usage/batch/stream", s.HandleOAuthUsageBatchStream)
 		admin.POST("/channels/usage/active/batch/stream", s.HandleActiveChannelUsageBatchStream)
@@ -1632,7 +1822,6 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/anthropic/oauth/status", s.HandleAnthropicOAuthStatus)
 		admin.POST("/anthropic/oauth/cancel", s.HandleCancelAnthropicOAuth)
 		admin.POST("/anthropic/oauth/callback", s.HandleSubmitAnthropicOAuthCode)
-		admin.POST("/anthropic/oauth/cookie", s.HandleAnthropicCookieAuth)
 		admin.POST("/channels/:id/anthropic-credential/refresh", s.HandleRefreshAnthropicCredential)
 		admin.POST("/zai/oauth/start", s.HandleStartZAIOAuth)
 		admin.POST("/codebuddy/oauth/start", s.HandleStartCodeBuddyOAuth)
@@ -1681,6 +1870,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/billing/fetch", s.HandleFetchKeyRate)
 		admin.POST("/channels/websocket-probe", s.HandleChannelWebsocketProbe)
 		admin.POST("/channels/models/refresh-batch", s.HandleBatchRefreshModels)
+		admin.POST("/channels/models/batch-delete", s.HandleBatchDeleteModels)
 		admin.GET("/channels/:id/models/fetch", s.HandleFetchModels) // 获取渠道可用模型列表(新增)
 		admin.POST("/channels/:id/models", s.HandleAddModels)        // 添加渠道模型
 		admin.DELETE("/channels/:id/models", s.HandleDeleteModels)   // 删除渠道模型
@@ -1714,6 +1904,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 
 		// 系统配置管理
 		admin.GET("/model-pricing", s.HandleGetModelPricing)
+		admin.POST("/typesafe/test", s.AdminTestTypeSafe)
 		admin.GET("/settings", s.AdminListSettings)
 		admin.GET("/settings/:key", s.AdminGetSetting)
 		admin.PUT("/settings/:key", s.AdminUpdateSetting)
@@ -1807,6 +1998,7 @@ func (s *Server) stateCleanupLoop() {
 			if s.channelRPMLimiter != nil {
 				s.channelRPMLimiter.CleanupExpired()
 			}
+			s.sessionAffinity.cleanupExpired(time.Now())
 		}
 	}
 }
@@ -1835,7 +2027,8 @@ func (s *Server) AddLogAsync(entry *model.LogEntry) {
 }
 
 func (s *Server) recordURLRequestFromLog(entry *model.LogEntry) {
-	if s == nil || s.urlSelector == nil || entry == nil {
+	if s == nil || s.urlSelector == nil || entry == nil ||
+		entry.LogSource == model.LogSourceJev || entry.LogSource == model.LogSourceCountTokens {
 		return
 	}
 	s.urlSelector.RecordRequestResult(entry.ChannelID, entry.BaseURL, entry.StatusCode)
@@ -1989,11 +2182,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	closeUpstreamHTTPClient(s.client)
 	closeUpstreamHTTPClient(s.antigravityClient)
 	closeUpstreamHTTPClient(s.xaiSSOClient)
-	s.antigravityTransportMu.Lock()
-	antigravityTransports := s.antigravityTransports
-	s.antigravityTransportMu.Unlock()
-	if antigravityTransports != nil {
-		antigravityTransports.closeAll()
+	s.credentialTransportMu.Lock()
+	credentialTransports := s.credentialTransports
+	s.credentialTransportMu.Unlock()
+	if credentialTransports != nil {
+		credentialTransports.closeAll()
 	}
 	s.proxyTransports.Range(func(_, v any) bool {
 		closeUpstreamHTTPClient(v.(*http.Client))

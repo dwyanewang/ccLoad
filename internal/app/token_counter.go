@@ -7,15 +7,34 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
-// CountTokensRequest 符合Anthropic官方API规范的请求结构
-// 参考: https://docs.claude.com/en/api/messages-count-tokens
+// CountTokensRequest is the input of every local count_tokens estimate.
 type CountTokensRequest struct {
 	Model    string         `json:"model" binding:"required"`
 	Messages []MessageParam `json:"messages" binding:"required"`
 	System   any            `json:"system,omitempty"` // 支持 string 或 []TextBlock
 	Tools    []Tool         `json:"tools,omitempty"`
+}
+
+// CountTokensResponse is the Anthropic-compatible local estimate envelope.
+type CountTokensResponse struct {
+	InputTokens int `json:"input_tokens"`
+}
+
+// localCountTokens estimates requests that have no first-party Anthropic target.
+// It returns the status, the Anthropic-compatible response, and the estimate (0 on error).
+func localCountTokens(body []byte) (int, any, int) {
+	var req CountTokensRequest
+	if err := binding.JSON.BindBody(body, &req); err != nil {
+		return http.StatusBadRequest, gin.H{"error": gin.H{
+			"type": "invalid_request_error", "message": fmt.Sprintf("Invalid request body: %v", err),
+		}}, 0
+	}
+	// 估算与模型无关：Claude Code 接 GLM/DeepSeek/Kimi 等后端时同样依赖它决定压缩时机，不按模型名拒绝。
+	inputTokens := estimateTokens(&req)
+	return http.StatusOK, CountTokensResponse{InputTokens: inputTokens}, inputTokens
 }
 
 // MessageParam 消息参数（简化版本，支持文本内容）
@@ -29,50 +48,6 @@ type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	InputSchema any    `json:"input_schema,omitempty"`
-}
-
-// CountTokensResponse 符合Anthropic官方API规范的响应结构
-type CountTokensResponse struct {
-	InputTokens int `json:"input_tokens"`
-}
-
-// handleCountTokens 本地实现token计数接口
-// 设计原则：
-// - KISS: 简单高效的估算算法，避免引入复杂的tokenizer库
-// - 向后兼容: 支持所有Claude模型和消息格式
-// - 本地计算: 避免引入复杂依赖
-func (s *Server) handleCountTokens(c *gin.Context) {
-	var req CountTokensRequest
-
-	// 解析请求体
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{
-				"type":    "invalid_request_error",
-				"message": fmt.Sprintf("Invalid request body: %v", err),
-			},
-		})
-		return
-	}
-
-	// 验证模型参数（支持所有Claude模型）
-	if !isValidClaudeModel(req.Model) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": gin.H{
-				"type":    "invalid_request_error",
-				"message": fmt.Sprintf("Invalid model: %s", req.Model),
-			},
-		})
-		return
-	}
-
-	// 计算token数量
-	tokenCount := estimateTokens(&req)
-
-	// 返回符合官方API格式的响应
-	c.JSON(http.StatusOK, CountTokensResponse{
-		InputTokens: tokenCount,
-	})
 }
 
 // estimateTokens 估算消息的token数量
@@ -290,11 +265,28 @@ func estimateTextTokens(text string) int {
 	return tokens
 }
 
+// estimateContentBlocks 估算 string 或内容块数组形式的 content。
+func estimateContentBlocks(content any) int {
+	switch content := content.(type) {
+	case string:
+		return estimateTextTokens(content)
+	case []any:
+		total := 0
+		for _, block := range content {
+			total += estimateContentBlock(block)
+		}
+		return total
+	default:
+		return 0
+	}
+}
+
 // estimateContentBlock 估算单个内容块的token数量
 // 支持的内容类型：
 // - text: 文本块
-// - image: 图片（固定1000 tokens估算）
-// - document: 文档（根据大小估算）
+// - image: 图片（固定1500 tokens估算）
+// - document: 文本/内容块来源按实际内容估算，二进制 PDF 无法离线计页，按固定值估算
+// - tool_result: string 或内容块数组（Claude Code 的读图、读文件结果都是数组）
 func estimateContentBlock(block any) int {
 	blockMap, ok := block.(map[string]any)
 	if !ok {
@@ -317,8 +309,18 @@ func estimateContentBlock(block any) int {
 		return 1500
 
 	case "document":
-		// 文档：根据大小估算（简化处理）
-		return 500
+		source, _ := blockMap["source"].(map[string]any)
+		switch sourceType, _ := source["type"].(string); sourceType {
+		case "text":
+			data, _ := source["data"].(string)
+			title, _ := blockMap["title"].(string)
+			context, _ := blockMap["context"].(string)
+			return estimateTextTokens(data) + estimateTextTokens(title) + estimateTextTokens(context)
+		case "content":
+			return estimateContentBlocks(source["content"])
+		default:
+			return 500
+		}
 
 	case "tool_use":
 		// 工具调用结果
@@ -331,8 +333,8 @@ func estimateContentBlock(block any) int {
 
 	case "tool_result":
 		// 工具执行结果
-		if content, ok := blockMap["content"].(string); ok {
-			return estimateTextTokens(content)
+		if content, ok := blockMap["content"]; ok && content != nil {
+			return estimateContentBlocks(content) + 5
 		}
 		return 50
 
@@ -343,35 +345,4 @@ func estimateContentBlock(block any) int {
 		}
 		return 10
 	}
-}
-
-// isValidClaudeModel 验证是否为有效的Claude模型
-// 支持所有Claude系列模型（不限制具体版本号）
-func isValidClaudeModel(model string) bool {
-	if model == "" {
-		return false
-	}
-
-	model = strings.ToLower(model)
-
-	// 支持的模型前缀
-	validPrefixes := []string{
-		"claude-",          // 所有Claude模型
-		"gpt-",             // OpenAI GPT系列
-		"chatgpt-",         // OpenAI ChatGPT系列（如chatgpt-4o-latest）
-		"o1",               // OpenAI o1系列（o1, o1-mini, o1-pro等）
-		"o3",               // OpenAI o3系列
-		"o4",               // OpenAI o4系列
-		"gemini-",          // Gemini兼容模式
-		"text-",            // 传统completion模型
-		"anthropic.claude", // Bedrock格式
-	}
-
-	for _, prefix := range validPrefixes {
-		if strings.HasPrefix(model, prefix) {
-			return true
-		}
-	}
-
-	return false
 }
